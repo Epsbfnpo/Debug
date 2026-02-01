@@ -1,0 +1,33 @@
+DATASET:
+  NAME: 'GDRBench'
+  NUM_CLASSES: 5
+  ROOT: './data/GDRBench'
+
+MODEL:
+  FPT:
+    SELECTION_RATIO: 0.2
+    LPM_PATH: '/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16'
+    HIGH_RES_SIZE: 512
+    LOW_RES_SIZE: 224
+    LAYERS_TO_EXTRACT: [0, 3, 6, 9]
+
+INPUT:
+  SIZE: 512
+
+BACKBONE: 'FPT'
+ALGORITHM: 'ERM'
+
+# ----------------- [新增/修改部分] -----------------
+SOLVER:
+  # 关键点 1: 学习率 (LR)
+  # SGD (ResNet) 通常用 0.01 (1e-2)
+  # AdamW (ViT) 必须降低到 0.0001 (1e-4) 或 5e-5，否则梯度会爆炸
+  LEARNING_RATE: 0.0001
+
+  # 关键点 2: 权重衰减 (Weight Decay)
+  # AdamW 的机制不同，通常需要比 SGD (1e-4) 更大的衰减来防止过拟合
+  # 推荐范围: 0.01 ~ 0.05
+  WEIGHT_DECAY: 0.05
+
+  # 兼容性保留 (AdamW 不使用 Momentum，但保留此行可防止代码中读取配置报错)
+  MOMENTUM: 0.9
