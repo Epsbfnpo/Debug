@@ -1,0 +1,24 @@
+DATASET:
+  NAME: 'GDRBench'
+  NUM_CLASSES: 5
+  ROOT: './data/GDRBench'
+
+MODEL:
+  FPT:
+    SELECTION_RATIO: 0.2
+    LPM_PATH: '/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16'
+    HIGH_RES_SIZE: 512
+    LOW_RES_SIZE: 224
+    LAYERS_TO_EXTRACT: [0, 3, 6, 9]
+
+INPUT:
+  SIZE: 512
+
+BACKBONE: 'FPT'
+ALGORITHM: 'ERM'
+
+# ----------------- [修改部分] -----------------
+# 扁平化设置，直接覆盖默认值，不再使用 SOLVER 嵌套
+LEARNING_RATE: 0.0001
+WEIGHT_DECAY: 0.05
+MOMENTUM: 0.9
