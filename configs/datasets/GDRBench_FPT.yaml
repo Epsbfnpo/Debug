@@ -1,0 +1,30 @@
+DATASET:
+  NAME: 'GDRBench'
+  NUM_CLASSES: 5
+  ROOT: './data/GDRBench'
+
+  # --- [SPMix Archive] ---
+  # SPMIX_PROB: 0.5
+  # -----------------------
+
+MODEL:
+  FPT:
+    SELECTION_RATIO: 0.5
+    LPM_PATH: '/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16'
+    HIGH_RES_SIZE: 512
+    LOW_RES_SIZE: 224
+    LAYERS_TO_EXTRACT: [0, 3, 6, 9]
+
+INPUT:
+  SIZE: 512
+
+GDRNET:
+  BETA: 0.1
+
+BACKBONE: 'FPT'
+ALGORITHM: 'ERM'
+
+BATCH_SIZE: 32
+LEARNING_RATE: 0.0005
+WEIGHT_DECAY: 0.0001
+MOMENTUM: 0.9
