@@ -466,8 +466,8 @@ class CASS_GDRNet(Algorithm):
         saliency_map = self.compute_saliency_map(imgs)
         patch_saliency = F.avg_pool2d(saliency_map, kernel_size=block_size, stride=block_size)
         patch_saliency = patch_saliency.view(N, L)
-        sal_min = patch_saliency.min(dim=1, keepdim=True)
-        sal_max = patch_saliency.max(dim=1, keepdim=True)
+        sal_min = patch_saliency.min(dim=1, keepdim=True).values
+        sal_max = patch_saliency.max(dim=1, keepdim=True).values
         patch_saliency = (patch_saliency - sal_min) / (sal_max - sal_min + 1e-6)
         rand_noise = torch.rand([N, L], device=x.device)
         final_scores = patch_saliency + noise_weight * rand_noise
