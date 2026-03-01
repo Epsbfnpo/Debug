@@ -433,9 +433,9 @@ class CASS_GDRNet(Algorithm):
 
     def patchify(self, imgs, block=32):
         p = block
-        assert imgs.shape == imgs.shape and imgs.shape % p == 0
-        h = w = imgs.shape // p
-        n = imgs.shape
+        n, c, h_img, w_img = imgs.shape
+        assert c == 3 and h_img == w_img and h_img % p == 0
+        h = w = h_img // p
         x = imgs.reshape(shape=(n, 3, h, p, w, p))
         x = torch.einsum('nchpwq->nhwpqc', x)
         x = x.reshape(shape=(n, h * w, p ** 2 * 3))
@@ -443,9 +443,9 @@ class CASS_GDRNet(Algorithm):
 
     def unpatchify(self, x, block=32):
         p = block
-        h = w = int(x.shape ** .5)
-        n = x.shape
-        assert h * w == x.shape
+        n, l, _ = x.shape
+        h = w = int(l ** 0.5)
+        assert h * w == l
         x = x.reshape(shape=(n, h, w, p, p, 3))
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(shape=(n, 3, h * p, h * p))
@@ -461,7 +461,8 @@ class CASS_GDRNet(Algorithm):
 
     def saliency_guided_masking(self, x, imgs, mask_ratio=0.5, noise_weight=0.3):
         N, L, D = x.shape
-        block_size = int((imgs.shape * imgs.shape / L) ** 0.5)
+        _, _, h_img, w_img = imgs.shape
+        block_size = int(((h_img * w_img) / L) ** 0.5)
         saliency_map = self.compute_saliency_map(imgs)
         patch_saliency = F.avg_pool2d(saliency_map, kernel_size=block_size, stride=block_size)
         patch_saliency = patch_saliency.view(N, L)
@@ -559,7 +560,7 @@ class CASS_GDRNet(Algorithm):
                 proj_mix = network_inner.projector_cnn(feat_orthmix)
             proj_mix = proj_mix.float()
             proj_mix_norm = F.normalize(proj_mix, dim=1)
-            num_mixs = proj_mix.shape // chunk_size
+            num_mixs = proj_mix.shape[0] // chunk_size
             target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
             cos_sim_mix = (proj_mix_norm * target_proj_rep).sum(dim=1)
             loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
