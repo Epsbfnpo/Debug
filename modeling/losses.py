@@ -162,18 +162,29 @@ class GDRNetLoss_Integrated(nn.Module):
         combined_weight = torch.clamp(combined_weight, min=0.1, max=10.0)
         return combined_weight / 2.0
 
-    def forward(self, output_dict, queue_dict, labels, domains):
+    def forward(self, output_dict, target_dict, labels, domains):
         dcr_weight = self.get_dcr_weights(labels, domains)
         logits_cnn = output_dict['logits_cnn']
         logits_vit = output_dict['logits_vit']
         proj_cnn = output_dict['proj_cnn']
         proj_vit = output_dict['proj_vit']
-        loss_sup_cnn = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
-        loss_sup_vit = (self.SupLoss(logits_vit, labels) * dcr_weight).mean()
         proj_cnn_norm = F.normalize(proj_cnn, dim=1)
         proj_vit_norm = F.normalize(proj_vit, dim=1)
-        cos_sim = (proj_cnn_norm * proj_vit_norm).sum(dim=1)
-        loss_cass_raw = 2.0 - 2.0 * cos_sim
+        loss_sup_cnn = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
+        loss_sup_vit = (self.SupLoss(logits_vit, labels) * dcr_weight).mean()
+
+        cos_sim_1 = (proj_cnn_norm * proj_vit_norm).sum(dim=1)
+        loss_cass_1 = 2.0 - 2.0 * cos_sim_1
+
+        target_vit = target_dict['target_vit']
+        cos_sim_2 = (proj_cnn_norm * target_vit).sum(dim=1)
+        loss_cass_2 = 2.0 - 2.0 * cos_sim_2
+
+        target_cnn = target_dict['target_cnn']
+        cos_sim_3 = (proj_vit_norm * target_cnn).sum(dim=1)
+        loss_cass_3 = 2.0 - 2.0 * cos_sim_3
+
+        loss_cass_raw = (loss_cass_1 + loss_cass_2 + loss_cass_3) / 3.0
         loss_cass = (loss_cass_raw * dcr_weight).mean()
         lambda_sup = 1.0
         lambda_cass = 0.5

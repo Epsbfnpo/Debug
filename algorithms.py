@@ -417,8 +417,10 @@ class CASS_GDRNet(Algorithm):
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
         self.K = 1024
         proj_dim = 1024
-        self.register_buffer("queue", torch.randn(self.K, proj_dim))
-        self.queue = nn.functional.normalize(self.queue, dim=-1)
+        self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
+        self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
+        self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
+        self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         init_prototypes = F.normalize(torch.randn(num_classes, proj_dim), dim=1)
@@ -481,22 +483,36 @@ class CASS_GDRNet(Algorithm):
         return x_masked
 
     @torch.no_grad()
-    def dequeue_and_enqueue(self, features, labels):
-        features = features.float()
-        batch_size = features.shape[0]
+    def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
+        feat_cnn = feat_cnn.float()
+        feat_vit = feat_vit.float()
+        batch_size = feat_cnn.shape[0]
         ptr = int(self.queue_ptr)
-        replace_idx = torch.arange(ptr, ptr + batch_size).to(features.device) % self.K
-        self.queue[replace_idx, :] = features
+        replace_idx = torch.arange(ptr, ptr + batch_size).to(feat_cnn.device) % self.K
+        self.queue_cnn[replace_idx, :] = feat_cnn
+        self.queue_vit[replace_idx, :] = feat_vit
         self.queue_labels[replace_idx] = labels
         ptr = (ptr + batch_size) % self.K
         self.queue_ptr[0] = ptr
+
+    @torch.no_grad()
+    def sample_target(self, current_features, labels, target_queue):
+        neighbor = []
+        for i, label in enumerate(labels):
+            pos = torch.where(self.queue_labels == label)[0]
+            if len(pos) != 0:
+                neighbor.append(target_queue[pos].mean(0))
+            else:
+                neighbor.append(current_features[i])
+        targets = torch.stack(neighbor, dim=0)
+        return F.normalize(targets, dim=-1)
 
     @torch.no_grad()
     def compute_prototypes_from_queue(self):
         for c in range(self.cfg.DATASET.NUM_CLASSES):
             idx = torch.nonzero(self.queue_labels == c).squeeze()
             if idx.numel() > 0:
-                class_proto = self.queue[idx].view(-1, self.queue.shape[1]).mean(dim=0)
+                class_proto = self.queue_vit[idx].view(-1, self.queue_vit.shape[1]).mean(dim=0)
                 class_proto = F.normalize(class_proto, dim=0)
                 if not self.proto_initialized[c]:
                     self.prototypes[c] = class_proto
@@ -554,6 +570,8 @@ class CASS_GDRNet(Algorithm):
                 res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
             momentum_proj_vit = res_momentum['proj_vit'].float()
             momentum_proj_vit = F.normalize(momentum_proj_vit, dim=1)
+            momentum_proj_cnn = res_momentum['proj_cnn'].float()
+            momentum_proj_cnn = F.normalize(momentum_proj_cnn, dim=1)
         loss_fastmoco = torch.tensor(0.0, device=image.device)
         with get_sync_context():
             with torch.amp.autocast('cuda'):
@@ -564,10 +582,11 @@ class CASS_GDRNet(Algorithm):
             target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
             cos_sim_mix = (proj_mix_norm * target_proj_rep).sum(dim=1)
             loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
-        self.dequeue_and_enqueue(momentum_proj_vit.detach(), label)
-        self.compute_prototypes_from_queue()
-        queue_dict = {'prototypes': self.prototypes, 'queue_labels': self.queue_labels}
-        loss_main, loss_dict = self.criterion(res_clean_fp32, queue_dict, label, domain)
+        target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
+        target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
+        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
+        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
+        loss_main, loss_dict = self.criterion(res_clean_fp32, target_dict, label, domain)
         logits_vit = res_clean_fp32['logits_vit']
         logits_cnn = res_clean_fp32['logits_cnn']
         kd_temp = 1.0
@@ -642,13 +661,13 @@ class CASS_GDRNet(Algorithm):
                 state_dict = self.network.state_dict()
             if source == 'cnn':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
-                torch.save({'queue': self.queue, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
+                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
             elif source == 'vit':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_vit.pth'))
-                torch.save({'queue': self.queue, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_vit.pth'))
+                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_vit.pth'))
             else:
                 torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-                torch.save({'queue': self.queue, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
+                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
 
     def renew_model(self, log_path, source='best'):
         if source == 'cnn':
