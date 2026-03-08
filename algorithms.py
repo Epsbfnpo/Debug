@@ -549,10 +549,19 @@ class CASS_GDRNet(Algorithm):
         x_cnn_patch = self.patchify(img_strong, block=block_size)
         x_cnn_masked_patch = self.saliency_guided_masking(x_cnn_patch, imgs=img_strong, mask_ratio=mask_ratio, noise_weight=0.3)
         img_strong_masked = self.unpatchify(x_cnn_masked_patch, block=block_size)
-        x_cnn_input = img_strong_masked
-        x_vit_input = img_strong
-        x_split_cnn = self._local_split(x_cnn_input).contiguous()
-        x_split_vit = self._local_split(x_vit_input).contiguous()
+        # 构建 4 个核心输入量
+        img_cnn_masked = img_strong_masked
+        img_cnn_unmasked = img_strong
+        img_vit_masked = img_strong_masked
+        img_vit_unmasked = img_strong
+
+        # 在 Batch 维度拼接，一次性前向传播
+        x_cnn_combined = torch.cat([img_cnn_masked, img_cnn_unmasked], dim=0)
+        x_vit_combined = torch.cat([img_vit_unmasked, img_vit_masked], dim=0)
+
+        # FastMoCo 的 split 使用前半部分基础数据
+        x_split_cnn = self._local_split(img_cnn_masked).contiguous()
+        x_split_vit = self._local_split(img_vit_unmasked).contiguous()
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
@@ -563,8 +572,21 @@ class CASS_GDRNet(Algorithm):
             feat_splits_list = list(feat_split.split(chunk_size, dim=0))
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
         with torch.amp.autocast('cuda'):
-            res_clean = self.network(x_cnn=x_cnn_input, x_vit=x_vit_input)
-        res_clean_fp32 = {'proj_cnn': res_clean['proj_cnn'].float(), 'proj_vit': res_clean['proj_vit'].float(), 'logits_cnn': res_clean['logits_cnn'].float(), 'logits_vit': res_clean['logits_vit'].float()}
+            res_combined = self.network(x_cnn=x_cnn_combined, x_vit=x_vit_combined)
+
+        B = image.size(0)
+
+        # 原路逻辑：CNN 掩码 + DINO 无掩码
+        res_clean_fp32 = {
+            'proj_cnn': res_combined['proj_cnn'][:B].float(),
+            'proj_vit': res_combined['proj_vit'][:B].float(),
+            'logits_cnn': res_combined['logits_cnn'][:B].float(),
+            'logits_vit': res_combined['logits_vit'][:B].float(),
+        }
+
+        # 对称逻辑：CNN 无掩码 + DINO 掩码
+        logits_cnn_unmasked = res_combined['logits_cnn'][B:].float()
+        logits_vit_masked = res_combined['logits_vit'][B:].float()
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
@@ -587,8 +609,6 @@ class CASS_GDRNet(Algorithm):
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
         loss_main, loss_dict = self.criterion(res_clean_fp32, target_dict, label, domain)
-        logits_vit = res_clean_fp32['logits_vit']
-        logits_cnn = res_clean_fp32['logits_cnn']
         kd_temp = 1.0
         kd_alpha = 0.5
         label_smooth = 0.1
@@ -596,12 +616,25 @@ class CASS_GDRNet(Algorithm):
         with torch.no_grad():
             true_dist = F.one_hot(label, num_classes=num_classes).float()
             true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
-            vit_soft_dist = F.softmax(logits_vit.detach() / kd_temp, dim=1)
-            mixed_target = kd_alpha * vit_soft_dist + (1.0 - kd_alpha) * true_dist
-        log_prob_cnn = F.log_softmax(logits_cnn / kd_temp, dim=1)
-        loss_kd = -torch.sum(mixed_target * log_prob_cnn, dim=1).mean() * (kd_temp ** 2)
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd
-        del img_strong, img_weak, x_cnn_input, x_vit_input, x_split_cnn, x_split_vit
+
+            # 路径 1: DINO(无掩码) -> CNN(有掩码)
+            vit_unmasked_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
+            mixed_target_for_cnn = kd_alpha * vit_unmasked_soft + (1.0 - kd_alpha) * true_dist
+
+            # 路径 2: CNN(无掩码) -> DINO(有掩码)
+            cnn_unmasked_soft = F.softmax(logits_cnn_unmasked.detach() / kd_temp, dim=1)
+            mixed_target_for_vit = kd_alpha * cnn_unmasked_soft + (1.0 - kd_alpha) * true_dist
+
+        log_prob_cnn_masked = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
+        loss_kd_cnn = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1).mean() * (kd_temp ** 2)
+
+        log_prob_vit_masked = F.log_softmax(logits_vit_masked / kd_temp, dim=1)
+        loss_kd_vit = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1).mean() * (kd_temp ** 2)
+
+        loss_kd_total = loss_kd_cnn + loss_kd_vit
+        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total
+        del img_strong, img_weak, img_cnn_masked, img_cnn_unmasked, img_vit_masked, img_vit_unmasked
+        del x_cnn_combined, x_vit_combined, x_split_cnn, x_split_vit
         del feat_split, feat_orthmix, cos_sim_mix, target_proj_rep
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -612,7 +645,9 @@ class CASS_GDRNet(Algorithm):
             for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
         loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_kd'] = loss_kd.item()
+        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
+        loss_dict['loss_kd_vit'] = loss_kd_vit.item()
+        loss_dict['loss_kd_total'] = loss_kd_total.item()
         loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
