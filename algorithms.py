@@ -544,22 +544,31 @@ class CASS_GDRNet(Algorithm):
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
         img_weak = image.clone() * mask
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
-        block_size = 32
+
+        img_strong_cnn = F.interpolate(img_strong, size=(512, 512), mode='bilinear', align_corners=False)
+        img_weak_cnn = F.interpolate(img_weak, size=(512, 512), mode='bilinear', align_corners=False)
+
         mask_ratio = 0.5
-        x_cnn_patch = self.patchify(img_strong, block=block_size)
-        x_cnn_masked_patch = self.saliency_guided_masking(x_cnn_patch, imgs=img_strong, mask_ratio=mask_ratio, noise_weight=0.3)
-        img_strong_masked = self.unpatchify(x_cnn_masked_patch, block=block_size)
-        # 构建 4 个核心输入量
-        img_cnn_masked = img_strong_masked
-        img_cnn_unmasked = img_strong
-        img_vit_masked = img_strong_masked
+
+        block_size_cnn = 32
+        x_cnn_patch = self.patchify(img_strong_cnn, block=block_size_cnn)
+        x_cnn_masked_patch = self.saliency_guided_masking(x_cnn_patch, imgs=img_strong_cnn, mask_ratio=mask_ratio, noise_weight=0.3)
+        img_strong_masked_cnn = self.unpatchify(x_cnn_masked_patch, block=block_size_cnn)
+
+        img_cnn_masked = img_strong_masked_cnn
+        img_cnn_unmasked = img_strong_cnn
+
+        block_size_vit = 64
+        x_vit_patch = self.patchify(img_strong, block=block_size_vit)
+        x_vit_masked_patch = self.saliency_guided_masking(x_vit_patch, imgs=img_strong, mask_ratio=mask_ratio, noise_weight=0.3)
+        img_strong_masked_vit = self.unpatchify(x_vit_masked_patch, block=block_size_vit)
+
+        img_vit_masked = img_strong_masked_vit
         img_vit_unmasked = img_strong
 
-        # 在 Batch 维度拼接，一次性前向传播
         x_cnn_combined = torch.cat([img_cnn_masked, img_cnn_unmasked], dim=0)
         x_vit_combined = torch.cat([img_vit_unmasked, img_vit_masked], dim=0)
 
-        # FastMoCo 的 split 使用前半部分基础数据
         x_split_cnn = self._local_split(img_cnn_masked).contiguous()
         x_split_vit = self._local_split(img_vit_unmasked).contiguous()
         with get_sync_context():
@@ -589,7 +598,7 @@ class CASS_GDRNet(Algorithm):
         logits_vit_masked = res_combined['logits_vit'][B:].float()
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
-                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
+                res_momentum = momentum_inner(x_cnn=img_weak_cnn, x_vit=img_weak)
             momentum_proj_vit = res_momentum['proj_vit'].float()
             momentum_proj_vit = F.normalize(momentum_proj_vit, dim=1)
             momentum_proj_cnn = res_momentum['proj_cnn'].float()
@@ -683,7 +692,9 @@ class CASS_GDRNet(Algorithm):
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        res = self.network(x_cnn=x, x_vit=x)
+        x_vit = x
+        x_cnn = F.interpolate(x, size=(512, 512), mode='bilinear', align_corners=False)
+        res = self.network(x_cnn=x_cnn, x_vit=x_vit)
         return res
 
     def save_model(self, log_path, source='best'):
