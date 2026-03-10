@@ -168,13 +168,18 @@ class GDRNetLoss_Integrated(nn.Module):
         logits_vit = output_dict['logits_vit']
         proj_cnn = output_dict['proj_cnn']
         proj_vit = output_dict['proj_vit']
+        pred_cnn = output_dict['pred_cnn']
+        pred_vit = output_dict['pred_vit']
+        pred_cnn_norm = F.normalize(pred_cnn, dim=1)
+        pred_vit_norm = F.normalize(pred_vit, dim=1)
         proj_cnn_norm = F.normalize(proj_cnn, dim=1)
         proj_vit_norm = F.normalize(proj_vit, dim=1)
         loss_sup_cnn = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
         loss_sup_vit = (self.SupLoss(logits_vit, labels) * dcr_weight).mean()
 
-        cos_sim_1 = (proj_cnn_norm * proj_vit_norm).sum(dim=1)
-        loss_cass_1 = 2.0 - 2.0 * cos_sim_1
+        cos_sim_1a = (pred_cnn_norm * proj_vit_norm.detach()).sum(dim=1)
+        cos_sim_1b = (pred_vit_norm * proj_cnn_norm.detach()).sum(dim=1)
+        loss_cass_1 = ((2.0 - 2.0 * cos_sim_1a) + (2.0 - 2.0 * cos_sim_1b)) / 2.0
 
         target_vit = target_dict['target_vit']
         cos_sim_2 = (proj_cnn_norm * target_vit).sum(dim=1)

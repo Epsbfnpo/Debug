@@ -410,13 +410,26 @@ class CASS_GDRNet(Algorithm):
         for param in self.momentum_network.parameters():
             param.requires_grad = False
         self.m = 0.999
+        proj_dim = 1024
+        self.predictor_cnn = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.predictor_vit = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
         trainable_params = [p for p in self.network.parameters() if p.requires_grad]
+        trainable_params += list(self.predictor_cnn.parameters()) + list(self.predictor_vit.parameters())
         total_params = sum(p.numel() for p in self.network.parameters())
         trainable_num = sum(p.numel() for p in trainable_params)
-        print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN): {trainable_num / 1e6:.2f}M")
+        print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN+Predictor): {trainable_num / 1e6:.2f}M")
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
         self.K = 1024
-        proj_dim = 1024
         self.num_positive = getattr(cfg, 'POSITIVE', 4)
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
         self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
@@ -576,7 +589,11 @@ class CASS_GDRNet(Algorithm):
         with torch.amp.autocast('cuda'):
             res_combined = self.network(x_cnn=x_cnn_combined, x_vit=x_vit_combined)
         B = image.size(0)
-        res_clean_fp32 = {'proj_cnn': res_combined['proj_cnn'][:B].float(), 'proj_vit': res_combined['proj_vit'][:B].float(), 'logits_cnn': res_combined['logits_cnn'][:B].float(), 'logits_vit': res_combined['logits_vit'][:B].float(),}
+        proj_cnn_clean = res_combined['proj_cnn'][:B].float()
+        proj_vit_clean = res_combined['proj_vit'][:B].float()
+        pred_cnn = self.predictor_cnn(proj_cnn_clean)
+        pred_vit = self.predictor_vit(proj_vit_clean)
+        res_clean_fp32 = {'proj_cnn': proj_cnn_clean, 'proj_vit': proj_vit_clean, 'pred_cnn': pred_cnn, 'pred_vit': pred_vit, 'logits_cnn': res_combined['logits_cnn'][:B].float(), 'logits_vit': res_combined['logits_vit'][:B].float(),}
         logits_cnn_unmasked = res_combined['logits_cnn'][B:].float()
         logits_vit_masked = res_combined['logits_vit'][B:].float()
         with torch.no_grad():
