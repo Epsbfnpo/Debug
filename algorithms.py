@@ -618,8 +618,8 @@ class CASS_GDRNet(Algorithm):
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
-        kd_temp = 1.0
-        kd_alpha = 0.5
+        kd_temp = 0.6
+        kd_alpha = max(0.0, 1.0 - (self.epoch / self.cfg.EPOCHS))
         label_smooth = 0.1
         num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
@@ -630,13 +630,13 @@ class CASS_GDRNet(Algorithm):
             cnn_unmasked_soft = F.softmax(logits_cnn_unmasked.detach() / kd_temp, dim=1)
             mixed_target_for_vit = kd_alpha * cnn_unmasked_soft + (1.0 - kd_alpha) * true_dist
         log_prob_cnn_masked = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn_raw = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1) * (kd_temp ** 2)
+        loss_kd_cnn_raw = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1)
         loss_kd_cnn = (loss_kd_cnn_raw * dcr_weight).mean()
         log_prob_vit_masked = F.log_softmax(logits_vit_masked / kd_temp, dim=1)
-        loss_kd_vit_raw = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1) * (kd_temp ** 2)
+        loss_kd_vit_raw = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1)
         loss_kd_vit = (loss_kd_vit_raw * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total
+        total_loss = loss_main + 0.5 * loss_fastmoco + 1.0 * loss_kd_total
         del img_strong, img_weak, img_cnn_masked, img_cnn_unmasked, img_vit_masked, img_vit_unmasked
         del x_cnn_combined, x_vit_combined, x_split_cnn, x_split_vit
         del feat_split, feat_orthmix, cos_sim_mix, target_proj_rep
