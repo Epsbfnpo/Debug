@@ -405,323 +405,86 @@ class DRGen(Algorithm):
 class CASS_GDRNet(Algorithm):
     def __init__(self, num_classes, cfg):
         super(CASS_GDRNet, self).__init__(num_classes, cfg)
-        self.network = DualTowerGDRNet(cfg)
-        self.momentum_network = copy.deepcopy(self.network)
-        for param in self.momentum_network.parameters():
-            param.requires_grad = False
-        self.m = 0.999
-        proj_dim = 1024
-        self.predictor_cnn = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, proj_dim)
-        )
-        self.predictor_vit = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, proj_dim)
-        )
-        trainable_params = [p for p in self.network.parameters() if p.requires_grad]
-        trainable_params += list(self.predictor_cnn.parameters()) + list(self.predictor_vit.parameters())
-        total_params = sum(p.numel() for p in self.network.parameters())
-        trainable_num = sum(p.numel() for p in trainable_params)
-        print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN+Predictor): {trainable_num / 1e6:.2f}M")
+
+        # 1. 纯粹的 CNN (通过 cfg 加载 ResNet50)
+        self.network = models.get_net(cfg)
+        self.classifier = models.get_classifier(self.network.out_features(), cfg)
+
+        # 2. 仅优化 CNN 和 分类器 的参数
+        trainable_params = list(self.network.parameters()) + list(self.classifier.parameters())
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-        self.K = 1024
-        self.num_positive = getattr(cfg, 'POSITIVE', 4)
-        self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
-        self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
-        self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
-        self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
-        self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        init_prototypes = F.normalize(torch.randn(num_classes, proj_dim), dim=1)
-        self.register_buffer("prototypes", init_prototypes)
-        self.register_buffer("proto_initialized", torch.zeros(num_classes, dtype=torch.bool))
-        self.split_num = 2
-        self.combs = 3
+
+        # 3. 保留基础的数据增强模块
         self.fundusAug = get_post_FundusAug(cfg)
-        self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
-        self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
-
-    def patchify(self, imgs, block=32):
-        p = block
-        n, c, h_img, w_img = imgs.shape
-        assert c == 3 and h_img == w_img and h_img % p == 0
-        h = w = h_img // p
-        x = imgs.reshape(shape=(n, 3, h, p, w, p))
-        x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(n, h * w, p ** 2 * 3))
-        return x
-
-    def unpatchify(self, x, block=32):
-        p = block
-        n, l, _ = x.shape
-        h = w = int(l ** 0.5)
-        assert h * w == l
-        x = x.reshape(shape=(n, h, w, p, p, 3))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(n, 3, h * p, h * p))
-        return imgs
-
-    def compute_saliency_map(self, imgs):
-        kernel_size = 31
-        padding = kernel_size // 2
-        surround = F.avg_pool2d(imgs, kernel_size=kernel_size, stride=1, padding=padding)
-        saliency = torch.abs(imgs - surround)
-        saliency_map = torch.mean(saliency, dim=1, keepdim=True)
-        return saliency_map
-
-    def saliency_guided_masking(self, x, imgs, mask_ratio=0.5, noise_weight=0.3):
-        N, L, D = x.shape
-        _, _, h_img, w_img = imgs.shape
-        block_size = int(((h_img * w_img) / L) ** 0.5)
-        saliency_map = self.compute_saliency_map(imgs)
-        patch_saliency = F.avg_pool2d(saliency_map, kernel_size=block_size, stride=block_size)
-        patch_saliency = patch_saliency.view(N, L)
-        sal_min = patch_saliency.min(dim=1, keepdim=True).values
-        sal_max = patch_saliency.max(dim=1, keepdim=True).values
-        patch_saliency = (patch_saliency - sal_min) / (sal_max - sal_min + 1e-6)
-        rand_noise = torch.rand([N, L], device=x.device)
-        final_scores = patch_saliency + noise_weight * rand_noise
-        len_keep = int(L * (1 - mask_ratio))
-        ids_shuffle = torch.argsort(-final_scores, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-        mask = torch.ones([N, L], device=x.device)
-        mask[:, :len_keep] = 0
-        mask = torch.gather(mask, dim=1, index=ids_restore)
-        x_masked = x * (1 - mask.unsqueeze(-1))
-        return x_masked
-
-    @torch.no_grad()
-    def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
-        feat_cnn = feat_cnn.float()
-        feat_vit = feat_vit.float()
-        batch_size = feat_cnn.shape[0]
-        ptr = int(self.queue_ptr)
-        replace_idx = torch.arange(ptr, ptr + batch_size).to(feat_cnn.device) % self.K
-        self.queue_cnn[replace_idx, :] = feat_cnn
-        self.queue_vit[replace_idx, :] = feat_vit
-        self.queue_labels[replace_idx] = labels
-        ptr = (ptr + batch_size) % self.K
-        self.queue_ptr[0] = ptr
-
-    @torch.no_grad()
-    def sample_target(self, current_features, labels, target_queue):
-        neighbor = []
-        for i, label in enumerate(labels):
-            pos = torch.where(self.queue_labels == label)[0]
-            if len(pos) != 0:
-                if self.num_positive > 0:
-                    weights = torch.ones_like(pos).float()
-                    choice = torch.multinomial(weights, self.num_positive, replacement=True)
-                    idx = pos[choice]
-                    neighbor.append(target_queue[idx].mean(0))
-                else:
-                    neighbor.append(target_queue[pos].mean(0))
-            else:
-                neighbor.append(current_features[i])
-        targets = torch.stack(neighbor, dim=0)
-        return F.normalize(targets, dim=-1)
-
-    @torch.no_grad()
-    def compute_prototypes_from_queue(self):
-        for c in range(self.cfg.DATASET.NUM_CLASSES):
-            idx = torch.nonzero(self.queue_labels == c).squeeze()
-            if idx.numel() > 0:
-                class_proto = self.queue_vit[idx].view(-1, self.queue_vit.shape[1]).mean(dim=0)
-                class_proto = F.normalize(class_proto, dim=0)
-                if not self.proto_initialized[c]:
-                    self.prototypes[c] = class_proto
-                    self.proto_initialized[c] = True
-                else:
-                    self.prototypes[c] = F.normalize(0.9 * self.prototypes[c] + 0.1 * class_proto, dim=0)
-
-    def _local_split(self, x):
-        _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
-        cols = x.split(_side_indent[1], dim=3)
-        xs = []
-        for _x in cols:
-            xs += _x.split(_side_indent[0], dim=2)
-        return torch.cat(xs, dim=0)
 
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
-        if hasattr(self.network, 'module'):
-            network_inner = self.network.module
-            get_sync_context = self.network.no_sync
-            momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
-        else:
-            network_inner = self.network
-            get_sync_context = contextlib.nullcontext
-            momentum_inner = self.momentum_network
+
+        # 1. 基础数据增强 (仅保留原图的 fundusAug 增强，去掉强弱增强对比和 Masking)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
-        img_weak = image.clone() * mask
-        img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
-        block_size = 32
-        mask_ratio = 0.5
-        x_cnn_patch = self.patchify(img_strong, block=block_size)
-        x_cnn_masked_patch = self.saliency_guided_masking(x_cnn_patch, imgs=img_strong, mask_ratio=mask_ratio, noise_weight=0.3)
-        img_strong_masked = self.unpatchify(x_cnn_masked_patch, block=block_size)
-        img_cnn_masked = img_strong_masked
-        img_cnn_unmasked = img_strong
-        img_vit_masked = img_strong_masked
-        img_vit_unmasked = img_strong
-        x_cnn_combined = torch.cat([img_cnn_masked, img_cnn_unmasked], dim=0)
-        x_vit_combined = torch.cat([img_vit_unmasked, img_vit_masked], dim=0)
-        x_split_cnn = self._local_split(img_cnn_masked).contiguous()
-        x_split_vit = self._local_split(img_vit_unmasked).contiguous()
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
-            feat_split = feat_split.float()
-            if len(feat_split.shape) > 2:
-                feat_split = feat_split.view(feat_split.size(0), -1)
-            chunk_size = image.size(0)
-            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
-            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
+
+        # 2. 纯 CNN 前向传播与交叉熵损失 (CE Loss)
         with torch.amp.autocast('cuda'):
-            res_combined = self.network(x_cnn=x_cnn_combined, x_vit=x_vit_combined)
-        B = image.size(0)
-        proj_cnn_clean = res_combined['proj_cnn'][:B].float()
-        proj_vit_clean = res_combined['proj_vit'][:B].float()
-        pred_cnn = self.predictor_cnn(proj_cnn_clean)
-        pred_vit = self.predictor_vit(proj_vit_clean)
-        res_clean_fp32 = {'proj_cnn': proj_cnn_clean, 'proj_vit': proj_vit_clean, 'pred_cnn': pred_cnn, 'pred_vit': pred_vit, 'logits_cnn': res_combined['logits_cnn'][:B].float(), 'logits_vit': res_combined['logits_vit'][:B].float(),}
-        logits_cnn_unmasked = res_combined['logits_cnn'][B:].float()
-        logits_vit_masked = res_combined['logits_vit'][B:].float()
-        with torch.no_grad():
-            with torch.amp.autocast('cuda'):
-                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
-            momentum_proj_vit = res_momentum['proj_vit'].float()
-            momentum_proj_vit = F.normalize(momentum_proj_vit, dim=1)
-            momentum_proj_cnn = res_momentum['proj_cnn'].float()
-            momentum_proj_cnn = F.normalize(momentum_proj_cnn, dim=1)
-        loss_fastmoco = torch.tensor(0.0, device=image.device)
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                proj_mix = network_inner.projector_cnn(feat_orthmix)
-            proj_mix = proj_mix.float()
-            proj_mix_norm = F.normalize(proj_mix, dim=1)
-            num_mixs = proj_mix.shape[0] // chunk_size
-            target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
-            cos_sim_mix = (proj_mix_norm * target_proj_rep).sum(dim=1)
-            loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
-        target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
-        target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
-        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
-        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
-        loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
-        kd_temp = 0.6
-        kd_alpha = max(0.0, 1.0 - (self.epoch / self.cfg.EPOCHS))
-        label_smooth = 0.1
-        num_classes = self.cfg.DATASET.NUM_CLASSES
-        with torch.no_grad():
-            true_dist = F.one_hot(label, num_classes=num_classes).float()
-            true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
-            vit_unmasked_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
-            mixed_target_for_cnn = kd_alpha * vit_unmasked_soft + (1.0 - kd_alpha) * true_dist
-            cnn_unmasked_soft = F.softmax(logits_cnn_unmasked.detach() / kd_temp, dim=1)
-            mixed_target_for_vit = kd_alpha * cnn_unmasked_soft + (1.0 - kd_alpha) * true_dist
-        log_prob_cnn_masked = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn_raw = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1)
-        loss_kd_cnn = (loss_kd_cnn_raw * dcr_weight).mean()
-        log_prob_vit_masked = F.log_softmax(logits_vit_masked / kd_temp, dim=1)
-        loss_kd_vit_raw = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1)
-        loss_kd_vit = (loss_kd_vit_raw * dcr_weight).mean()
-        loss_kd_total = loss_kd_cnn + loss_kd_vit
-        total_loss = loss_main + 0.5 * loss_fastmoco + 1.0 * loss_kd_total
-        del img_strong, img_weak, img_cnn_masked, img_cnn_unmasked, img_vit_masked, img_vit_unmasked
-        del x_cnn_combined, x_vit_combined, x_split_cnn, x_split_vit
-        del feat_split, feat_orthmix, cos_sim_mix, target_proj_rep
-        self.scaler.scale(total_loss).backward()
+            features = self.network(img_strong)
+            logits = self.classifier(features)
+            loss = F.cross_entropy(logits, label)
+
+        # 3. 反向传播与优化
+        self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        with torch.no_grad():
-            for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
-                param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-        loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
-        loss_dict['loss_kd_vit'] = loss_kd_vit.item()
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
-        loss_dict['loss'] = total_loss.item()
-        loss_dict['gate1'] = network_inner.bridge1.gate.item()
-        loss_dict['gate2'] = network_inner.bridge2.gate.item()
-        loss_dict['gate3'] = network_inner.bridge3.gate.item()
+
+        loss_dict = {'loss': loss.item()}
         return loss_dict
 
     def update_epoch(self, epoch):
         self.epoch = epoch
-        if hasattr(self.criterion, 'update_alpha'):
-            self.criterion.update_alpha(epoch)
         return epoch
 
     def validate(self, val_loader, test_loader, writer):
-        self.eval_branch = 'cnn'
-        metrics_cnn_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_cnn')
-        metrics_cnn_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
-        val_auc_cnn = metrics_cnn_val['auc']
-        test_auc_cnn = metrics_cnn_test['auc']
-        self.eval_branch = 'vit'
-        metrics_vit_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_vit')
-        metrics_vit_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_vit')
-        val_auc_vit = metrics_vit_val['auc']
-        test_auc_vit = metrics_vit_test['auc']
-        self.eval_branch = 'cnn'
+        # 纯 CNN 只需要验证一条分支
+        metrics_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val')
+        metrics_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test')
+
+        val_auc = metrics_val['auc']
+        test_auc = metrics_test['auc']
+
         if self.epoch == self.cfg.EPOCHS:
             self.epoch += 1
         if self.epoch > self.cfg.EPOCHS:
             logging.info("=" * 30)
-            logging.info(f"🚀 FINAL RESULTS (Epoch {self.epoch - 1})")
-            logging.info(f"✅ CNN Branch >> Val AUC: {val_auc_cnn:.4f} | Test AUC: {test_auc_cnn:.4f}")
-            logging.info(f"✅ ViT Branch >> Val AUC: {val_auc_vit:.4f} | Test AUC: {test_auc_vit:.4f}")
+            logging.info(f"🚀 FINAL RESULTS - Pure CNN (Epoch {self.epoch - 1})")
+            logging.info(f"✅ Baseline >> Val AUC: {val_auc:.4f} | Test AUC: {test_auc:.4f}")
             logging.info("=" * 30)
-        return val_auc_cnn, test_auc_cnn
+
+        return val_auc, test_auc
 
     def predict(self, x):
-        res = self.network(x_cnn=x, x_vit=x)
-        return res
+        # 预测时直接走 CNN
+        return self.classifier(self.network(x))
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            logging.info(f"Saving {source} model...")
-            if hasattr(self.network, 'module'):
-                state_dict = self.network.module.state_dict()
-            else:
-                state_dict = self.network.state_dict()
-            if source == 'cnn':
-                torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
-            elif source == 'vit':
-                torch.save(state_dict, os.path.join(log_path, 'best_model_vit.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_vit.pth'))
-            else:
-                torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
+            logging.info("Saving pure CNN model...")
+            state_dict = self.network.module.state_dict() if hasattr(self.network, 'module') else self.network.state_dict()
+            torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
+            torch.save(self.classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
 
     def renew_model(self, log_path, source='best'):
-        if source == 'cnn':
-            filename = 'best_model_cnn.pth'
-        elif source == 'vit':
-            filename = 'best_model_vit.pth'
-        else:
-            filename = 'best_model.pth'
-        net_path = os.path.join(log_path, filename)
+        net_path = os.path.join(log_path, 'best_model.pth')
+        cls_path = os.path.join(log_path, 'best_classifier.pth')
         if os.path.exists(net_path):
             state_dict = torch.load(net_path, map_location='cpu')
             if hasattr(self.network, 'module'):
                 self.network.module.load_state_dict(state_dict)
             else:
                 self.network.load_state_dict(state_dict)
-            logging.info(f"✅ Model renewed from {filename}")
-        else:
-            logging.warning(f"⚠️ Could not find {filename}, skipping load.")
+            self.classifier.load_state_dict(torch.load(cls_path, map_location='cpu'))
+            logging.info(f"✅ Model renewed from {net_path}")
