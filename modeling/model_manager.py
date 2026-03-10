@@ -3,7 +3,7 @@ from .nets import *
 import torch
 
 def get_net(cfg):
-    if cfg.ALGORITHM == 'ERM' or cfg.ALGORITHM == 'GDRNet':
+    if cfg.ALGORITHM in ['ERM', 'GDRNet', 'CASS_GDRNet']:
         net = get_backbone(cfg)
     elif cfg.ALGORITHM == 'GREEN':
         net = SoftLabelGCN(cfg)
