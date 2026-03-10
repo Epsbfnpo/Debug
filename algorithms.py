@@ -406,7 +406,10 @@ class CASS_GDRNet(Algorithm):
     def __init__(self, num_classes, cfg):
         super(CASS_GDRNet, self).__init__(num_classes, cfg)
 
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
+        # 1. 引入双塔网络 (CNN + ViT)
+        self.network = DualTowerGDRNet(cfg)
+
+        # 2. 引入 CASS 的非对称 Predictor
         # ================== 1. 引入双塔网络 (CNN + ViT) ==================
         self.network = DualTowerGDRNet(cfg)
 
@@ -426,10 +429,14 @@ class CASS_GDRNet(Algorithm):
         )
 
         # 优化器包含双塔网络和 Predictor 的参数
-        trainable_params = list(self.network.parameters()) +                            list(self.predictor_cnn.parameters()) +                            list(self.predictor_vit.parameters())
+        trainable_params = (
+            list(self.network.parameters())
+            + list(self.predictor_cnn.parameters())
+            + list(self.predictor_vit.parameters())
+        )
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
 
-        # ================== 3. 引入 CASS 队列 (Queue) ==================
+        # 3. 引入 CASS 队列 (Queue)
         self.K = 1024
         self.num_positive = getattr(cfg, 'POSITIVE', 4) # 动态多项式采样参数
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
@@ -439,7 +446,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
-        # ================== 4. 引入集成损失 (CE + CASS) ==================
+        # 4. 引入集成损失 (CE + CASS)
         self.criterion = GDRNetLoss_Integrated(
             training_domains=cfg.DATASET.SOURCE_DOMAINS,
             beta=cfg.GDRNET.BETA
@@ -452,7 +459,7 @@ class CASS_GDRNet(Algorithm):
     def dequeue_and_enqueue(self, proj_cnn, proj_vit, labels):
         batch_size = proj_cnn.shape[0]
         ptr = int(self.queue_ptr)
-        replace_idx = torch.arange(ptr, ptr + batch_size).cuda() % self.K
+        replace_idx = torch.arange(ptr, ptr + batch_size).to(proj_cnn.device) % self.K
         self.queue_cnn[replace_idx, :] = proj_cnn
         self.queue_vit[replace_idx, :] = proj_vit
         self.queue_labels[replace_idx] = labels
@@ -477,34 +484,16 @@ class CASS_GDRNet(Algorithm):
         targets = torch.stack(neighbor, dim=0)
         return F.normalize(targets, dim=-1)
 
-=======
-        # 1. 纯粹的 CNN (通过 cfg 加载 ResNet50)
-        self.network = models.get_net(cfg)
-        self.classifier = models.get_classifier(self.network.out_features(), cfg)
-
-        # 2. 仅优化 CNN 和 分类器 的参数
-        trainable_params = list(self.network.parameters()) + list(self.classifier.parameters())
-        self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-
-        # 3. 保留基础的数据增强模块
-        self.fundusAug = get_post_FundusAug(cfg)
-        self.scaler = torch.cuda.amp.GradScaler()
-
->>>>>>> main
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
 
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
         # 基础数据增强 (仅使用 strong aug)
-=======
-        # 1. 基础数据增强 (仅保留原图的 fundusAug 增强，去掉强弱增强对比和 Masking)
->>>>>>> main
+        # 基础数据增强 (仅使用 strong aug)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
 
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
         with torch.amp.autocast('cuda'):
             # 1. 双塔前向传播 (此版本没有 Feature Fusion 桥接)
             res_dict = self.network(img_strong)
@@ -534,12 +523,10 @@ class CASS_GDRNet(Algorithm):
 
             # 4. 计算监督损失和 CASS 损失 (无 KD，无 FastMoCo)
             loss_main, loss_dict_inner, dcr_weight = self.criterion(res_fp32, target_dict, label, domain)
-
             total_loss = loss_main
 
         # 5. 反向传播与优化
         self.scaler.scale(total_loss).backward()
-=======
         # 2. 纯 CNN 前向传播与交叉熵损失 (CE Loss)
         with torch.amp.autocast('cuda'):
             features = self.network(img_strong)
@@ -548,28 +535,21 @@ class CASS_GDRNet(Algorithm):
 
         # 3. 反向传播与优化
         self.scaler.scale(loss).backward()
->>>>>>> main
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
         # 6. 入队更新
         self.dequeue_and_enqueue(proj_cnn.detach(), proj_vit.detach(), label)
 
         return loss_dict_inner
-=======
-        loss_dict = {'loss': loss.item()}
-        return loss_dict
->>>>>>> main
 
     def update_epoch(self, epoch):
         self.epoch = epoch
         return epoch
 
     def validate(self, val_loader, test_loader, writer):
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
         # 双塔模型，分别验证 CNN 分支和 ViT 分支的表现
         metrics_val_cnn, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_cnn')
         metrics_test_cnn, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
@@ -580,45 +560,32 @@ class CASS_GDRNet(Algorithm):
         # 记录两个分支中表现最好的
         val_auc = max(metrics_val_cnn['auc'], metrics_val_vit['auc'])
         test_auc = max(metrics_test_cnn['auc'], metrics_test_vit['auc'])
-=======
-        # 纯 CNN 只需要验证一条分支
-        metrics_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val')
-        metrics_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test')
-
-        val_auc = metrics_val['auc']
-        test_auc = metrics_test['auc']
->>>>>>> main
 
         if self.epoch == self.cfg.EPOCHS:
             self.epoch += 1
         if self.epoch > self.cfg.EPOCHS:
             logging.info("=" * 30)
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
             logging.info(f"🚀 FINAL RESULTS - Step 2: + CASS (Epoch {self.epoch - 1})")
             logging.info(f"✅ CNN Branch >> Val AUC: {metrics_val_cnn['auc']:.4f} | Test AUC: {metrics_test_cnn['auc']:.4f}")
             logging.info(f"✅ ViT Branch >> Val AUC: {metrics_val_vit['auc']:.4f} | Test AUC: {metrics_test_vit['auc']:.4f}")
-=======
-            logging.info(f"🚀 FINAL RESULTS - Pure CNN (Epoch {self.epoch - 1})")
-            logging.info(f"✅ Baseline >> Val AUC: {val_auc:.4f} | Test AUC: {test_auc:.4f}")
->>>>>>> main
+            logging.info(f"🚀 FINAL RESULTS - Step 2: + CASS (Epoch {self.epoch - 1})")
+            logging.info(f"✅ CNN Branch >> Val AUC: {metrics_val_cnn['auc']:.4f} | Test AUC: {metrics_test_cnn['auc']:.4f}")
+            logging.info(f"✅ ViT Branch >> Val AUC: {metrics_val_vit['auc']:.4f} | Test AUC: {metrics_test_vit['auc']:.4f}")
             logging.info("=" * 30)
 
         return val_auc, test_auc
 
     def predict(self, x):
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
         # 验证预测时，采用双塔的 Logits 平均作为 Ensemble 结果
         res = self.network(x)
         return (res['logits_cnn'] + res['logits_vit']) / 2.0
-=======
-        # 预测时直接走 CNN
-        return self.classifier(self.network(x))
->>>>>>> main
+        # 验证预测时，采用双塔的 Logits 平均作为 Ensemble 结果
+        res = self.network(x)
+        return (res['logits_cnn'] + res['logits_vit']) / 2.0
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
             logging.info("Saving Step 2 CASS model...")
             state_dict = self.network.module.state_dict() if hasattr(self.network, 'module') else self.network.state_dict()
             torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
@@ -626,24 +593,10 @@ class CASS_GDRNet(Algorithm):
 
     def renew_model(self, log_path, source='best'):
         net_path = os.path.join(log_path, 'best_model.pth')
-=======
-            logging.info("Saving pure CNN model...")
-            state_dict = self.network.module.state_dict() if hasattr(self.network, 'module') else self.network.state_dict()
-            torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-            torch.save(self.classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
-
-    def renew_model(self, log_path, source='best'):
-        net_path = os.path.join(log_path, 'best_model.pth')
-        cls_path = os.path.join(log_path, 'best_classifier.pth')
->>>>>>> main
         if os.path.exists(net_path):
             state_dict = torch.load(net_path, map_location='cpu')
             if hasattr(self.network, 'module'):
                 self.network.module.load_state_dict(state_dict)
             else:
                 self.network.load_state_dict(state_dict)
-<<<<<<< codex/replace-cass_gdrnet-class-with-pure-cnn-ad0pn5
-=======
-            self.classifier.load_state_dict(torch.load(cls_path, map_location='cpu'))
->>>>>>> main
             logging.info(f"✅ Model renewed from {net_path}")
