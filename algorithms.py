@@ -527,16 +527,13 @@ class CASS_GDRNet(Algorithm):
 
         # 5. 反向传播与优化
         self.scaler.scale(total_loss).backward()
-        # 2. 纯 CNN 前向传播与交叉熵损失 (CE Loss)
-        with torch.amp.autocast('cuda'):
-            features = self.network(img_strong)
-            logits = self.classifier(features)
-            loss = F.cross_entropy(logits, label)
-
-        # 3. 反向传播与优化
-        self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(
+            list(self.network.parameters())
+            + list(self.predictor_cnn.parameters())
+            + list(self.predictor_vit.parameters()),
+            max_norm=5.0
+        )
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
