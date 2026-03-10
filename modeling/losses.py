@@ -185,12 +185,12 @@ class GDRNetLoss_Integrated(nn.Module):
         loss_cass_3 = 2.0 - 2.0 * cos_sim_3
 
         loss_cass_raw = (loss_cass_1 + loss_cass_2 + loss_cass_3) / 3.0
-        loss_cass = (loss_cass_raw * dcr_weight).mean()
+        loss_cass = loss_cass_raw.mean()
         lambda_sup = 1.0
         lambda_cass = 0.5
         loss_total = lambda_sup * (loss_sup_cnn + loss_sup_vit) + lambda_cass * loss_cass
         loss_dict = {"loss": loss_total.item(), "sup_cnn": loss_sup_cnn.item(), "sup_vit": loss_sup_vit.item(), "cass": loss_cass.item()}
-        return loss_total, loss_dict
+        return loss_total, loss_dict, dcr_weight
 
     def update_alpha(self, epoch):
         pass
