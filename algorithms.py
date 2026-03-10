@@ -417,6 +417,7 @@ class CASS_GDRNet(Algorithm):
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
         self.K = 1024
         proj_dim = 1024
+        self.num_positive = getattr(cfg, 'POSITIVE', 4)
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
         self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
         self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
@@ -501,7 +502,13 @@ class CASS_GDRNet(Algorithm):
         for i, label in enumerate(labels):
             pos = torch.where(self.queue_labels == label)[0]
             if len(pos) != 0:
-                neighbor.append(target_queue[pos].mean(0))
+                if self.num_positive > 0:
+                    weights = torch.ones_like(pos).float()
+                    choice = torch.multinomial(weights, self.num_positive, replacement=True)
+                    idx = pos[choice]
+                    neighbor.append(target_queue[idx].mean(0))
+                else:
+                    neighbor.append(target_queue[pos].mean(0))
             else:
                 neighbor.append(current_features[i])
         targets = torch.stack(neighbor, dim=0)
