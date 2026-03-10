@@ -405,15 +405,17 @@ class DRGen(Algorithm):
 class CASS_GDRNet(Algorithm):
     def __init__(self, num_classes, cfg):
         super(CASS_GDRNet, self).__init__(num_classes, cfg)
-
-        # 1. 引入双塔网络 (CNN + ViT)
-        self.network = DualTowerGDRNet(cfg)
-
-        # 2. 引入 CASS 的非对称 Predictor
+        
         # ================== 1. 引入双塔网络 (CNN + ViT) ==================
         self.network = DualTowerGDRNet(cfg)
-
-        # ================== 2. 引入 CASS 的非对称 Predictor ==================
+        
+        # ================== 新增：2. 引入动量网络 (Momentum Network) ==================
+        self.momentum_network = copy.deepcopy(self.network)
+        for param in self.momentum_network.parameters():
+            param.requires_grad = False
+        self.m = 0.999
+        
+        # 3. 引入 CASS 的非对称 Predictor
         proj_dim = 1024
         self.predictor_cnn = nn.Sequential(
             nn.Linear(proj_dim, proj_dim, bias=False),
@@ -427,39 +429,46 @@ class CASS_GDRNet(Algorithm):
             nn.ReLU(inplace=True),
             nn.Linear(proj_dim, proj_dim)
         )
-
-        # 优化器包含双塔网络和 Predictor 的参数
-        trainable_params = (
-            list(self.network.parameters())
-            + list(self.predictor_cnn.parameters())
-            + list(self.predictor_vit.parameters())
-        )
+        
+        trainable_params = list(self.network.parameters()) +                            list(self.predictor_cnn.parameters()) +                            list(self.predictor_vit.parameters())
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-
-        # 3. 引入 CASS 队列 (Queue)
+        
+        # 4. 引入 CASS 队列 (Queue)
         self.K = 1024
-        self.num_positive = getattr(cfg, 'POSITIVE', 4) # 动态多项式采样参数
+        self.num_positive = getattr(cfg, 'POSITIVE', 4)
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
         self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
         self.queue_cnn = F.normalize(self.queue_cnn, dim=-1)
         self.queue_vit = F.normalize(self.queue_vit, dim=-1)
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-        # 4. 引入集成损失 (CE + CASS)
+        
+        # ================== 新增：5. 特征融合 (Orthmix) 切分参数 ==================
+        self.split_num = 2
+        self.combs = 3
+        
         self.criterion = GDRNetLoss_Integrated(
-            training_domains=cfg.DATASET.SOURCE_DOMAINS,
+            training_domains=cfg.DATASET.SOURCE_DOMAINS, 
             beta=cfg.GDRNET.BETA
         )
-
+        
         self.fundusAug = get_post_FundusAug(cfg)
         self.scaler = torch.cuda.amp.GradScaler()
+
+    # ================== 新增：局部切分函数 ==================
+    def _local_split(self, x):
+        _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
+        cols = x.split(_side_indent[1], dim=3)
+        xs = []
+        for _x in cols:
+            xs += _x.split(_side_indent[0], dim=2)
+        return torch.cat(xs, dim=0)
 
     @torch.no_grad()
     def dequeue_and_enqueue(self, proj_cnn, proj_vit, labels):
         batch_size = proj_cnn.shape[0]
         ptr = int(self.queue_ptr)
-        replace_idx = torch.arange(ptr, ptr + batch_size).to(proj_cnn.device) % self.K
+        replace_idx = torch.arange(ptr, ptr + batch_size).cuda() % self.K
         self.queue_cnn[replace_idx, :] = proj_cnn
         self.queue_vit[replace_idx, :] = proj_vit
         self.queue_labels[replace_idx] = labels
@@ -487,44 +496,79 @@ class CASS_GDRNet(Algorithm):
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
-
-        # 基础数据增强 (仅使用 strong aug)
-        # 基础数据增强 (仅使用 strong aug)
+        
+        # 处理 DDP 下的 module 属性
+        network_inner = self.network.module if hasattr(self.network, 'module') else self.network
+        momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
+        
+        # 图像增强 (强弱分离)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
-
+        
+        img_weak = image.clone() * mask
+        img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
+        
+        # ================== 新增：FastMoCo 局部切分与融合 ==================
+        x_split = self._local_split(img_strong).contiguous()
+        
         with torch.amp.autocast('cuda'):
-            # 1. 双塔前向传播 (此版本没有 Feature Fusion 桥接)
-            res_dict = self.network(img_strong)
+            # 1. 提取切片局部特征并进行组合 (Orthmix)
+            feat_split = network_inner.extract_cnn_feature(x_cnn=x_split, x_vit=x_split)
+            feat_split = feat_split.float()
+            if len(feat_split.shape) > 2:
+                feat_split = feat_split.view(feat_split.size(0), -1)
+            
+            chunk_size = image.size(0)
+            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
+            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
+            
+            # 投影出融合特征
+            proj_mix = network_inner.projector_cnn(feat_orthmix)
+            proj_mix = proj_mix.float()
+            proj_mix_norm = F.normalize(proj_mix, dim=1)
 
+            # 2. 双塔正常前向传播
+            res_dict = self.network(x_cnn=img_strong, x_vit=img_strong)
             proj_cnn = res_dict['proj_cnn'].float()
             proj_vit = res_dict['proj_vit'].float()
-            logits_cnn = res_dict['logits_cnn'].float()
-            logits_vit = res_dict['logits_vit'].float()
-
-            # 2. 经过 Predictor 获取交叉预测特征
+            
             pred_cnn = self.predictor_cnn(proj_cnn)
             pred_vit = self.predictor_vit(proj_vit)
-
+            
             res_fp32 = {
-                'proj_cnn': proj_cnn,
-                'proj_vit': proj_vit,
+                'proj_cnn': proj_cnn, 
+                'proj_vit': proj_vit, 
                 'pred_cnn': pred_cnn,
                 'pred_vit': pred_vit,
-                'logits_cnn': logits_cnn,
-                'logits_vit': logits_vit,
+                'logits_cnn': res_dict['logits_cnn'].float(), 
+                'logits_vit': res_dict['logits_vit'].float(),
             }
 
-            # 3. 跨模态动态 Queue 采样 (ViT 查 CNN 队列，CNN 查 ViT 队列)
-            target_vit_for_cnn = self.sample_target(proj_vit.detach(), label, self.queue_vit)
-            target_cnn_for_vit = self.sample_target(proj_cnn.detach(), label, self.queue_cnn)
-            target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
+        # ================== 新增：动量网络前向提取 Target ==================
+        with torch.no_grad():
+            with torch.amp.autocast('cuda'):
+                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
+            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
+            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+            
+        # ================== 新增：计算 FastMoCo 融合特征对比损失 ==================
+        num_mixs = proj_mix.shape[0] // chunk_size
+        target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
+        cos_sim_mix = (proj_mix_norm * target_proj_rep).sum(dim=1)
+        loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
 
-            # 4. 计算监督损失和 CASS 损失 (无 KD，无 FastMoCo)
-            loss_main, loss_dict_inner, dcr_weight = self.criterion(res_fp32, target_dict, label, domain)
-            total_loss = loss_main
-
+        # 3. 跨模态动态 Queue 采样 (改用稳定的 Momentum 特征)
+        target_vit_for_cnn = self.sample_target(momentum_proj_vit.detach(), label, self.queue_vit)
+        target_cnn_for_vit = self.sample_target(momentum_proj_cnn.detach(), label, self.queue_cnn)
+        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
+        
+        # 4. 计算集成损失
+        loss_main, loss_dict_inner, dcr_weight = self.criterion(res_fp32, target_dict, label, domain)
+        
+        # 【修改点】总损失加入 FastMoCo 融合损失，权重 0.5
+        total_loss = loss_main + 0.5 * loss_fastmoco
+        
         # 5. 反向传播与优化
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -536,10 +580,16 @@ class CASS_GDRNet(Algorithm):
         )
         self.scaler.step(self.optimizer)
         self.scaler.update()
-
-        # 6. 入队更新
-        self.dequeue_and_enqueue(proj_cnn.detach(), proj_vit.detach(), label)
-
+        
+        # ================== 新增：动量参数更新 ==================
+        with torch.no_grad():
+            for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
+                param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+        
+        # 6. 入队更新 (使用更稳定的 Momentum 特征)
+        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
+        
+        loss_dict_inner['fastmoco'] = loss_fastmoco.item()
         return loss_dict_inner
 
     def update_epoch(self, epoch):
@@ -547,46 +597,36 @@ class CASS_GDRNet(Algorithm):
         return epoch
 
     def validate(self, val_loader, test_loader, writer):
-        # 双塔模型，分别验证 CNN 分支和 ViT 分支的表现
         metrics_val_cnn, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_cnn')
         metrics_test_cnn, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
-
+        
         metrics_val_vit, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_vit')
         metrics_test_vit, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_vit')
-
-        # 记录两个分支中表现最好的
+        
         val_auc = max(metrics_val_cnn['auc'], metrics_val_vit['auc'])
         test_auc = max(metrics_test_cnn['auc'], metrics_test_vit['auc'])
-
+        
         if self.epoch == self.cfg.EPOCHS:
             self.epoch += 1
         if self.epoch > self.cfg.EPOCHS:
             logging.info("=" * 30)
-            logging.info(f"🚀 FINAL RESULTS - Step 2: + CASS (Epoch {self.epoch - 1})")
-            logging.info(f"✅ CNN Branch >> Val AUC: {metrics_val_cnn['auc']:.4f} | Test AUC: {metrics_test_cnn['auc']:.4f}")
-            logging.info(f"✅ ViT Branch >> Val AUC: {metrics_val_vit['auc']:.4f} | Test AUC: {metrics_test_vit['auc']:.4f}")
-            logging.info(f"🚀 FINAL RESULTS - Step 2: + CASS (Epoch {self.epoch - 1})")
+            logging.info(f"🚀 FINAL RESULTS - Step 3: + Feature Fusion (Epoch {self.epoch - 1})")
             logging.info(f"✅ CNN Branch >> Val AUC: {metrics_val_cnn['auc']:.4f} | Test AUC: {metrics_test_cnn['auc']:.4f}")
             logging.info(f"✅ ViT Branch >> Val AUC: {metrics_val_vit['auc']:.4f} | Test AUC: {metrics_test_vit['auc']:.4f}")
             logging.info("=" * 30)
-
+            
         return val_auc, test_auc
 
     def predict(self, x):
-        # 验证预测时，采用双塔的 Logits 平均作为 Ensemble 结果
-        res = self.network(x)
-        return (res['logits_cnn'] + res['logits_vit']) / 2.0
-        # 验证预测时，采用双塔的 Logits 平均作为 Ensemble 结果
-        res = self.network(x)
+        res = self.network(x_cnn=x, x_vit=x)
         return (res['logits_cnn'] + res['logits_vit']) / 2.0
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            logging.info("Saving Step 2 CASS model...")
+            logging.info("Saving Step 3 Feature Fusion model...")
             state_dict = self.network.module.state_dict() if hasattr(self.network, 'module') else self.network.state_dict()
             torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-            # 注意：双塔模型的分类器已经集成在 DualTowerGDRNet 内部，无需单独保存
 
     def renew_model(self, log_path, source='best'):
         net_path = os.path.join(log_path, 'best_model.pth')
