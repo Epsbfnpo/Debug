@@ -410,13 +410,27 @@ class CASS_GDRNet(Algorithm):
         for param in self.momentum_network.parameters():
             param.requires_grad = False
         self.m = 0.999
+        proj_dim = 1024
+        self.predictor_cnn = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.predictor_vit = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
         trainable_params = [p for p in self.network.parameters() if p.requires_grad]
+        trainable_params += list(self.predictor_cnn.parameters()) + list(self.predictor_vit.parameters())
         total_params = sum(p.numel() for p in self.network.parameters())
         trainable_num = sum(p.numel() for p in trainable_params)
-        print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN): {trainable_num / 1e6:.2f}M")
+        print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN+Predictor): {trainable_num / 1e6:.2f}M")
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
         self.K = 1024
-        proj_dim = 1024
+        self.num_positive = getattr(cfg, 'POSITIVE', 4)
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
         self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
         self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
@@ -501,7 +515,13 @@ class CASS_GDRNet(Algorithm):
         for i, label in enumerate(labels):
             pos = torch.where(self.queue_labels == label)[0]
             if len(pos) != 0:
-                neighbor.append(target_queue[pos].mean(0))
+                if self.num_positive > 0:
+                    weights = torch.ones_like(pos).float()
+                    choice = torch.multinomial(weights, self.num_positive, replacement=True)
+                    idx = pos[choice]
+                    neighbor.append(target_queue[idx].mean(0))
+                else:
+                    neighbor.append(target_queue[pos].mean(0))
             else:
                 neighbor.append(current_features[i])
         targets = torch.stack(neighbor, dim=0)
@@ -569,7 +589,11 @@ class CASS_GDRNet(Algorithm):
         with torch.amp.autocast('cuda'):
             res_combined = self.network(x_cnn=x_cnn_combined, x_vit=x_vit_combined)
         B = image.size(0)
-        res_clean_fp32 = {'proj_cnn': res_combined['proj_cnn'][:B].float(), 'proj_vit': res_combined['proj_vit'][:B].float(), 'logits_cnn': res_combined['logits_cnn'][:B].float(), 'logits_vit': res_combined['logits_vit'][:B].float(),}
+        proj_cnn_clean = res_combined['proj_cnn'][:B].float()
+        proj_vit_clean = res_combined['proj_vit'][:B].float()
+        pred_cnn = self.predictor_cnn(proj_cnn_clean)
+        pred_vit = self.predictor_vit(proj_vit_clean)
+        res_clean_fp32 = {'proj_cnn': proj_cnn_clean, 'proj_vit': proj_vit_clean, 'pred_cnn': pred_cnn, 'pred_vit': pred_vit, 'logits_cnn': res_combined['logits_cnn'][:B].float(), 'logits_vit': res_combined['logits_vit'][:B].float(),}
         logits_cnn_unmasked = res_combined['logits_cnn'][B:].float()
         logits_vit_masked = res_combined['logits_vit'][B:].float()
         with torch.no_grad():
@@ -593,7 +617,7 @@ class CASS_GDRNet(Algorithm):
         target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
-        loss_main, loss_dict = self.criterion(res_clean_fp32, target_dict, label, domain)
+        loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
         kd_temp = 1.0
         kd_alpha = 0.5
         label_smooth = 0.1
@@ -606,9 +630,11 @@ class CASS_GDRNet(Algorithm):
             cnn_unmasked_soft = F.softmax(logits_cnn_unmasked.detach() / kd_temp, dim=1)
             mixed_target_for_vit = kd_alpha * cnn_unmasked_soft + (1.0 - kd_alpha) * true_dist
         log_prob_cnn_masked = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1).mean() * (kd_temp ** 2)
+        loss_kd_cnn_raw = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1) * (kd_temp ** 2)
+        loss_kd_cnn = (loss_kd_cnn_raw * dcr_weight).mean()
         log_prob_vit_masked = F.log_softmax(logits_vit_masked / kd_temp, dim=1)
-        loss_kd_vit = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1).mean() * (kd_temp ** 2)
+        loss_kd_vit_raw = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1) * (kd_temp ** 2)
+        loss_kd_vit = (loss_kd_vit_raw * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
         total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total
         del img_strong, img_weak, img_cnn_masked, img_cnn_unmasked, img_vit_masked, img_vit_unmasked
