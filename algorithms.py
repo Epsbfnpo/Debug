@@ -410,6 +410,10 @@ class CASS_GDRNet(Algorithm):
         self.network = DualTowerGDRNet(cfg)
 
         # 2. 引入 CASS 的非对称 Predictor
+        # ================== 1. 引入双塔网络 (CNN + ViT) ==================
+        self.network = DualTowerGDRNet(cfg)
+
+        # ================== 2. 引入 CASS 的非对称 Predictor ==================
         proj_dim = 1024
         self.predictor_cnn = nn.Sequential(
             nn.Linear(proj_dim, proj_dim, bias=False),
@@ -434,7 +438,7 @@ class CASS_GDRNet(Algorithm):
 
         # 3. 引入 CASS 队列 (Queue)
         self.K = 1024
-        self.num_positive = getattr(cfg, 'POSITIVE', 4)
+        self.num_positive = getattr(cfg, 'POSITIVE', 4) # 动态多项式采样参数
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
         self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
         self.queue_cnn = F.normalize(self.queue_cnn, dim=-1)
@@ -485,6 +489,7 @@ class CASS_GDRNet(Algorithm):
         self.optimizer.zero_grad()
 
         # 基础数据增强 (仅使用 strong aug)
+        # 基础数据增强 (仅使用 strong aug)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
@@ -522,6 +527,14 @@ class CASS_GDRNet(Algorithm):
 
         # 5. 反向传播与优化
         self.scaler.scale(total_loss).backward()
+        # 2. 纯 CNN 前向传播与交叉熵损失 (CE Loss)
+        with torch.amp.autocast('cuda'):
+            features = self.network(img_strong)
+            logits = self.classifier(features)
+            loss = F.cross_entropy(logits, label)
+
+        # 3. 反向传播与优化
+        self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
         self.scaler.step(self.optimizer)
@@ -555,11 +568,17 @@ class CASS_GDRNet(Algorithm):
             logging.info(f"🚀 FINAL RESULTS - Step 2: + CASS (Epoch {self.epoch - 1})")
             logging.info(f"✅ CNN Branch >> Val AUC: {metrics_val_cnn['auc']:.4f} | Test AUC: {metrics_test_cnn['auc']:.4f}")
             logging.info(f"✅ ViT Branch >> Val AUC: {metrics_val_vit['auc']:.4f} | Test AUC: {metrics_test_vit['auc']:.4f}")
+            logging.info(f"🚀 FINAL RESULTS - Step 2: + CASS (Epoch {self.epoch - 1})")
+            logging.info(f"✅ CNN Branch >> Val AUC: {metrics_val_cnn['auc']:.4f} | Test AUC: {metrics_test_cnn['auc']:.4f}")
+            logging.info(f"✅ ViT Branch >> Val AUC: {metrics_val_vit['auc']:.4f} | Test AUC: {metrics_test_vit['auc']:.4f}")
             logging.info("=" * 30)
 
         return val_auc, test_auc
 
     def predict(self, x):
+        # 验证预测时，采用双塔的 Logits 平均作为 Ensemble 结果
+        res = self.network(x)
+        return (res['logits_cnn'] + res['logits_vit']) / 2.0
         # 验证预测时，采用双塔的 Logits 平均作为 Ensemble 结果
         res = self.network(x)
         return (res['logits_cnn'] + res['logits_vit']) / 2.0
