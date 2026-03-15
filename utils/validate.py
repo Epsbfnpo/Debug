@@ -24,13 +24,37 @@ def gather_tensor(tensor):
     return torch.cat(data_list, dim=0)
 
 def calculate_metrics_numpy(real_labels, real_preds, real_outputs):
+    # 总体指标
     acc = accuracy_score(real_labels, real_preds)
     f1 = f1_score(real_labels, real_preds, average='macro')
     try:
         auc_ovo = roc_auc_score(real_labels, real_outputs, average='macro', multi_class='ovo')
     except ValueError:
         auc_ovo = 0.0
-    return acc, f1, auc_ovo
+
+    # 每个类别的 OvR 指标
+    num_classes = real_outputs.shape[1] if real_outputs.ndim > 1 else 0
+    per_class_metrics = {}
+    if num_classes > 0:
+        f1_per_class = f1_score(real_labels, real_preds, average=None, labels=range(num_classes))
+
+        for c in range(num_classes):
+            y_true_c = (real_labels == c).astype(int)
+            y_pred_c = (real_preds == c).astype(int)
+
+            acc_c = accuracy_score(y_true_c, y_pred_c)
+
+            try:
+                if len(np.unique(y_true_c)) > 1:
+                    auc_c = roc_auc_score(y_true_c, real_outputs[:, c])
+                else:
+                    auc_c = 0.0
+            except ValueError:
+                auc_c = 0.0
+
+            per_class_metrics[c] = {'acc': acc_c, 'f1': f1_per_class[c], 'auc': auc_c}
+
+    return acc, f1, auc_ovo, per_class_metrics
 
 def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
     algorithm.eval()
@@ -125,6 +149,7 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
                 else:
                     final_loss = 0.0
             metrics_stream = {'auc': 0.0, 'acc': 0.0, 'f1': 0.0, 'loss': final_loss}
+            num_classes = 0
             if rank == 0:
                 all_indices_cpu = all_indices.cpu().numpy()
                 if len(all_indices_cpu) > 0:
@@ -132,32 +157,57 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
                     real_preds = all_preds.cpu().numpy()[unique_mask]
                     real_labels = all_labels.cpu().numpy()[unique_mask]
                     real_outputs = all_outputs.cpu().numpy()[unique_mask]
-                    acc, f1, auc_ovo = calculate_metrics_numpy(real_labels, real_preds, real_outputs)
+
+                    acc, f1, auc_ovo, per_class_metrics = calculate_metrics_numpy(real_labels, real_preds, real_outputs)
+                    num_classes = real_outputs.shape[1]
                 else:
                     acc, f1, auc_ovo = 0.0, 0.0, 0.0
+                    per_class_metrics = {}
+                    num_classes = 0
                 metrics_stream = {'auc': auc_ovo, 'acc': acc, 'f1': f1, 'loss': final_loss}
+
+                for c in range(num_classes):
+                    if c in per_class_metrics:
+                        metrics_stream[f'class_{c}_auc'] = per_class_metrics[c]['auc']
+                        metrics_stream[f'class_{c}_acc'] = per_class_metrics[c]['acc']
+                        metrics_stream[f'class_{c}_f1'] = per_class_metrics[c]['f1']
+
                 prefix = f"{val_type}"
                 if is_dual_stream:
                     prefix = f"{val_type}/{stream_name.upper()}"
-                    logging.info(f'[{stream_name.upper()}] {val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}')
+                    log_str = f'[{stream_name.upper()}] {val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}'
                 else:
-                    logging.info(f'{val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}')
+                    log_str = f'{val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}'
+
+                if val_type == 'test' and num_classes > 0:
+                    detail_str = " | " + " ".join([
+                        f"C{c}(AUC:{per_class_metrics[c]['auc']:.4f} ACC:{per_class_metrics[c]['acc']:.4f} F1:{per_class_metrics[c]['f1']:.4f})"
+                        for c in range(num_classes)
+                    ])
+                    log_str += detail_str
+
+                logging.info(log_str)
+
                 if writer is not None:
                     writer.add_scalar(f'info/{prefix}_accuracy', acc, epoch)
                     writer.add_scalar(f'info/{prefix}_loss', final_loss, epoch)
                     writer.add_scalar(f'info/{prefix}_auc_ovo', auc_ovo, epoch)
                     writer.add_scalar(f'info/{prefix}_f1', f1, epoch)
             if is_dual_stream:
-                final_metrics[f'{stream_name}_auc'] = metrics_stream['auc']
-                final_metrics[f'{stream_name}_acc'] = metrics_stream['acc']
-                final_metrics[f'{stream_name}_f1'] = metrics_stream['f1']
+                final_metrics[f'{stream_name}_auc'] = metrics_stream.get('auc', 0.0)
+                final_metrics[f'{stream_name}_acc'] = metrics_stream.get('acc', 0.0)
+                final_metrics[f'{stream_name}_f1'] = metrics_stream.get('f1', 0.0)
+                for c in range(num_classes):
+                    final_metrics[f'{stream_name}_class_{c}_auc'] = metrics_stream.get(f'class_{c}_auc', 0.0)
+                    final_metrics[f'{stream_name}_class_{c}_acc'] = metrics_stream.get(f'class_{c}_acc', 0.0)
+                    final_metrics[f'{stream_name}_class_{c}_f1'] = metrics_stream.get(f'class_{c}_f1', 0.0)
             else:
                 final_metrics = metrics_stream
         if is_dual_stream:
             final_metrics['auc'] = final_metrics.get('cnn_auc', 0.0)
             final_metrics['acc'] = final_metrics.get('cnn_acc', 0.0)
             final_metrics['f1'] = final_metrics.get('cnn_f1', 0.0)
-            final_metrics['loss'] = final_metrics.get('cnn_loss', 0.0)
+            final_metrics['loss'] = metrics_stream.get('loss', 0.0)
         algorithm.train()
-        return final_metrics, final_metrics['loss']
+        return final_metrics, final_metrics.get('loss', 0.0)
     return None, 0.0
