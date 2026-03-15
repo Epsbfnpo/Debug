@@ -192,7 +192,17 @@ def main():
             target_f1 = test_metrics.get(f'{branch}_f1', test_metrics.get('f1', 0.0))
             if args.local_rank in [-1, 0]:
                 with open(os.path.join(log_path, f'done_{branch}'), 'w') as f:
-                    f.write(f'done, best_val={best_performance_cnn if branch == "cnn" else best_performance_vit:.4f}, test_auc={target_auc:.4f}, test_acc={target_acc:.4f}, test_f1={target_f1:.4f}')
+                    best_val_score = best_performance_cnn if branch == "cnn" else best_performance_vit
+                    res_str = f'done, best_val={best_val_score:.4f}, test_auc={target_auc:.4f}, test_acc={target_acc:.4f}, test_f1={target_f1:.4f}'
+
+                    num_classes = cfg.DATASET.NUM_CLASSES if hasattr(cfg.DATASET, 'NUM_CLASSES') else 5
+                    for c in range(num_classes):
+                        c_auc = test_metrics.get(f'{branch}_class_{c}_auc', 0.0)
+                        c_acc = test_metrics.get(f'{branch}_class_{c}_acc', 0.0)
+                        c_f1 = test_metrics.get(f'{branch}_class_{c}_f1', 0.0)
+                        res_str += f', C{c}_auc={c_auc:.4f}, C{c}_acc={c_acc:.4f}, C{c}_f1={c_f1:.4f}'
+
+                    f.write(res_str)
     else:
         if args.local_rank in [-1, 0]:
             save_checkpoint(final_ckpt_path, algorithm, optimizer, scheduler, cfg.EPOCHS, best_performance)
@@ -212,7 +222,16 @@ def main():
         if args.local_rank in [-1, 0]:
             logging.info(f"🚀 Final Test Results - AUC: {test_auc:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}")
             with open(os.path.join(log_path, 'done'), 'w') as f:
-                f.write(f'done, best_val={best_performance:.4f}, test_auc={test_auc:.4f}, test_acc={test_acc:.4f}, test_f1={test_f1:.4f}')
+                res_str = f'done, best_val={best_performance:.4f}, test_auc={test_auc:.4f}, test_acc={test_acc:.4f}, test_f1={test_f1:.4f}'
+
+                num_classes = cfg.DATASET.NUM_CLASSES if hasattr(cfg.DATASET, 'NUM_CLASSES') else 5
+                for c in range(num_classes):
+                    c_auc = test_metrics.get(f'class_{c}_auc', 0.0)
+                    c_acc = test_metrics.get(f'class_{c}_acc', 0.0)
+                    c_f1 = test_metrics.get(f'class_{c}_f1', 0.0)
+                    res_str += f', C{c}_auc={c_auc:.4f}, C{c}_acc={c_acc:.4f}, C{c}_f1={c_f1:.4f}'
+
+                f.write(res_str)
         if writer: writer.close()
     if is_distributed:
         dist.barrier()
