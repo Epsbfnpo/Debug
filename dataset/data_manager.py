@@ -58,12 +58,31 @@ def get_pre_FundusAug(cfg):
     jitter_c = getattr(cfg.TRANSFORM, 'COLORJITTER_C', 0.2)
     jitter_s = getattr(cfg.TRANSFORM, 'COLORJITTER_S', 0.2)
     jitter_h = getattr(cfg.TRANSFORM, 'COLORJITTER_H', 0.1)
-    size = 512
-    re_size = 512
+    size = 256
+    re_size = 224
     normalize = get_normalize()
-    tra_train = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
-    tra_test = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.CenterCrop(re_size), transforms.ToTensor(), normalize])
-    tra_mask = transforms.Compose([SquarePad(), transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST), transforms.ToTensor()])
+    tra_train = transforms.Compose([
+        SquarePad(),
+        transforms.Resize((size, size)),
+        transforms.RandomResizedCrop(re_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    tra_test = transforms.Compose([
+        SquarePad(),
+        transforms.Resize((size, size)),
+        transforms.CenterCrop(re_size),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    tra_mask = transforms.Compose([
+        SquarePad(),
+        transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
+        transforms.CenterCrop(re_size),
+        transforms.ToTensor(),
+    ])
     return tra_train, tra_test, tra_mask
 
 def get_post_FundusAug(cfg):
