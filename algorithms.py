@@ -9,6 +9,7 @@ from utils.validate import algorithm_validate
 import modeling.model_manager as models
 from modeling.losses import DahLoss, GDRNetLoss_Integrated, SupConLoss
 from modeling.nets import LossValley, AveragedModel, DualTowerGDRNet
+from modeling.fpt_builder import build_fpt_models
 from dataset.data_manager import get_post_FundusAug
 from backpack import backpack, extend
 from backpack.extensions import BatchGrad
@@ -17,7 +18,7 @@ import torch.distributed as dist
 import copy
 import contextlib
 
-ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
+ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet', 'FPTPlus']
 
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
@@ -708,3 +709,92 @@ class CASS_GDRNet(Algorithm):
             logging.info(f"✅ Model renewed from {filename}")
         else:
             logging.warning(f"⚠️ Could not find {filename}, skipping load.")
+
+
+class FPTPlus(Algorithm):
+    def __init__(self, num_classes, cfg):
+        super(FPTPlus, self).__init__(num_classes, cfg)
+        self.num_classes = num_classes
+        self.pretrained_path = "google/vit-base-patch16-224"
+        self.side_input_size = 224
+
+        self.frozen_encoder, self.trainable_model = build_fpt_models(
+            pretrained_path=self.pretrained_path,
+            num_classes=self.num_classes,
+            layers_to_extract=[3, 7, 11],
+            token_ratio=0.1,
+            token_imp='global',
+            side_reduction_ratio=4,
+            prompt_reduction_ratio=4,
+            num_prompts=4,
+            side_input_size=self.side_input_size,
+        )
+
+        self.network = self.trainable_model
+        self.frozen_encoder.eval()
+
+        self.optimizer = torch.optim.AdamW(
+            self.trainable_model.parameters(),
+            lr=cfg.LEARNING_RATE,
+            weight_decay=1e-4,
+        )
+
+    def _extract_states(self, image):
+        with torch.no_grad():
+            self.frozen_encoder.eval()
+            _, key_states, value_states = self.frozen_encoder(image)
+        return key_states, value_states
+
+    def update(self, minibatch):
+        image, mask, label, domain = minibatch
+        self.optimizer.zero_grad()
+
+        key_states, value_states = self._extract_states(image)
+        x_coarse = F.interpolate(
+            image,
+            size=(self.side_input_size, self.side_input_size),
+            mode='bicubic',
+            align_corners=False,
+        )
+        logits = self.trainable_model(x_coarse, key_states, value_states)
+
+        loss = F.cross_entropy(logits, label)
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict(self, x):
+        self.frozen_encoder.eval()
+        self.trainable_model.eval()
+        with torch.no_grad():
+            key_states, value_states = self._extract_states(x)
+            x_coarse = F.interpolate(
+                x,
+                size=(self.side_input_size, self.side_input_size),
+                mode='bicubic',
+                align_corners=False,
+            )
+            logits = self.trainable_model(x_coarse, key_states, value_states)
+        return logits
+
+    def validate(self, val_loader, test_loader, writer):
+        val_auc = -1
+        test_auc = -1
+        if self.epoch <= self.cfg.EPOCHS:
+            val_auc, val_loss = algorithm_validate(self, val_loader, writer, self.epoch, 'val')
+            test_auc, test_loss = algorithm_validate(self, test_loader, writer, self.epoch, 'test')
+            if self.epoch == self.cfg.EPOCHS:
+                self.epoch += 1
+        else:
+            test_auc, test_loss = algorithm_validate(self, test_loader, writer, self.cfg.EPOCHS + self.cfg.VAL_EPOCH, 'test')
+            logging.info('Best performance on test domain(s): {}'.format(test_auc))
+        return val_auc, test_auc
+
+    def save_model(self, log_path, **kwargs):
+        logging.info("Saving best FPT+ model...")
+        torch.save(self.trainable_model.state_dict(), os.path.join(log_path, 'best_fpt_trainable.pth'))
+
+    def renew_model(self, log_path, **kwargs):
+        trainable_path = os.path.join(log_path, 'best_fpt_trainable.pth')
+        self.trainable_model.load_state_dict(torch.load(trainable_path, map_location='cpu'))
