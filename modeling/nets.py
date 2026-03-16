@@ -785,14 +785,40 @@ class DINOv3_FD_Net(nn.Module):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=["query", "key", "value", "dense"],
-            lora_dropout=lora_dropout,
-            bias="none",
-        )
-        self.encoder = get_peft_model(self.encoder, lora_config)
+        module_names = [n for n, _ in self.encoder.named_modules()]
+        is_dinov3_vit = self.encoder.__class__.__name__ == "DINOv3ViTModel"
+
+        # Your local DINOv3 structure uses: q_proj/k_proj/v_proj/o_proj + up_proj/down_proj
+        if is_dinov3_vit:
+            detected_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
+        else:
+            # Generic fallback for non-DINOv3 backbones
+            preferred_targets = [
+                ["q_proj", "k_proj", "v_proj", "o_proj"],
+                ["query", "key", "value", "dense"],
+                ["qkv", "proj"],
+            ]
+            detected_targets = None
+            for candidates in preferred_targets:
+                hit = [m for m in candidates if any(name.endswith(f".{m}") or name == m for name in module_names)]
+                if len(hit) >= 2:
+                    detected_targets = candidates
+                    break
+
+        if detected_targets is not None:
+            try:
+                lora_config = LoraConfig(
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    target_modules=detected_targets,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                )
+                self.encoder = get_peft_model(self.encoder, lora_config)
+            except ValueError:
+                self.encoder = inject_lora_dinov3(self.encoder, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        else:
+            self.encoder = inject_lora_dinov3(self.encoder, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
 
         self.feature_dim = feature_dim
         self.adapter_dim = adapter_dim
