@@ -12,6 +12,7 @@ from copy import deepcopy
 from collections import deque
 import logging
 from transformers import AutoModel, AutoConfig
+from peft import LoraConfig, get_peft_model
 from .lora_utils import inject_lora_dinov3
 import types
 
@@ -721,3 +722,99 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
         return feat_cnn_final
+
+class Adapter(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.orthogonal_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.orthogonal_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        return self.fc2(self.drop(self.act(self.fc1(x))))
+
+
+class MINE(nn.Module):
+    def __init__(self, in_dim: int = 512, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+    def estimate_mi(self, x, y):
+        pos = self.forward(torch.cat([x, y], dim=1))
+        idx = torch.randperm(y.size(0), device=y.device)
+        y_shuf = y[idx]
+        neg = self.forward(torch.cat([x, y_shuf], dim=1))
+        return pos.mean() - torch.log(torch.exp(neg).mean() + 1e-12)
+
+
+class DINOv3_FD_Net(nn.Module):
+    def __init__(
+        self,
+        num_classes,
+        model_name="facebook/dinov3-vitl16-pretrain-lvd1689m",
+        local_path=None,
+        local_files_only=True,
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        feature_dim=512,
+        adapter_dim=256,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        pretrained_source = local_path if local_path else model_name
+        self.encoder = AutoModel.from_pretrained(pretrained_source, local_files_only=local_files_only)
+        encoder_dim = self.encoder.config.hidden_size
+
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=["query", "key", "value", "dense"],
+            lora_dropout=lora_dropout,
+            bias="none",
+        )
+        self.encoder = get_peft_model(self.encoder, lora_config)
+
+        self.feature_dim = feature_dim
+        self.adapter_dim = adapter_dim
+        self.proj = nn.Linear(encoder_dim, self.feature_dim)
+        self.tra = Adapter(self.feature_dim, hidden_dim=self.adapter_dim)
+        self.tia = Adapter(self.feature_dim, hidden_dim=self.adapter_dim)
+        self.head_t = nn.Linear(self.adapter_dim, num_classes)
+        self.head_i = nn.Linear(self.adapter_dim, num_classes)
+        self._out_features = self.adapter_dim
+
+    def out_features(self):
+        return self._out_features
+
+    def forward(self, x):
+        outputs = self.encoder(pixel_values=x)
+        f_cls = outputs.last_hidden_state[:, 0, :]
+        f_cls = self.proj(f_cls)
+        f_t = self.tra(f_cls)
+        f_i = self.tia(f_cls)
+        logits_t = self.head_t(f_t)
+        logits_i = self.head_i(f_i)
+
+        if self.training:
+            return logits_t, logits_i, f_t, f_i
+        return logits_t
