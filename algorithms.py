@@ -432,6 +432,8 @@ class CASS_GDRNet(Algorithm):
         main_params = [p for p in self.network.parameters() if p.requires_grad]
         self.optimizer_main = torch.optim.AdamW(main_params, lr=main_lr, weight_decay=main_weight_decay)
         self.optimizer_mine = torch.optim.Adam(self.mine_net.parameters(), lr=mine_lr)
+        # Keep compatibility with existing training loop expecting `algorithm.optimizer`
+        self.optimizer = self.optimizer_main
 
     def update(self, minibatch):
         image, mask, label, domain = minibatch
