@@ -767,6 +767,8 @@ class DINOv3_FD_Net(nn.Module):
         self,
         num_classes,
         model_name="facebook/dinov3-vitl16-pretrain-lvd1689m",
+        local_path=None,
+        local_files_only=True,
         lora_r=8,
         lora_alpha=16,
         lora_dropout=0.0,
@@ -776,7 +778,8 @@ class DINOv3_FD_Net(nn.Module):
         super().__init__()
         self.num_classes = num_classes
 
-        self.encoder = AutoModel.from_pretrained(model_name)
+        pretrained_source = local_path if local_path else model_name
+        self.encoder = AutoModel.from_pretrained(pretrained_source, local_files_only=local_files_only)
         encoder_dim = self.encoder.config.hidden_size
 
         for param in self.encoder.parameters():

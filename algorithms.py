@@ -406,12 +406,16 @@ class CASS_GDRNet(Algorithm):
     def __init__(self, num_classes, cfg):
         super(CASS_GDRNet, self).__init__(num_classes, cfg)
         model_name = getattr(cfg.GDRNET, 'DINOV3_MODEL_NAME', 'facebook/dinov3-vitl16-pretrain-lvd1689m')
+        local_path = getattr(cfg.GDRNET, 'DINOV3_PATH', None)
+        local_files_only = getattr(cfg.GDRNET, 'LOCAL_FILES_ONLY', True)
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
         lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
         lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
         self.network = DINOv3_FD_Net(
             num_classes=num_classes,
             model_name=model_name,
+            local_path=local_path,
+            local_files_only=local_files_only,
             lora_r=lora_r,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
