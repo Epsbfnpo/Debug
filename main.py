@@ -29,12 +29,25 @@ def set_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+def _to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu(v) for v in obj)
+    return obj
+
 def save_checkpoint(path, algorithm, optimizer, scheduler, epoch, best_performance):
-    if hasattr(algorithm.network, 'module'):
-        network_state = algorithm.network.module.state_dict()
-    else:
-        network_state = algorithm.network.state_dict()
-    state = {'epoch': epoch, 'algorithm_state': algorithm.state_dict(), 'optimizer_state': optimizer.state_dict(), 'scheduler_state': scheduler.state_dict(), 'best_performance': best_performance}
+    state = {
+        'epoch': epoch,
+        'algorithm_state': _to_cpu(algorithm.state_dict()),
+        'optimizer_state': _to_cpu(optimizer.state_dict()),
+        'scheduler_state': _to_cpu(scheduler.state_dict()),
+        'best_performance': best_performance
+    }
     torch.save(state, path)
 
 def load_checkpoint(path, algorithm, optimizer, scheduler):
@@ -93,12 +106,16 @@ def main():
     algorithm.to(args.device)
     if is_distributed:
         algorithm = nn.SyncBatchNorm.convert_sync_batchnorm(algorithm)
-        ddp_find_unused = (cfg.ALGORITHM == 'CASS_GDRNet')
+        ddp_kwargs = {
+            'device_ids': [args.local_rank],
+            'output_device': args.local_rank,
+            'find_unused_parameters': False,
+        }
+        if cfg.ALGORITHM == 'CASS_GDRNet':
+            ddp_kwargs['static_graph'] = True
         algorithm.network = DDP(
             algorithm.network,
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            find_unused_parameters=ddp_find_unused
+            **ddp_kwargs
         )
         if hasattr(algorithm, 'projector'):
             algorithm.projector = DDP(algorithm.projector, device_ids=[args.local_rank], output_device=args.local_rank)
@@ -142,6 +159,8 @@ def main():
         scheduler.step()
         if args.local_rank in [-1, 0]:
             save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance)
+        if is_distributed:
+            dist.barrier()
         if epoch % cfg.VAL_EPOCH == 0:
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Validation...")
