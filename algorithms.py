@@ -434,55 +434,6 @@ class CASS_GDRNet(Algorithm):
         self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
 
-    def patchify(self, imgs, block=32):
-        p = block
-        n, c, h_img, w_img = imgs.shape
-        assert c == 3 and h_img == w_img and h_img % p == 0
-        h = w = h_img // p
-        x = imgs.reshape(shape=(n, 3, h, p, w, p))
-        x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(n, h * w, p ** 2 * 3))
-        return x
-
-    def unpatchify(self, x, block=32):
-        p = block
-        n, l, _ = x.shape
-        h = w = int(l ** 0.5)
-        assert h * w == l
-        x = x.reshape(shape=(n, h, w, p, p, 3))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(n, 3, h * p, h * p))
-        return imgs
-
-    def compute_saliency_map(self, imgs):
-        kernel_size = 31
-        padding = kernel_size // 2
-        surround = F.avg_pool2d(imgs, kernel_size=kernel_size, stride=1, padding=padding)
-        saliency = torch.abs(imgs - surround)
-        saliency_map = torch.mean(saliency, dim=1, keepdim=True)
-        return saliency_map
-
-    def saliency_guided_masking(self, x, imgs, mask_ratio=0.5, noise_weight=0.3):
-        N, L, D = x.shape
-        _, _, h_img, w_img = imgs.shape
-        block_size = int(((h_img * w_img) / L) ** 0.5)
-        saliency_map = self.compute_saliency_map(imgs)
-        patch_saliency = F.avg_pool2d(saliency_map, kernel_size=block_size, stride=block_size)
-        patch_saliency = patch_saliency.view(N, L)
-        sal_min = patch_saliency.min(dim=1, keepdim=True).values
-        sal_max = patch_saliency.max(dim=1, keepdim=True).values
-        patch_saliency = (patch_saliency - sal_min) / (sal_max - sal_min + 1e-6)
-        rand_noise = torch.rand([N, L], device=x.device)
-        final_scores = patch_saliency + noise_weight * rand_noise
-        len_keep = int(L * (1 - mask_ratio))
-        ids_shuffle = torch.argsort(-final_scores, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-        mask = torch.ones([N, L], device=x.device)
-        mask[:, :len_keep] = 0
-        mask = torch.gather(mask, dim=1, index=ids_restore)
-        x_masked = x * (1 - mask.unsqueeze(-1))
-        return x_masked
-
     @torch.no_grad()
     def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
         feat_cnn = feat_cnn.float()
@@ -538,6 +489,7 @@ class CASS_GDRNet(Algorithm):
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
+
         if hasattr(self.network, 'module'):
             network_inner = self.network.module
             get_sync_context = self.network.no_sync
@@ -546,24 +498,17 @@ class CASS_GDRNet(Algorithm):
             network_inner = self.network
             get_sync_context = contextlib.nullcontext
             momentum_inner = self.momentum_network
+
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
+
         img_weak = image.clone() * mask
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
-        block_size = 32
-        mask_ratio = 0.5
-        x_cnn_patch = self.patchify(img_strong, block=block_size)
-        x_cnn_masked_patch = self.saliency_guided_masking(x_cnn_patch, imgs=img_strong, mask_ratio=mask_ratio, noise_weight=0.3)
-        img_strong_masked = self.unpatchify(x_cnn_masked_patch, block=block_size)
-        img_cnn_masked = img_strong_masked
-        img_cnn_unmasked = img_strong
-        img_vit_masked = img_strong_masked
-        img_vit_unmasked = img_strong
-        x_cnn_combined = torch.cat([img_cnn_masked, img_cnn_unmasked], dim=0)
-        x_vit_combined = torch.cat([img_vit_unmasked, img_vit_masked], dim=0)
-        x_split_cnn = self._local_split(img_cnn_masked).contiguous()
-        x_split_vit = self._local_split(img_vit_unmasked).contiguous()
+
+        x_split_cnn = self._local_split(img_strong).contiguous()
+        x_split_vit = self._local_split(img_strong).contiguous()
+
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
@@ -573,68 +518,81 @@ class CASS_GDRNet(Algorithm):
             chunk_size = image.size(0)
             feat_splits_list = list(feat_split.split(chunk_size, dim=0))
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
+
         with torch.amp.autocast('cuda'):
-            res_combined = self.network(x_cnn=x_cnn_combined, x_vit=x_vit_combined)
-        B = image.size(0)
-        res_clean_fp32 = {'proj_cnn': res_combined['proj_cnn'][:B].float(), 'proj_vit': res_combined['proj_vit'][:B].float(), 'logits_cnn': res_combined['logits_cnn'][:B].float(), 'logits_vit': res_combined['logits_vit'][:B].float(),}
-        logits_cnn_unmasked = res_combined['logits_cnn'][B:].float()
-        logits_vit_masked = res_combined['logits_vit'][B:].float()
+            res_combined = self.network(x_cnn=img_strong, x_vit=img_strong)
+
+        res_clean_fp32 = {
+            'proj_cnn': res_combined['proj_cnn'].float(),
+            'proj_vit': res_combined['proj_vit'].float(),
+            'logits_cnn': res_combined['logits_cnn'].float(),
+            'logits_vit': res_combined['logits_vit'].float(),
+            'drts': res_combined['drts'].float(),
+            'spatial_tokens': res_combined['spatial_tokens'].float(),
+        }
+
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
-            momentum_proj_vit = res_momentum['proj_vit'].float()
-            momentum_proj_vit = F.normalize(momentum_proj_vit, dim=1)
-            momentum_proj_cnn = res_momentum['proj_cnn'].float()
-            momentum_proj_cnn = F.normalize(momentum_proj_cnn, dim=1)
-        loss_fastmoco = torch.tensor(0.0, device=image.device)
+            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
+            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 proj_mix = network_inner.projector_cnn(feat_orthmix)
-            proj_mix = proj_mix.float()
-            proj_mix_norm = F.normalize(proj_mix, dim=1)
+            proj_mix = F.normalize(proj_mix.float(), dim=1)
             num_mixs = proj_mix.shape[0] // chunk_size
             target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
-            cos_sim_mix = (proj_mix_norm * target_proj_rep).sum(dim=1)
+            cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
             loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
+
         target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
         target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
+
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
-        kd_temp = 1.0
-        kd_alpha = 0.5
-        label_smooth = 0.1
+
+        kd_temp, kd_alpha, label_smooth = 1.0, 0.5, 0.1
         num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
             true_dist = F.one_hot(label, num_classes=num_classes).float()
             true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
-            vit_unmasked_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
-            mixed_target_for_cnn = kd_alpha * vit_unmasked_soft + (1.0 - kd_alpha) * true_dist
-            cnn_unmasked_soft = F.softmax(logits_cnn_unmasked.detach() / kd_temp, dim=1)
-            mixed_target_for_vit = kd_alpha * cnn_unmasked_soft + (1.0 - kd_alpha) * true_dist
-        log_prob_cnn_masked = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn_raw = -torch.sum(mixed_target_for_cnn * log_prob_cnn_masked, dim=1) * (kd_temp ** 2)
-        loss_kd_cnn = (loss_kd_cnn_raw * dcr_weight).mean()
-        log_prob_vit_masked = F.log_softmax(logits_vit_masked / kd_temp, dim=1)
-        loss_kd_vit_raw = -torch.sum(mixed_target_for_vit * log_prob_vit_masked, dim=1) * (kd_temp ** 2)
-        loss_kd_vit = (loss_kd_vit_raw * dcr_weight).mean()
+            vit_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
+            mixed_target_for_cnn = kd_alpha * vit_soft + (1.0 - kd_alpha) * true_dist
+            cnn_soft = F.softmax(res_clean_fp32['logits_cnn'].detach() / kd_temp, dim=1)
+            mixed_target_for_vit = kd_alpha * cnn_soft + (1.0 - kd_alpha) * true_dist
+
+        log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
+        loss_kd_cnn = (-torch.sum(mixed_target_for_cnn * log_prob_cnn, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
+
+        log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
+        loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total
-        del img_strong, img_weak, img_cnn_masked, img_cnn_unmasked, img_vit_masked, img_vit_unmasked
-        del x_cnn_combined, x_vit_combined, x_split_cnn, x_split_vit
-        del feat_split, feat_orthmix, cos_sim_mix, target_proj_rep
+
+        drts = res_clean_fp32['drts']
+        spatial_tokens = res_clean_fp32['spatial_tokens']
+        drts_norm = F.normalize(drts, dim=-1)
+        spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
+        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
+        loss_ortho = torch.mean(cos_sim_ortho ** 2)
+
+        lambda_ortho = 1.5
+        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
         with torch.no_grad():
             for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
-                param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+                param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+
         loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
-        loss_dict['loss_kd_vit'] = loss_kd_vit.item()
         loss_dict['loss_kd_total'] = loss_kd_total.item()
+        loss_dict['loss_ortho'] = loss_ortho.item()
         loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
