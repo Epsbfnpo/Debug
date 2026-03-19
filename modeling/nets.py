@@ -12,6 +12,7 @@ from copy import deepcopy
 from collections import deque
 import logging
 from transformers import AutoModel, AutoConfig
+from transformers.modeling_outputs import BaseModelOutput
 from .lora_utils import inject_lora_dinov3
 import types
 
@@ -606,23 +607,39 @@ class DINOv3Wrapper(nn.Module):
         patch_tokens = embeddings[:, 1:, :]
         drts = self.drt_tokens.expand(batch_size, -1, -1)
         hidden_states = torch.cat([cls_token, drts, patch_tokens], dim=1)
-        head_mask = self.model.get_head_mask(None, self.model.config.num_hidden_layers)
-        outputs = self.model.encoder(
-            hidden_states,
-            head_mask=head_mask,
-            output_attentions=self.config.output_attentions,
-            output_hidden_states=self.config.output_hidden_states,
-            return_dict=True,
+        position_embeddings = self.model.rope_embeddings(x) if hasattr(self.model, "rope_embeddings") else None
+        all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
+
+        for layer_module in self.model.layer:
+            if getattr(self.model, "gradient_checkpointing", False) and self.training and hasattr(self.model, "_gradient_checkpointing_func"):
+                hidden_states = self.model._gradient_checkpointing_func(
+                    layer_module.__call__,
+                    hidden_states,
+                    None,
+                    position_embeddings,
+                )
+            else:
+                hidden_states = layer_module(
+                    hidden_states,
+                    attention_mask=None,
+                    position_embeddings=position_embeddings,
+                )
+            if self.config.output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if hasattr(self.model, "norm"):
+            hidden_states = self.model.norm(hidden_states)
+        elif hasattr(self.model, "layernorm"):
+            hidden_states = self.model.layernorm(hidden_states)
+
+        if self.config.output_hidden_states:
+            all_hidden_states = all_hidden_states[:-1] + (hidden_states,)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=None,
         )
-        if outputs.hidden_states is not None and len(outputs.hidden_states) == self.model.config.num_hidden_layers:
-            outputs.hidden_states = (hidden_states,) + outputs.hidden_states
-        sequence_output = outputs[0]
-        if hasattr(self.model, "layernorm"):
-            sequence_output = self.model.layernorm(sequence_output)
-        outputs.last_hidden_state = sequence_output
-        if outputs.hidden_states is not None:
-            outputs.hidden_states = outputs.hidden_states[:-1] + (sequence_output,)
-        return outputs
 
     @property
     def out_features(self):
