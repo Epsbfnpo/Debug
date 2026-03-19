@@ -575,7 +575,7 @@ class AveragedModel(Module):
         return clone
 
 class DINOv3Wrapper(nn.Module):
-    def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, num_drts=4):
+    def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, num_drts=4, use_grad_checkpointing=False):
         super().__init__()
         print(f"🚀 [DINOv3+LoRA+DRTs] Loading from local path: {local_path}")
         try:
@@ -584,7 +584,12 @@ class DINOv3Wrapper(nn.Module):
             self.config.output_attentions = False
             self._out_features = self.config.hidden_size
             self.model = AutoModel.from_pretrained(local_path, config=self.config, local_files_only=True)
-            self.model.gradient_checkpointing_enable()
+            self.use_grad_checkpointing = use_grad_checkpointing and hasattr(self.model, "gradient_checkpointing_enable")
+            if self.use_grad_checkpointing:
+                self.model.gradient_checkpointing_enable()
+                print("⚙️ [DINOv3] Gradient checkpointing enabled.")
+            else:
+                print("⚙️ [DINOv3] Gradient checkpointing disabled to avoid DDP re-entrant backward issues.")
             for param in self.model.parameters():
                 param.requires_grad = False
             print("🧊 [DINOv3] All base parameters frozen.")
@@ -611,7 +616,7 @@ class DINOv3Wrapper(nn.Module):
         all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
 
         for layer_module in self.model.layer:
-            if getattr(self.model, "gradient_checkpointing", False) and self.training and hasattr(self.model, "_gradient_checkpointing_func"):
+            if self.use_grad_checkpointing and self.training and hasattr(self.model, "_gradient_checkpointing_func"):
                 hidden_states = self.model._gradient_checkpointing_func(
                     layer_module.__call__,
                     hidden_states,
@@ -660,7 +665,8 @@ class DualTowerGDRNet(nn.Module):
         lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
         lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
         num_drts = getattr(cfg.GDRNET, 'NUM_DRTS', 4)
-        self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts)
+        use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
+        self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
         self.target_layers = [3, 6, 9]
         self.hooked_attns = {}
