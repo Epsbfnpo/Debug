@@ -487,6 +487,8 @@ class CASS_GDRNet(Algorithm):
         return torch.cat(xs, dim=0)
 
     def update(self, minibatch):
+        import torchvision.transforms as T
+
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
 
@@ -499,6 +501,10 @@ class CASS_GDRNet(Algorithm):
             get_sync_context = contextlib.nullcontext
             momentum_inner = self.momentum_network
 
+        # ---------------------------------------------------------
+        # 1. 视角生成：全局图 (Global Views) 与 局部切块 (Local Crops)
+        # ---------------------------------------------------------
+        # 1a. 全局强弱增强 (512x512)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
@@ -506,6 +512,24 @@ class CASS_GDRNet(Algorithm):
         img_weak = image.clone() * mask
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
 
+        # 1b. 生成局部高分辨率切块 (Local Crops, 强制裁剪出极小区域并输出为 224x224)
+        # 相当于给 CNN 发了一个“高倍显微镜”，只看原图 10%~40% 的面积
+        local_crop_transform = T.Compose([
+            T.RandomResizedCrop(224, scale=(0.1, 0.4), ratio=(0.75, 1.33)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomApply([T.ColorJitter(brightness=0.2, contrast=0.2)], p=0.5)
+        ])
+
+        num_local_crops = 2
+        # 注意：使用 img_strong 作为底图进行抠取，确保背景已被 mask
+        local_crops = [
+            torch.stack([local_crop_transform(img) for img in img_strong.clone()], dim=0).contiguous()
+            for _ in range(num_local_crops)
+        ]
+
+        # ---------------------------------------------------------
+        # 2. FastMoCo 特征准备 (保持原有逻辑)
+        # ---------------------------------------------------------
         x_split_cnn = self._local_split(img_strong).contiguous()
         x_split_vit = self._local_split(img_strong).contiguous()
 
@@ -519,24 +543,48 @@ class CASS_GDRNet(Algorithm):
             feat_splits_list = list(feat_split.split(chunk_size, dim=0))
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
+        # ---------------------------------------------------------
+        # 3. 当前网络 (Student) 前向传播 - 处理全局视图
+        # ---------------------------------------------------------
         with torch.amp.autocast('cuda'):
-            res_combined = self.network(x_cnn=img_strong, x_vit=img_strong)
+            res_student_global = self.network(x_cnn=img_strong, x_vit=img_strong)
 
         res_clean_fp32 = {
-            'proj_cnn': res_combined['proj_cnn'].float(),
-            'proj_vit': res_combined['proj_vit'].float(),
-            'logits_cnn': res_combined['logits_cnn'].float(),
-            'logits_vit': res_combined['logits_vit'].float(),
-            'drts': res_combined['drts'].float(),
-            'spatial_tokens': res_combined['spatial_tokens'].float(),
+            'proj_cnn': res_student_global['proj_cnn'].float(),
+            'proj_vit': res_student_global['proj_vit'].float(),
+            'logits_cnn': res_student_global['logits_cnn'].float(),
+            'logits_vit': res_student_global['logits_vit'].float(),
+            'drts': res_student_global['drts'].float(),
+            'spatial_tokens': res_student_global['spatial_tokens'].float(),
         }
 
+        # ---------------------------------------------------------
+        # 4. 动量教师网络 (Teacher) 前向传播 - 生成全局权威软标签
+        # ---------------------------------------------------------
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
-                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
-            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
-            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+                res_teacher_global = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
+            momentum_proj_vit = F.normalize(res_teacher_global['proj_vit'].float(), dim=1)
+            momentum_proj_cnn = F.normalize(res_teacher_global['proj_cnn'].float(), dim=1)
 
+            # --- DINO 核心：教师中心化 (Centering) 与锐化 (Sharpening) ---
+            if not hasattr(self, 'teacher_center'):
+                self.teacher_center = torch.zeros(1, self.cfg.DATASET.NUM_CLASSES).to(image.device)
+
+            teacher_temp = 0.04 # 较低的温度使得 Teacher 的预测更自信 (Sharpening)
+            teacher_logits = res_teacher_global['logits_vit'].float()
+
+            # 结合 Center 生成 Teacher 的 Soft Target
+            teacher_probs = F.softmax((teacher_logits - self.teacher_center) / teacher_temp, dim=-1)
+
+            # EMA 更新 Center (防止模型坍塌到一个类别上)
+            center_momentum = 0.9
+            batch_center = torch.mean(teacher_logits, dim=0, keepdim=True)
+            self.teacher_center = self.teacher_center * center_momentum + batch_center * (1 - center_momentum)
+
+        # ---------------------------------------------------------
+        # 5. 计算原有全局损失 (FastMoCo + CASS + Sup)
+        # ---------------------------------------------------------
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 proj_mix = network_inner.projector_cnn(feat_orthmix)
@@ -551,34 +599,51 @@ class CASS_GDRNet(Algorithm):
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
 
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
+        # CASS_Loss 和 监督分类 Loss
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
 
-        kd_temp, kd_alpha, label_smooth = 1.0, 0.5, 0.1
-        num_classes = self.cfg.DATASET.NUM_CLASSES
-        with torch.no_grad():
-            true_dist = F.one_hot(label, num_classes=num_classes).float()
-            true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
-            vit_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
-            mixed_target_for_cnn = kd_alpha * vit_soft + (1.0 - kd_alpha) * true_dist
-            cnn_soft = F.softmax(res_clean_fp32['logits_cnn'].detach() / kd_temp, dim=1)
-            mixed_target_for_vit = kd_alpha * cnn_soft + (1.0 - kd_alpha) * true_dist
+        # ---------------------------------------------------------
+        # 6. 【创新点】跨尺度非对称自蒸馏 (Cross-Scale Asymmetric KD)
+        # ---------------------------------------------------------
+        # 强制 Student(CNN) 从局部 224x224 病灶中，猜出 Teacher(ViT) 看到的全局 512x512 诊断结果
+        student_temp = 0.1
+        loss_dino_local = torch.tensor(0.0, device=image.device)
 
-        log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = (-torch.sum(mixed_target_for_cnn * log_prob_cnn, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
+        for local_crop in local_crops:
+            with torch.amp.autocast('cuda'):
+                # Student 独立处理局部切块
+                res_student_local = self.network(x_cnn=local_crop, x_vit=local_crop)
 
-        log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
-        loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
-        loss_kd_total = loss_kd_cnn + loss_kd_vit
+            # 获取 CNN 分支对局部的预测
+            student_logits_local = res_student_local['logits_cnn'].float()
+            student_log_probs = F.log_softmax(student_logits_local / student_temp, dim=-1)
 
+            # 交叉熵蒸馏：Teacher_Global_Probs 指导 Student_Local_LogProbs
+            # 乘以 dcr_weight 确保在极度不平衡的长尾分布中，少数类的局部特征受到足够重视
+            loss_crop = torch.sum(-teacher_probs * student_log_probs, dim=-1)
+            loss_dino_local += (loss_crop * dcr_weight).mean()
+
+        loss_dino_local = loss_dino_local / num_local_crops
+
+        # ---------------------------------------------------------
+        # 7. 【创新点】DRTs 正交解耦约束
+        # ---------------------------------------------------------
         drts = res_clean_fp32['drts']
         spatial_tokens = res_clean_fp32['spatial_tokens']
         drts_norm = F.normalize(drts, dim=-1)
         spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
+
+        # 强制域噪声寄存器与病理空间向量正交 (余弦相似度趋近于0)
         cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
-        lambda_ortho = 1.5
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        # ---------------------------------------------------------
+        # 8. 最终损失聚合与反向传播
+        # ---------------------------------------------------------
+        lambda_ortho = 1.5   # 寄存器正交约束强度
+        lambda_dino = 1.0    # 局部特征锚定(蒸馏)强度
+
+        total_loss = loss_main + 0.1 * loss_fastmoco + lambda_dino * loss_dino_local + lambda_ortho * loss_ortho
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -586,17 +651,22 @@ class CASS_GDRNet(Algorithm):
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
+        # 动量网络平滑更新
         with torch.no_grad():
             for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
 
+        # ---------------------------------------------------------
+        # 9. 记录日志
+        # ---------------------------------------------------------
         loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
-        loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['loss_dino_local'] = loss_dino_local.item() # 核心蒸馏Loss
+        loss_dict['loss_ortho'] = loss_ortho.item()           # 正交解耦Loss
         loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
         loss_dict['gate3'] = network_inner.bridge3.gate.item()
+
         return loss_dict
 
     def update_epoch(self, epoch):
