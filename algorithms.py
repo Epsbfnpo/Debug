@@ -415,68 +415,15 @@ class CASS_GDRNet(Algorithm):
         trainable_num = sum(p.numel() for p in trainable_params)
         print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN): {trainable_num / 1e6:.2f}M")
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-        self.K = 1024
-        proj_dim = 1024
-        self.num_positive = getattr(cfg, 'POSITIVE', 4)
-        self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
-        self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
-        self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
-        self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
-        self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        init_prototypes = F.normalize(torch.randn(num_classes, proj_dim), dim=1)
-        self.register_buffer("prototypes", init_prototypes)
-        self.register_buffer("proto_initialized", torch.zeros(num_classes, dtype=torch.bool))
+
+        # --- 彻底删除了关于 Queue 和 Prototypes 的所有冗余初始化 ---
+
         self.split_num = 2
         self.combs = 3
         self.fundusAug = get_post_FundusAug(cfg)
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
-
-    @torch.no_grad()
-    def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
-        feat_cnn = feat_cnn.float()
-        feat_vit = feat_vit.float()
-        batch_size = feat_cnn.shape[0]
-        ptr = int(self.queue_ptr)
-        replace_idx = torch.arange(ptr, ptr + batch_size).to(feat_cnn.device) % self.K
-        self.queue_cnn[replace_idx, :] = feat_cnn
-        self.queue_vit[replace_idx, :] = feat_vit
-        self.queue_labels[replace_idx] = labels
-        ptr = (ptr + batch_size) % self.K
-        self.queue_ptr[0] = ptr
-
-    @torch.no_grad()
-    def sample_target(self, current_features, labels, target_queue):
-        neighbor = []
-        for i, label in enumerate(labels):
-            pos = torch.where(self.queue_labels == label)[0]
-            if len(pos) != 0:
-                if self.num_positive > 0:
-                    weights = torch.ones_like(pos).float()
-                    choice = torch.multinomial(weights, self.num_positive, replacement=True)
-                    idx = pos[choice]
-                    neighbor.append(target_queue[idx].mean(0))
-                else:
-                    neighbor.append(target_queue[pos].mean(0))
-            else:
-                neighbor.append(current_features[i])
-        targets = torch.stack(neighbor, dim=0)
-        return F.normalize(targets, dim=-1)
-
-    @torch.no_grad()
-    def compute_prototypes_from_queue(self):
-        for c in range(self.cfg.DATASET.NUM_CLASSES):
-            idx = torch.nonzero(self.queue_labels == c).squeeze()
-            if idx.numel() > 0:
-                class_proto = self.queue_vit[idx].view(-1, self.queue_vit.shape[1]).mean(dim=0)
-                class_proto = F.normalize(class_proto, dim=0)
-                if not self.proto_initialized[c]:
-                    self.prototypes[c] = class_proto
-                    self.proto_initialized[c] = True
-                else:
-                    self.prototypes[c] = F.normalize(0.9 * self.prototypes[c] + 0.1 * class_proto, dim=0)
 
     def _local_split(self, x):
         _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
@@ -504,7 +451,6 @@ class CASS_GDRNet(Algorithm):
         # ---------------------------------------------------------
         # 1. 视角生成：全局图 (Global Views) 与 局部切块 (Local Crops)
         # ---------------------------------------------------------
-        # 1a. 全局强弱增强 (512x512)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
@@ -512,8 +458,6 @@ class CASS_GDRNet(Algorithm):
         img_weak = image.clone() * mask
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
 
-        # 1b. 生成局部高分辨率切块 (Local Crops, 强制裁剪出极小区域并输出为 224x224)
-        # 相当于给 CNN 发了一个“高倍显微镜”，只看原图 10%~40% 的面积
         local_crop_transform = T.Compose([
             T.RandomResizedCrop(224, scale=(0.1, 0.4), ratio=(0.75, 1.33)),
             T.RandomHorizontalFlip(p=0.5),
@@ -521,14 +465,13 @@ class CASS_GDRNet(Algorithm):
         ])
 
         num_local_crops = 2
-        # 注意：使用 img_strong 作为底图进行抠取，确保背景已被 mask
         local_crops = [
             torch.stack([local_crop_transform(img) for img in img_strong.clone()], dim=0).contiguous()
             for _ in range(num_local_crops)
         ]
 
         # ---------------------------------------------------------
-        # 2. FastMoCo 特征准备 (保持原有逻辑)
+        # 2. FastMoCo 特征准备
         # ---------------------------------------------------------
         x_split_cnn = self._local_split(img_strong).contiguous()
         x_split_vit = self._local_split(img_strong).contiguous()
@@ -567,24 +510,27 @@ class CASS_GDRNet(Algorithm):
             momentum_proj_vit = F.normalize(res_teacher_global['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_teacher_global['proj_cnn'].float(), dim=1)
 
-            # --- DINO 核心：教师中心化 (Centering) 与锐化 (Sharpening) ---
+            # 教师中心化 (Centering) - 防止模型长尾坍塌
             if not hasattr(self, 'teacher_center'):
                 self.teacher_center = torch.zeros(1, self.cfg.DATASET.NUM_CLASSES).to(image.device)
 
-            teacher_temp = 0.04 # 较低的温度使得 Teacher 的预测更自信 (Sharpening)
+            teacher_temp = 0.04
             teacher_logits = res_teacher_global['logits_vit'].float()
-
-            # 结合 Center 生成 Teacher 的 Soft Target
             teacher_probs = F.softmax((teacher_logits - self.teacher_center) / teacher_temp, dim=-1)
 
-            # EMA 更新 Center (防止模型坍塌到一个类别上)
             center_momentum = 0.9
             batch_center = torch.mean(teacher_logits, dim=0, keepdim=True)
             self.teacher_center = self.teacher_center * center_momentum + batch_center * (1 - center_momentum)
 
         # ---------------------------------------------------------
-        # 5. 计算原有全局损失 (FastMoCo + CASS + Sup)
+        # 5. 【彻底重构】DCR引导的监督学习与动量非对比对齐
         # ---------------------------------------------------------
+        # 5a. 监督分类损失与 DCR 动态长尾权重
+        loss_sup, loss_dict_main, dcr_weight = self.criterion(
+            res_clean_fp32['logits_cnn'], res_clean_fp32['logits_vit'], label, domain
+        )
+
+        # 5b. FastMoCo 对齐
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 proj_mix = network_inner.projector_cnn(feat_orthmix)
@@ -594,56 +540,54 @@ class CASS_GDRNet(Algorithm):
             cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
             loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
 
-        target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
-        target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
-        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
+        # 5c. 【新卖点】动态 EMA 跨架构对齐 (替代旧的 Prototype 队列)
+        student_proj_cnn = F.normalize(res_clean_fp32['proj_cnn'], dim=1)
+        student_proj_vit = F.normalize(res_clean_fp32['proj_vit'], dim=1)
 
-        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
-        # CASS_Loss 和 监督分类 Loss
-        loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
+        # 计算余弦距离（完全对齐时为0，完全相反为4）
+        align_cnn_to_vit = 2.0 - 2.0 * (student_proj_cnn * momentum_proj_vit.detach()).sum(dim=1)
+        align_vit_to_cnn = 2.0 - 2.0 * (student_proj_vit * momentum_proj_cnn.detach()).sum(dim=1)
+
+        # 引入 DCR_Weight，自适应放大少数分布域的病变特征对齐梯度
+        loss_align = (align_cnn_to_vit * dcr_weight).mean() + (align_vit_to_cnn * dcr_weight).mean()
 
         # ---------------------------------------------------------
-        # 6. 【创新点】跨尺度非对称自蒸馏 (Cross-Scale Asymmetric KD)
+        # 6. 跨尺度非对称自蒸馏 (Cross-Scale Asymmetric KD)
         # ---------------------------------------------------------
-        # 强制 Student(CNN) 从局部 224x224 病灶中，猜出 Teacher(ViT) 看到的全局 512x512 诊断结果
         student_temp = 0.1
         loss_dino_local = torch.tensor(0.0, device=image.device)
 
         for local_crop in local_crops:
             with torch.amp.autocast('cuda'):
-                # Student 独立处理局部切块
                 res_student_local = self.network(x_cnn=local_crop, x_vit=local_crop)
 
-            # 获取 CNN 分支对局部的预测
             student_logits_local = res_student_local['logits_cnn'].float()
             student_log_probs = F.log_softmax(student_logits_local / student_temp, dim=-1)
 
-            # 交叉熵蒸馏：Teacher_Global_Probs 指导 Student_Local_LogProbs
-            # 乘以 dcr_weight 确保在极度不平衡的长尾分布中，少数类的局部特征受到足够重视
             loss_crop = torch.sum(-teacher_probs * student_log_probs, dim=-1)
             loss_dino_local += (loss_crop * dcr_weight).mean()
 
         loss_dino_local = loss_dino_local / num_local_crops
 
         # ---------------------------------------------------------
-        # 7. 【创新点】DRTs 正交解耦约束
+        # 7. DRTs 正交解耦约束
         # ---------------------------------------------------------
         drts = res_clean_fp32['drts']
         spatial_tokens = res_clean_fp32['spatial_tokens']
         drts_norm = F.normalize(drts, dim=-1)
         spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
 
-        # 强制域噪声寄存器与病理空间向量正交 (余弦相似度趋近于0)
         cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
         # ---------------------------------------------------------
         # 8. 最终损失聚合与反向传播
         # ---------------------------------------------------------
+        lambda_align = 0.5   # 跨架构动量对齐强度
         lambda_ortho = 1.5   # 寄存器正交约束强度
-        lambda_dino = 1.0    # 局部特征锚定(蒸馏)强度
+        lambda_dino = 1.0    # 局部特征蒸馏强度
 
-        total_loss = loss_main + 0.1 * loss_fastmoco + lambda_dino * loss_dino_local + lambda_ortho * loss_ortho
+        total_loss = loss_sup + lambda_align * loss_align + 0.1 * loss_fastmoco + lambda_dino * loss_dino_local + lambda_ortho * loss_ortho
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -659,9 +603,12 @@ class CASS_GDRNet(Algorithm):
         # ---------------------------------------------------------
         # 9. 记录日志
         # ---------------------------------------------------------
+        loss_dict = {}
+        loss_dict.update(loss_dict_main)
+        loss_dict['loss_align'] = loss_align.item()           # 动量对齐 Loss
         loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_dino_local'] = loss_dino_local.item() # 核心蒸馏Loss
-        loss_dict['loss_ortho'] = loss_ortho.item()           # 正交解耦Loss
+        loss_dict['loss_dino_local'] = loss_dino_local.item() # 核心局部蒸馏 Loss
+        loss_dict['loss_ortho'] = loss_ortho.item()           # 正交解耦 Loss
         loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
@@ -681,11 +628,13 @@ class CASS_GDRNet(Algorithm):
         metrics_cnn_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
         val_auc_cnn = metrics_cnn_val['auc']
         test_auc_cnn = metrics_cnn_test['auc']
+
         self.eval_branch = 'vit'
         metrics_vit_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_vit')
         metrics_vit_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_vit')
         val_auc_vit = metrics_vit_val['auc']
         test_auc_vit = metrics_vit_test['auc']
+
         self.eval_branch = 'cnn'
         if self.epoch == self.cfg.EPOCHS:
             self.epoch += 1
@@ -709,15 +658,13 @@ class CASS_GDRNet(Algorithm):
                 state_dict = self.network.module.state_dict()
             else:
                 state_dict = self.network.state_dict()
+            # 彻底去掉了保存 Queue 相关的字典
             if source == 'cnn':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
             elif source == 'vit':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_vit.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_vit.pth'))
             else:
                 torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
 
     def renew_model(self, log_path, source='best'):
         if source == 'cnn':
