@@ -713,8 +713,11 @@ class DualTowerGDRNet(nn.Module):
             attn_clean = None
         return feat_clean, attn_clean
 
-    def forward(self, x_cnn, x_vit=None):
+    def forward(self, x_cnn=None, x_vit=None, return_cnn_feature=False, project_cnn_feature=None):
         res = {}
+        if project_cnn_feature is not None:
+            return self.projector_cnn(project_cnn_feature)
+
         if x_vit is None:
             img_for_vit = x_cnn
             img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
@@ -754,6 +757,8 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.layer4(x)
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
+        if return_cnn_feature:
+            return feat_cnn_final
         logits_cnn = self.classifier_cnn(feat_cnn_final)
         proj_cnn = self.projector_cnn(feat_cnn_final)
         res['logits_cnn'] = logits_cnn
