@@ -15,7 +15,6 @@ from backpack.extensions import BatchGrad
 from itertools import combinations
 import torch.distributed as dist
 import copy
-import contextlib
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
 
@@ -494,11 +493,9 @@ class CASS_GDRNet(Algorithm):
 
         if hasattr(self.network, 'module'):
             network_inner = self.network.module
-            get_sync_context = self.network.no_sync
             momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
         else:
             network_inner = self.network
-            get_sync_context = contextlib.nullcontext
             momentum_inner = self.momentum_network
 
         # ---------------------------------------------------------
@@ -533,15 +530,14 @@ class CASS_GDRNet(Algorithm):
         x_split_cnn = self._local_split(img_strong).contiguous()
         x_split_vit = self._local_split(img_strong).contiguous()
 
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
-            feat_split = feat_split.float()
-            if len(feat_split.shape) > 2:
-                feat_split = feat_split.view(feat_split.size(0), -1)
-            chunk_size = image.size(0)
-            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
-            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
+        with torch.amp.autocast('cuda'):
+            feat_split = self.network(x_cnn=x_split_cnn, x_vit=x_split_vit, return_cnn_feature=True)
+        feat_split = feat_split.float()
+        if len(feat_split.shape) > 2:
+            feat_split = feat_split.view(feat_split.size(0), -1)
+        chunk_size = image.size(0)
+        feat_splits_list = list(feat_split.split(chunk_size, dim=0))
+        feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
         # ---------------------------------------------------------
         # 3. 当前网络 (Student) 前向传播 - 处理全局视图
@@ -585,14 +581,13 @@ class CASS_GDRNet(Algorithm):
         # ---------------------------------------------------------
         # 5. 计算原有全局损失 (FastMoCo + CASS + Sup)
         # ---------------------------------------------------------
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                proj_mix = network_inner.projector_cnn(feat_orthmix)
-            proj_mix = F.normalize(proj_mix.float(), dim=1)
-            num_mixs = proj_mix.shape[0] // chunk_size
-            target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
-            cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
-            loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
+        with torch.amp.autocast('cuda'):
+            proj_mix = self.network(project_cnn_feature=feat_orthmix)
+        proj_mix = F.normalize(proj_mix.float(), dim=1)
+        num_mixs = proj_mix.shape[0] // chunk_size
+        target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
+        cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
+        loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
 
         target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
         target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
