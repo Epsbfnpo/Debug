@@ -138,7 +138,6 @@ class GDRNetLoss_Integrated(nn.Module):
         self.register_buffer('label_counts', torch.tensor(selected_label_nums, dtype=torch.float))
         self.beta = beta
         self.SupLoss = nn.CrossEntropyLoss(reduction='none')
-        self.MSELoss = nn.MSELoss(reduction='none')
 
     def multinomial_smoothing(self, probs, beta):
         return torch.pow(probs, beta)
@@ -162,35 +161,20 @@ class GDRNetLoss_Integrated(nn.Module):
         combined_weight = torch.clamp(combined_weight, min=0.1, max=10.0)
         return combined_weight / 2.0
 
-    def forward(self, output_dict, target_dict, labels, domains):
+    def forward(self, logits_cnn, logits_vit, labels, domains):
+        # 1. 获取动态重加权权重 (DCR Weight)
         dcr_weight = self.get_dcr_weights(labels, domains)
-        logits_cnn = output_dict['logits_cnn']
-        logits_vit = output_dict['logits_vit']
-        proj_cnn = output_dict['proj_cnn']
-        proj_vit = output_dict['proj_vit']
-        proj_cnn_norm = F.normalize(proj_cnn, dim=1)
-        proj_vit_norm = F.normalize(proj_vit, dim=1)
+
+        # 2. 计算 CNN 和 ViT 的监督分类损失，并注入 DCR 权重
         loss_sup_cnn = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
         loss_sup_vit = (self.SupLoss(logits_vit, labels) * dcr_weight).mean()
 
-        cos_sim_1 = (proj_cnn_norm * proj_vit_norm).sum(dim=1)
-        loss_cass_1 = 2.0 - 2.0 * cos_sim_1
+        loss_sup_total = loss_sup_cnn + loss_sup_vit
+        loss_dict = {"sup_cnn": loss_sup_cnn.item(), "sup_vit": loss_sup_vit.item()}
 
-        target_vit = target_dict['target_vit']
-        cos_sim_2 = (proj_cnn_norm * target_vit).sum(dim=1)
-        loss_cass_2 = 2.0 - 2.0 * cos_sim_2
-
-        target_cnn = target_dict['target_cnn']
-        cos_sim_3 = (proj_vit_norm * target_cnn).sum(dim=1)
-        loss_cass_3 = 2.0 - 2.0 * cos_sim_3
-
-        loss_cass_raw = (loss_cass_1 + loss_cass_2 + loss_cass_3) / 3.0
-        loss_cass = loss_cass_raw.mean()
-        lambda_sup = 1.0
-        lambda_cass = 0.5
-        loss_total = lambda_sup * (loss_sup_cnn + loss_sup_vit) + lambda_cass * loss_cass
-        loss_dict = {"loss": loss_total.item(), "sup_cnn": loss_sup_cnn.item(), "sup_vit": loss_sup_vit.item(), "cass": loss_cass.item()}
-        return loss_total, loss_dict, dcr_weight
+        # 返回总监督损失、日志字典、以及 dcr_weight 供外部对齐和蒸馏使用
+        return loss_sup_total, loss_dict, dcr_weight
 
     def update_alpha(self, epoch):
         pass
+
