@@ -128,7 +128,7 @@ def D(p, z, version='simplified'):
 
 
 class GDRNetLoss_Integrated(nn.Module):
-    def __init__(self, training_domains, beta):
+    def __init__(self, training_domains, beta, **kwargs):
         super(GDRNetLoss_Integrated, self).__init__()
         self.domain_num_dict = {'MESSIDOR': 1396, 'IDRID': 413, 'DEEPDR': 1280, 'FGADR': 1474, 'APTOS': 2930, 'RLDR': 1275, 'DDR': 10018, 'EYEPACS': 28101}
         self.label_num_dict = {'MESSIDOR': [824, 218, 272, 57, 25], 'IDRID': [131, 23, 135, 71, 53], 'DEEPDR': [583, 141, 253, 227, 76], 'FGADR': [81, 177, 474, 508, 234], 'APTOS': [1438, 300, 807, 156, 229], 'RLDR': [126, 272, 747, 77, 53], 'DDR': [5012, 484, 3600, 184, 738], 'EYEPACS': [20661, 1962, 4207, 702, 569]}
@@ -138,7 +138,6 @@ class GDRNetLoss_Integrated(nn.Module):
         self.register_buffer('label_counts', torch.tensor(selected_label_nums, dtype=torch.float))
         self.beta = beta
         self.SupLoss = nn.CrossEntropyLoss(reduction='none')
-        self.MSELoss = nn.MSELoss(reduction='none')
 
     def multinomial_smoothing(self, probs, beta):
         return torch.pow(probs, beta)
@@ -162,35 +161,22 @@ class GDRNetLoss_Integrated(nn.Module):
         combined_weight = torch.clamp(combined_weight, min=0.1, max=10.0)
         return combined_weight / 2.0
 
-    def forward(self, output_dict, target_dict, labels, domains):
+    def forward(self, logits_cnn, logits_vit, labels, domains):
+        if isinstance(logits_vit, (list, tuple, dict)):
+            dcr_weight = self.get_dcr_weights(labels, domains)
+            loss_sup = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
+            loss_dict = {"loss": loss_sup.item(), "sup_cnn": loss_sup.item()}
+            return loss_sup, loss_dict
+
         dcr_weight = self.get_dcr_weights(labels, domains)
-        logits_cnn = output_dict['logits_cnn']
-        logits_vit = output_dict['logits_vit']
-        proj_cnn = output_dict['proj_cnn']
-        proj_vit = output_dict['proj_vit']
-        proj_cnn_norm = F.normalize(proj_cnn, dim=1)
-        proj_vit_norm = F.normalize(proj_vit, dim=1)
+
         loss_sup_cnn = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
         loss_sup_vit = (self.SupLoss(logits_vit, labels) * dcr_weight).mean()
-
-        cos_sim_1 = (proj_cnn_norm * proj_vit_norm).sum(dim=1)
-        loss_cass_1 = 2.0 - 2.0 * cos_sim_1
-
-        target_vit = target_dict['target_vit']
-        cos_sim_2 = (proj_cnn_norm * target_vit).sum(dim=1)
-        loss_cass_2 = 2.0 - 2.0 * cos_sim_2
-
-        target_cnn = target_dict['target_cnn']
-        cos_sim_3 = (proj_vit_norm * target_cnn).sum(dim=1)
-        loss_cass_3 = 2.0 - 2.0 * cos_sim_3
-
-        loss_cass_raw = (loss_cass_1 + loss_cass_2 + loss_cass_3) / 3.0
-        loss_cass = loss_cass_raw.mean()
-        lambda_sup = 1.0
-        lambda_cass = 0.5
-        loss_total = lambda_sup * (loss_sup_cnn + loss_sup_vit) + lambda_cass * loss_cass
-        loss_dict = {"loss": loss_total.item(), "sup_cnn": loss_sup_cnn.item(), "sup_vit": loss_sup_vit.item(), "cass": loss_cass.item()}
-        return loss_total, loss_dict, dcr_weight
+        
+        loss_sup_total = loss_sup_cnn + loss_sup_vit
+        loss_dict = {"sup_cnn": loss_sup_cnn.item(), "sup_vit": loss_sup_vit.item()}
+        
+        return loss_sup_total, loss_dict, dcr_weight
 
     def update_alpha(self, epoch):
         pass
