@@ -15,6 +15,7 @@ from backpack.extensions import BatchGrad
 from itertools import combinations
 import torch.distributed as dist
 import copy
+import contextlib
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
 
@@ -437,42 +438,44 @@ class CASS_GDRNet(Algorithm):
 
         if hasattr(self.network, 'module'):
             network_inner = self.network.module
+            get_sync_context = self.network.no_sync
             momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
         else:
             network_inner = self.network
+            get_sync_context = contextlib.nullcontext
             momentum_inner = self.momentum_network
 
+        # ---------------------------------------------------------
+        # 1. 视角生成：只保留全局图 (Global Views)，抛弃有害的局部裁剪
+        # ---------------------------------------------------------
+        # 强增强 (给 Student 学习用)
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
 
+        # 弱增强 (给动量 Teacher 产出稳定目标用)
         img_weak = image.clone() * mask
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
 
-        local_crop_transform = T.Compose([
-            T.RandomResizedCrop(224, scale=(0.1, 0.4), ratio=(0.75, 1.33)),
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomApply([T.ColorJitter(brightness=0.2, contrast=0.2)], p=0.5)
-        ])
-
-        num_local_crops = 2
-        local_crops = [
-            torch.stack([local_crop_transform(img) for img in img_strong.clone()], dim=0).contiguous()
-            for _ in range(num_local_crops)
-        ]
-
+        # ---------------------------------------------------------
+        # 2. FastMoCo 特征准备
+        # ---------------------------------------------------------
         x_split_cnn = self._local_split(img_strong).contiguous()
         x_split_vit = self._local_split(img_strong).contiguous()
 
-        with torch.amp.autocast('cuda'):
-            feat_split = self.network(x_cnn=x_split_cnn, x_vit=x_split_vit, return_cnn_feature=True)
-        feat_split = feat_split.float()
-        if len(feat_split.shape) > 2:
-            feat_split = feat_split.view(feat_split.size(0), -1)
-        chunk_size = image.size(0)
-        feat_splits_list = list(feat_split.split(chunk_size, dim=0))
-        feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
+        with get_sync_context():
+            with torch.amp.autocast('cuda'):
+                feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
+            feat_split = feat_split.float()
+            if len(feat_split.shape) > 2:
+                feat_split = feat_split.view(feat_split.size(0), -1)
+            chunk_size = image.size(0)
+            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
+            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
+        # ---------------------------------------------------------
+        # 3. 当前网络 (Student) 前向传播 - 处理全局强增强视图
+        # ---------------------------------------------------------
         with torch.amp.autocast('cuda'):
             res_student_global = self.network(x_cnn=img_strong, x_vit=img_strong)
 
@@ -485,12 +488,16 @@ class CASS_GDRNet(Algorithm):
             'spatial_tokens': res_student_global['spatial_tokens'].float(),
         }
 
+        # ---------------------------------------------------------
+        # 4. 动量教师网络 (Teacher) 前向传播 - 处理全局弱增强视图
+        # ---------------------------------------------------------
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 res_teacher_global = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
             momentum_proj_vit = F.normalize(res_teacher_global['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_teacher_global['proj_cnn'].float(), dim=1)
 
+            # 教师中心化 (Centering) - 依然保留，这对长尾分布极其有效
             if not hasattr(self, 'teacher_center'):
                 self.teacher_center = torch.zeros(1, self.cfg.DATASET.NUM_CLASSES).to(image.device)
 
@@ -502,49 +509,63 @@ class CASS_GDRNet(Algorithm):
             batch_center = torch.mean(teacher_logits, dim=0, keepdim=True)
             self.teacher_center = self.teacher_center * center_momentum + batch_center * (1 - center_momentum)
 
+        # ---------------------------------------------------------
+        # 5. DCR引导的监督学习与动量非对比对齐 (完美保留)
+        # ---------------------------------------------------------
+        # 5a. 监督分类损失与 DCR 动态长尾权重
         loss_sup, loss_dict_main, dcr_weight = self.criterion(
             res_clean_fp32['logits_cnn'], res_clean_fp32['logits_vit'], label, domain
         )
 
-        with torch.amp.autocast('cuda'):
-            proj_mix = self.network(project_cnn_feature=feat_orthmix)
-        proj_mix = F.normalize(proj_mix.float(), dim=1)
-        num_mixs = proj_mix.shape[0] // chunk_size
-        target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
-        cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
-        loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
+        # 5b. FastMoCo 对齐
+        with get_sync_context():
+            with torch.amp.autocast('cuda'):
+                proj_mix = network_inner.projector_cnn(feat_orthmix)
+            proj_mix = F.normalize(proj_mix.float(), dim=1)
+            num_mixs = proj_mix.shape[0] // chunk_size
+            target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
+            cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
+            loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
 
+        # 5c. 动态 EMA 跨架构对齐 
         student_proj_cnn = F.normalize(res_clean_fp32['proj_cnn'], dim=1)
         student_proj_vit = F.normalize(res_clean_fp32['proj_vit'], dim=1)
+
         align_cnn_to_vit = 2.0 - 2.0 * (student_proj_cnn * momentum_proj_vit.detach()).sum(dim=1)
         align_vit_to_cnn = 2.0 - 2.0 * (student_proj_vit * momentum_proj_cnn.detach()).sum(dim=1)
+
         loss_align = (align_cnn_to_vit * dcr_weight).mean() + (align_vit_to_cnn * dcr_weight).mean()
 
+        # ---------------------------------------------------------
+        # 6. 【修正】全局动量自蒸馏 (Global Momentum Self-Distillation)
+        # ---------------------------------------------------------
+        # 用 Teacher(弱增强) 全局指导 Student(强增强) 全局分类，防止 CNN 过拟合强增强噪声
         student_temp = 0.1
-        loss_dino_local = torch.tensor(0.0, device=image.device)
+        student_log_probs_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / student_temp, dim=-1)
+        
+        # 交叉熵蒸馏，并带入 DCR 权重保护重症样本
+        loss_kd_global = torch.sum(-teacher_probs * student_log_probs_cnn, dim=-1)
+        loss_kd_global = (loss_kd_global * dcr_weight).mean()
 
-        for local_crop in local_crops:
-            with torch.amp.autocast('cuda'):
-                res_student_local = self.network(x_cnn=local_crop, x_vit=local_crop)
-
-            student_logits_local = res_student_local['logits_cnn'].float()
-            student_log_probs = F.log_softmax(student_logits_local / student_temp, dim=-1)
-            loss_crop = torch.sum(-teacher_probs * student_log_probs, dim=-1)
-            loss_dino_local += (loss_crop * dcr_weight).mean()
-
-        loss_dino_local = loss_dino_local / num_local_crops
-
+        # ---------------------------------------------------------
+        # 7. DRTs 正交解耦约束 (完美保留)
+        # ---------------------------------------------------------
         drts = res_clean_fp32['drts']
         spatial_tokens = res_clean_fp32['spatial_tokens']
         drts_norm = F.normalize(drts, dim=-1)
         spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
+
         cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
-        lambda_align = 0.5
-        lambda_ortho = 1.5
-        lambda_dino = 1.0
-        total_loss = loss_sup + lambda_align * loss_align + 0.1 * loss_fastmoco + lambda_dino * loss_dino_local + lambda_ortho * loss_ortho
+        # ---------------------------------------------------------
+        # 8. 最终损失聚合与反向传播
+        # ---------------------------------------------------------
+        lambda_align = 0.5   # 跨架构动量对齐强度
+        lambda_ortho = 1.5   # 寄存器正交约束强度
+        lambda_kd = 1.0      # 变更为：全局蒸馏强度
+
+        total_loss = loss_sup + lambda_align * loss_align + 0.1 * loss_fastmoco + lambda_kd * loss_kd_global + lambda_ortho * loss_ortho
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -552,20 +573,25 @@ class CASS_GDRNet(Algorithm):
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
+        # 动量网络平滑更新
         with torch.no_grad():
             for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
 
+        # ---------------------------------------------------------
+        # 9. 记录日志
+        # ---------------------------------------------------------
         loss_dict = {}
         loss_dict.update(loss_dict_main)
-        loss_dict['loss_align'] = loss_align.item()
+        loss_dict['loss_align'] = loss_align.item()           # 动量对齐 Loss
         loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_dino_local'] = loss_dino_local.item()
-        loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['loss_kd_global'] = loss_kd_global.item()   # 恢复为全局蒸馏 Loss
+        loss_dict['loss_ortho'] = loss_ortho.item()           # 正交解耦 Loss
         loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
         loss_dict['gate3'] = network_inner.bridge3.gate.item()
+
         return loss_dict
 
     def update_epoch(self, epoch):
