@@ -14,7 +14,6 @@ import logging
 from transformers import AutoModel, AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
 from .lora_utils import inject_lora_dinov3
-import types
 
 def important_token_selection(key_layer, value_layer, attention_probs, token_ratio=0.2):
     B, N, C = key_layer.shape
@@ -661,31 +660,6 @@ class DualTowerGDRNet(nn.Module):
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
         self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
-        self.target_layers = [3, 6, 9]
-        self.hooked_attns = {}
-        def make_hook(layer_idx):
-            def new_forward(attn_self, *args, **kwargs):
-                kwargs['output_attentions'] = True
-                outputs = attn_self._original_forward(*args, **kwargs)
-                if isinstance(outputs, tuple) and len(outputs) > 1:
-                    attn_self.current_attn_map = outputs[1]
-                return outputs
-            return new_forward
-        hook_count = 0
-        for name, module in self.vit.model.named_modules():
-            if isinstance(module, nn.ModuleList) and len(module) >= 12:
-                for l_idx in self.target_layers:
-                    if hasattr(module[l_idx], 'attention'):
-                        target_attention = module[l_idx].attention
-                        target_attention._original_forward = target_attention.forward
-                        target_attention.forward = types.MethodType(make_hook(l_idx), target_attention)
-                        self.hooked_attns[l_idx] = target_attention
-                        hook_count += 1
-                break
-        if hook_count == len(self.target_layers):
-            print(f"✅ 成功注入 {hook_count} 个 Hook：已精准拦截 DINOv3 第 {self.target_layers} 层的 Attention Map。")
-        else:
-            print("⚠️ 警告：多层 Hook 注入不完整，请检查 DINOv3 结构。")
         self.bridge1 = BridgeModule(cnn_dim=256, vit_dim=self.vit_dim, project_dim=256, token_ratio=0.5)
         self.bridge2 = BridgeModule(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.4)
         self.bridge3 = BridgeModule(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.3)
@@ -694,9 +668,6 @@ class DualTowerGDRNet(nn.Module):
         self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
-
-    def _strip_drts_and_attn(self, feat, attn):
-        return feat, None
 
     def forward(self, x_cnn, x_vit=None):
         res = {}
@@ -713,15 +684,9 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[3 + 1]
         feat_vit_6 = vit_outputs.hidden_states[6 + 1]
         feat_vit_9 = vit_outputs.hidden_states[9 + 1]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
+        feat_vit_3_clean = feat_vit_3
+        feat_vit_6_clean = feat_vit_6
+        feat_vit_9_clean = feat_vit_9
         feat_vit_final = vit_outputs.last_hidden_state[:, 0]
         x = self.cnn.conv1(img_for_cnn)
         x = self.cnn.bn1(x)
@@ -755,15 +720,9 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[4]
         feat_vit_6 = vit_outputs.hidden_states[7]
         feat_vit_9 = vit_outputs.hidden_states[10]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
+        feat_vit_3_clean = feat_vit_3
+        feat_vit_6_clean = feat_vit_6
+        feat_vit_9_clean = feat_vit_9
         x = self.cnn.conv1(x_cnn)
         x = self.cnn.bn1(x)
         x = self.cnn.relu(x)

@@ -499,13 +499,10 @@ class CASS_GDRNet(Algorithm):
                 state_dict = self.network.state_dict()
             if source == 'cnn':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
             elif source == 'vit':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_vit.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_vit.pth'))
             else:
                 torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
 
     def renew_model(self, log_path, source='best'):
         if source == 'cnn':
