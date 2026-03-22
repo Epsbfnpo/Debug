@@ -28,7 +28,7 @@ conda activate brainseg
 
 chmod +x ./run_esdg.sh
 
-export OUTPUT_DIR="./output_esdg_h100"
+export OUTPUT_DIR="./output_esdg_h100_m_src"
 
 set +e
 
@@ -38,7 +38,7 @@ set -e
 
 echo "Python script finished. Checking checkpoints for status..."
 
-CHECK_DIR="${OUTPUT_DIR}/GDRNet_ESDG_MESSIDOR"
+CHECK_DIR="${OUTPUT_DIR}/Target_MESSIDOR/GDRNet_ESDG_MESSIDOR"
 
 FINAL_PTH="${CHECK_DIR}/final_model.pth"
 LATEST_PTH="${CHECK_DIR}/latest_model.pth"
