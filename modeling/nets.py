@@ -14,7 +14,6 @@ import logging
 from transformers import AutoModel, AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
 from .lora_utils import inject_lora_dinov3
-import types
 
 def important_token_selection(key_layer, value_layer, attention_probs, token_ratio=0.2):
     B, N, C = key_layer.shape
@@ -577,7 +576,7 @@ class AveragedModel(Module):
 class DINOv3Wrapper(nn.Module):
     def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, num_drts=4, use_grad_checkpointing=False):
         super().__init__()
-        print(f"🚀 [DINOv3+LoRA+DRTs] Loading from local path: {local_path}")
+        print(f"🚀 [DINOv3+LoRA] Loading from local path: {local_path}")
         try:
             self.config = AutoConfig.from_pretrained(local_path, local_files_only=True)
             self.config.output_hidden_states = True
@@ -593,13 +592,8 @@ class DINOv3Wrapper(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
             print("🧊 [DINOv3] All base parameters frozen.")
-            self.num_drts = num_drts
-            self.drt_tokens = nn.Parameter(torch.zeros(1, num_drts, self._out_features))
-            nn.init.normal_(self.drt_tokens, std=0.02)
-            print(f"🧩 [DRTs] Initialized {num_drts} Domain-Absorbing Register Tokens.")
             inject_lora_dinov3(self.model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            trainable_params.append(self.drt_tokens)
             print(f"🔥 [LoRA Injected] Trainable parameters: {len(trainable_params)}")
         except Exception as e:
             print(f"❌ Error loading DINOv3: {e}")
@@ -607,11 +601,9 @@ class DINOv3Wrapper(nn.Module):
 
     def forward(self, x):
         embeddings = self.model.embeddings(x)
-        batch_size = embeddings.shape[0]
         cls_token = embeddings[:, :1, :]
         patch_tokens = embeddings[:, 1:, :]
-        drts = self.drt_tokens.expand(batch_size, -1, -1)
-        hidden_states = torch.cat([cls_token, drts, patch_tokens], dim=1)
+        hidden_states = torch.cat([cls_token, patch_tokens], dim=1)
         position_embeddings = self.model.rope_embeddings(x) if hasattr(self.model, "rope_embeddings") else None
         all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
 
@@ -668,50 +660,11 @@ class DualTowerGDRNet(nn.Module):
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
         self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
-        self.target_layers = [3, 6, 9]
-        self.hooked_attns = {}
-        def make_hook(layer_idx):
-            def new_forward(attn_self, *args, **kwargs):
-                kwargs['output_attentions'] = True
-                outputs = attn_self._original_forward(*args, **kwargs)
-                if isinstance(outputs, tuple) and len(outputs) > 1:
-                    attn_self.current_attn_map = outputs[1]
-                return outputs
-            return new_forward
-        hook_count = 0
-        for name, module in self.vit.model.named_modules():
-            if isinstance(module, nn.ModuleList) and len(module) >= 12:
-                for l_idx in self.target_layers:
-                    if hasattr(module[l_idx], 'attention'):
-                        target_attention = module[l_idx].attention
-                        target_attention._original_forward = target_attention.forward
-                        target_attention.forward = types.MethodType(make_hook(l_idx), target_attention)
-                        self.hooked_attns[l_idx] = target_attention
-                        hook_count += 1
-                break
-        if hook_count == len(self.target_layers):
-            print(f"✅ 成功注入 {hook_count} 个 Hook：已精准拦截 DINOv3 第 {self.target_layers} 层的 Attention Map。")
-        else:
-            print("⚠️ 警告：多层 Hook 注入不完整，请检查 DINOv3 结构。")
         self.bridge1 = BridgeModule(cnn_dim=256, vit_dim=self.vit_dim, project_dim=256, token_ratio=0.5)
         self.bridge2 = BridgeModule(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.4)
         self.bridge3 = BridgeModule(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.3)
-        proj_dim = 1024
-        self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
-        self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
-
-    def _strip_drts_and_attn(self, feat, attn):
-        """剥离序列中的 DRTs，防止污染 CNN，同时调整 Attention Map 维度"""
-        num_drts = self.vit.num_drts
-        feat_clean = torch.cat([feat[:, :1, :], feat[:, 1 + num_drts:, :]], dim=1)
-        if attn is not None:
-            attn_clean = torch.cat([attn[:, :, :1, :], attn[:, :, 1 + num_drts:, :]], dim=2)
-            attn_clean = torch.cat([attn_clean[:, :, :, :1], attn_clean[:, :, :, 1 + num_drts:]], dim=3)
-        else:
-            attn_clean = None
-        return feat_clean, attn_clean
 
     def forward(self, x_cnn, x_vit=None):
         res = {}
@@ -728,42 +681,27 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[3 + 1]
         feat_vit_6 = vit_outputs.hidden_states[6 + 1]
         feat_vit_9 = vit_outputs.hidden_states[9 + 1]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
+        feat_vit_3_clean = feat_vit_3
+        feat_vit_6_clean = feat_vit_6
+        feat_vit_9_clean = feat_vit_9
         feat_vit_final = vit_outputs.last_hidden_state[:, 0]
-        num_drts = self.vit.num_drts
-        drts_features = vit_outputs.last_hidden_state[:, 1:1 + num_drts, :]
-        spatial_features = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
         x = self.cnn.conv1(img_for_cnn)
         x = self.cnn.bn1(x)
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
+        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=None)
         x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
+        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=None)
         x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
+        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=None)
         x = self.cnn.layer4(x)
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
         logits_cnn = self.classifier_cnn(feat_cnn_final)
-        proj_cnn = self.projector_cnn(feat_cnn_final)
         res['logits_cnn'] = logits_cnn
-        res['proj_cnn'] = proj_cnn
         logits_vit = self.classifier_vit(feat_vit_final)
-        proj_vit = self.projector_vit(feat_vit_final)
         res['logits_vit'] = logits_vit
-        res['proj_vit'] = proj_vit
-        res['drts'] = drts_features
-        res['spatial_tokens'] = spatial_features
         return res
 
     def extract_cnn_feature(self, x_cnn, x_vit=None):
@@ -775,25 +713,19 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[4]
         feat_vit_6 = vit_outputs.hidden_states[7]
         feat_vit_9 = vit_outputs.hidden_states[10]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
+        feat_vit_3_clean = feat_vit_3
+        feat_vit_6_clean = feat_vit_6
+        feat_vit_9_clean = feat_vit_9
         x = self.cnn.conv1(x_cnn)
         x = self.cnn.bn1(x)
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
+        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=None)
         x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
+        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=None)
         x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
+        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=None)
         x = self.cnn.layer4(x)
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
