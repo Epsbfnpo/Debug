@@ -663,9 +663,6 @@ class DualTowerGDRNet(nn.Module):
         self.bridge1 = BridgeModule(cnn_dim=256, vit_dim=self.vit_dim, project_dim=256, token_ratio=0.5)
         self.bridge2 = BridgeModule(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.4)
         self.bridge3 = BridgeModule(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.3)
-        proj_dim = 1024
-        self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
-        self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
 
@@ -702,13 +699,9 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
         logits_cnn = self.classifier_cnn(feat_cnn_final)
-        proj_cnn = self.projector_cnn(feat_cnn_final)
         res['logits_cnn'] = logits_cnn
-        res['proj_cnn'] = proj_cnn
         logits_vit = self.classifier_vit(feat_vit_final)
-        proj_vit = self.projector_vit(feat_vit_final)
         res['logits_vit'] = logits_vit
-        res['proj_vit'] = proj_vit
         return res
 
     def extract_cnn_feature(self, x_cnn, x_vit=None):

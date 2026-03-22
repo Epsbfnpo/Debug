@@ -428,8 +428,6 @@ class CASS_GDRNet(Algorithm):
             res_combined = self.network(x_cnn=img_strong, x_vit=img_strong)
 
         res_clean_fp32 = {
-            'proj_cnn': res_combined['proj_cnn'].float(),
-            'proj_vit': res_combined['proj_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
         }
