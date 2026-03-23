@@ -708,6 +708,17 @@ class DualTowerGDRNet(nn.Module):
             if hasattr(hook, 'current_attn_map'):
                 hook.current_attn_map = None
 
+    def _strip_drts_and_attn(self, feat, attn):
+        """剥离序列中的 DRTs，防止污染 CNN，同时调整 Attention Map 维度"""
+        num_drts = self.vit.num_drts
+        feat_clean = torch.cat([feat[:, :1, :], feat[:, 1 + num_drts:, :]], dim=1)
+        if attn is not None:
+            attn_clean = torch.cat([attn[:, :, :1, :], attn[:, :, 1 + num_drts:, :]], dim=2)
+            attn_clean = torch.cat([attn_clean[:, :, :, :1], attn_clean[:, :, :, 1 + num_drts:]], dim=3)
+        else:
+            attn_clean = None
+        return feat_clean, attn_clean
+
     def forward(self, x_cnn, x_vit=None):
         res = {}
         try:
@@ -729,17 +740,20 @@ class DualTowerGDRNet(nn.Module):
             attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
             if attn_3 is None or attn_6 is None or attn_9 is None:
                 raise RuntimeError("Attention maps not found! Check if hook is properly registered in DINOv3.")
+            feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
+            feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
+            feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
             feat_vit_final = vit_outputs.last_hidden_state[:, 0]
             x = self.cnn.conv1(img_for_cnn)
             x = self.cnn.bn1(x)
             x = self.cnn.relu(x)
             x = self.cnn.maxpool(x)
             x = self.cnn.layer1(x)
-            x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3, attn_map_vit=attn_3)
+            x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
             x = self.cnn.layer2(x)
-            x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6, attn_map_vit=attn_6)
+            x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
             x = self.cnn.layer3(x)
-            x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9, attn_map_vit=attn_9)
+            x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
             x = self.cnn.layer4(x)
             x = self.cnn.global_avgpool(x)
             feat_cnn_final = torch.flatten(x, 1)
@@ -766,16 +780,19 @@ class DualTowerGDRNet(nn.Module):
             attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
             if attn_3 is None or attn_6 is None or attn_9 is None:
                 raise RuntimeError("Attention maps not found! Check if hook is properly registered in DINOv3.")
+            feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
+            feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
+            feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
             x = self.cnn.conv1(x_cnn)
             x = self.cnn.bn1(x)
             x = self.cnn.relu(x)
             x = self.cnn.maxpool(x)
             x = self.cnn.layer1(x)
-            x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3, attn_map_vit=attn_3)
+            x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
             x = self.cnn.layer2(x)
-            x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6, attn_map_vit=attn_6)
+            x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
             x = self.cnn.layer3(x)
-            x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9, attn_map_vit=attn_9)
+            x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
             x = self.cnn.layer4(x)
             x = self.cnn.global_avgpool(x)
             feat_cnn_final = torch.flatten(x, 1)
