@@ -14,8 +14,6 @@ from backpack import backpack, extend
 from backpack.extensions import BatchGrad
 from itertools import combinations
 import torch.distributed as dist
-import copy
-import contextlib
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
 
@@ -406,179 +404,44 @@ class CASS_GDRNet(Algorithm):
     def __init__(self, num_classes, cfg):
         super(CASS_GDRNet, self).__init__(num_classes, cfg)
         self.network = DualTowerGDRNet(cfg)
-        self.momentum_network = copy.deepcopy(self.network)
-        for param in self.momentum_network.parameters():
-            param.requires_grad = False
-        self.m = 0.999
         trainable_params = [p for p in self.network.parameters() if p.requires_grad]
         total_params = sum(p.numel() for p in self.network.parameters())
         trainable_num = sum(p.numel() for p in trainable_params)
         print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN): {trainable_num / 1e6:.2f}M")
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-        self.K = 1024
-        proj_dim = 1024
-        self.num_positive = getattr(cfg, 'POSITIVE', 4)
-        self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
-        self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
-        self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
-        self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
-        self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        init_prototypes = F.normalize(torch.randn(num_classes, proj_dim), dim=1)
-        self.register_buffer("prototypes", init_prototypes)
-        self.register_buffer("proto_initialized", torch.zeros(num_classes, dtype=torch.bool))
-        self.split_num = 2
-        self.combs = 3
         self.fundusAug = get_post_FundusAug(cfg)
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
 
-    @torch.no_grad()
-    def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
-        feat_cnn = feat_cnn.float()
-        feat_vit = feat_vit.float()
-        batch_size = feat_cnn.shape[0]
-        ptr = int(self.queue_ptr)
-        replace_idx = torch.arange(ptr, ptr + batch_size).to(feat_cnn.device) % self.K
-        self.queue_cnn[replace_idx, :] = feat_cnn
-        self.queue_vit[replace_idx, :] = feat_vit
-        self.queue_labels[replace_idx] = labels
-        ptr = (ptr + batch_size) % self.K
-        self.queue_ptr[0] = ptr
-
-    @torch.no_grad()
-    def sample_target(self, current_features, labels, target_queue):
-        neighbor = []
-        for i, label in enumerate(labels):
-            pos = torch.where(self.queue_labels == label)[0]
-            if len(pos) != 0:
-                if self.num_positive > 0:
-                    weights = torch.ones_like(pos).float()
-                    choice = torch.multinomial(weights, self.num_positive, replacement=True)
-                    idx = pos[choice]
-                    neighbor.append(target_queue[idx].mean(0))
-                else:
-                    neighbor.append(target_queue[pos].mean(0))
-            else:
-                neighbor.append(current_features[i])
-        targets = torch.stack(neighbor, dim=0)
-        return F.normalize(targets, dim=-1)
-
-    @torch.no_grad()
-    def compute_prototypes_from_queue(self):
-        for c in range(self.cfg.DATASET.NUM_CLASSES):
-            idx = torch.nonzero(self.queue_labels == c).squeeze()
-            if idx.numel() > 0:
-                class_proto = self.queue_vit[idx].view(-1, self.queue_vit.shape[1]).mean(dim=0)
-                class_proto = F.normalize(class_proto, dim=0)
-                if not self.proto_initialized[c]:
-                    self.prototypes[c] = class_proto
-                    self.proto_initialized[c] = True
-                else:
-                    self.prototypes[c] = F.normalize(0.9 * self.prototypes[c] + 0.1 * class_proto, dim=0)
-
-    def _local_split(self, x):
-        _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
-        cols = x.split(_side_indent[1], dim=3)
-        xs = []
-        for _x in cols:
-            xs += _x.split(_side_indent[0], dim=2)
-        return torch.cat(xs, dim=0)
-
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
 
-        if hasattr(self.network, 'module'):
-            network_inner = self.network.module
-            get_sync_context = self.network.no_sync
-            momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
-        else:
-            network_inner = self.network
-            get_sync_context = contextlib.nullcontext
-            momentum_inner = self.momentum_network
+        network_inner = self.network.module if hasattr(self.network, 'module') else self.network
 
         img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
         img_strong = img_strong * mask_strong
         img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
 
-        img_weak = image.clone() * mask
-        img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
-
-        x_split_cnn = self._local_split(img_strong).contiguous()
-        x_split_vit = self._local_split(img_strong).contiguous()
-
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
-            feat_split = feat_split.float()
-            if len(feat_split.shape) > 2:
-                feat_split = feat_split.view(feat_split.size(0), -1)
-            chunk_size = image.size(0)
-            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
-            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
-
         with torch.amp.autocast('cuda'):
             res_combined = self.network(x_cnn=img_strong, x_vit=img_strong)
 
         res_clean_fp32 = {
-            'proj_cnn': res_combined['proj_cnn'].float(),
-            'proj_vit': res_combined['proj_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
-            'drts': res_combined['drts'].float(),
-            'spatial_tokens': res_combined['spatial_tokens'].float(),
         }
 
-        with torch.no_grad():
-            with torch.amp.autocast('cuda'):
-                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
-            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
-            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+        dcr_weight = self.criterion.get_dcr_weights(label, domain)
+        loss_sup_cnn = (self.criterion.SupLoss(res_clean_fp32['logits_cnn'], label) * dcr_weight).mean()
+        loss_sup_vit = (self.criterion.SupLoss(res_clean_fp32['logits_vit'], label) * dcr_weight).mean()
+        loss_main = loss_sup_cnn + loss_sup_vit
+        loss_dict = {
+            'sup_cnn': loss_sup_cnn.item(),
+            'sup_vit': loss_sup_vit.item(),
+        }
 
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                proj_mix = network_inner.projector_cnn(feat_orthmix)
-            proj_mix = F.normalize(proj_mix.float(), dim=1)
-            num_mixs = proj_mix.shape[0] // chunk_size
-            target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
-            cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
-            loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
-
-        target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
-        target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
-        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
-
-        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
-        loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
-
-        kd_temp, kd_alpha, label_smooth = 1.0, 0.5, 0.1
-        num_classes = self.cfg.DATASET.NUM_CLASSES
-        with torch.no_grad():
-            true_dist = F.one_hot(label, num_classes=num_classes).float()
-            true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
-            vit_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
-            mixed_target_for_cnn = kd_alpha * vit_soft + (1.0 - kd_alpha) * true_dist
-            cnn_soft = F.softmax(res_clean_fp32['logits_cnn'].detach() / kd_temp, dim=1)
-            mixed_target_for_vit = kd_alpha * cnn_soft + (1.0 - kd_alpha) * true_dist
-
-        log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = (-torch.sum(mixed_target_for_cnn * log_prob_cnn, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
-
-        log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
-        loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
-        loss_kd_total = loss_kd_cnn + loss_kd_vit
-
-        drts = res_clean_fp32['drts']
-        spatial_tokens = res_clean_fp32['spatial_tokens']
-        drts_norm = F.normalize(drts, dim=-1)
-        spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
-        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
-        loss_ortho = torch.mean(cos_sim_ortho ** 2)
-
-        lambda_ortho = 1.5
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        total_loss = loss_main
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -586,13 +449,6 @@ class CASS_GDRNet(Algorithm):
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        with torch.no_grad():
-            for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
-                param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
-
-        loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
-        loss_dict['loss_ortho'] = loss_ortho.item()
         loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
@@ -641,13 +497,10 @@ class CASS_GDRNet(Algorithm):
                 state_dict = self.network.state_dict()
             if source == 'cnn':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
             elif source == 'vit':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_vit.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_vit.pth'))
             else:
                 torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
-                torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
 
     def renew_model(self, log_path, source='best'):
         if source == 'cnn':

@@ -48,14 +48,28 @@ class BridgeModule(nn.Module):
         self.norm = nn.LayerNorm(project_dim)
         self.proj_back = nn.Linear(project_dim, cnn_dim)
 
+    def purify_cnn_feature(self, cnn_feat, vit_attn):
+        cls_attn = vit_attn[:, :, 0, 1:]
+        cls_attn = cls_attn.mean(dim=1)
+        batch_size, num_tokens = cls_attn.shape
+        vit_side = int(num_tokens ** 0.5)
+        if vit_side * vit_side != num_tokens:
+            raise RuntimeError(f"Unexpected ViT attention token count: {num_tokens}")
+        cls_attn_spatial = cls_attn.view(batch_size, 1, vit_side, vit_side)
+        attn_mask = F.interpolate(cls_attn_spatial, size=cnn_feat.shape[2:], mode='bilinear', align_corners=False)
+        attn_mask_flat = attn_mask.view(batch_size, -1)
+        mask_min = attn_mask_flat.min(dim=1, keepdim=True)[0].view(batch_size, 1, 1, 1)
+        mask_max = attn_mask_flat.max(dim=1, keepdim=True)[0].view(batch_size, 1, 1, 1)
+        attn_mask_norm = (attn_mask - mask_min) / (mask_max - mask_min + 1e-8)
+        return cnn_feat * attn_mask_norm
+
     def forward(self, feat_cnn, feat_vit, attn_map_vit=None):
+        if attn_map_vit is not None:
+            feat_cnn = self.purify_cnn_feature(feat_cnn, attn_map_vit)
         B, C, H, W = feat_cnn.shape
         cnn_flat = feat_cnn.flatten(2).transpose(1, 2).contiguous()
         query = self.norm_q(self.proj_cnn(cnn_flat))
-        if attn_map_vit is not None:
-            key_vit, val_vit = important_token_selection(feat_vit, feat_vit, attn_map_vit, self.token_ratio)
-        else:
-            key_vit, val_vit = feat_vit, feat_vit
+        key_vit, val_vit = feat_vit, feat_vit
         key_vit = key_vit.contiguous()
         val_vit = val_vit.contiguous()
         key = self.norm_k(self.proj_vit(key_vit))
@@ -577,7 +591,7 @@ class AveragedModel(Module):
 class DINOv3Wrapper(nn.Module):
     def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, num_drts=4, use_grad_checkpointing=False):
         super().__init__()
-        print(f"🚀 [DINOv3+LoRA+DRTs] Loading from local path: {local_path}")
+        print(f"🚀 [DINOv3+LoRA] Loading from local path: {local_path}")
         try:
             self.config = AutoConfig.from_pretrained(local_path, local_files_only=True)
             self.config.output_hidden_states = True
@@ -593,13 +607,8 @@ class DINOv3Wrapper(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
             print("🧊 [DINOv3] All base parameters frozen.")
-            self.num_drts = num_drts
-            self.drt_tokens = nn.Parameter(torch.zeros(1, num_drts, self._out_features))
-            nn.init.normal_(self.drt_tokens, std=0.02)
-            print(f"🧩 [DRTs] Initialized {num_drts} Domain-Absorbing Register Tokens.")
             inject_lora_dinov3(self.model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            trainable_params.append(self.drt_tokens)
             print(f"🔥 [LoRA Injected] Trainable parameters: {len(trainable_params)}")
         except Exception as e:
             print(f"❌ Error loading DINOv3: {e}")
@@ -607,11 +616,9 @@ class DINOv3Wrapper(nn.Module):
 
     def forward(self, x):
         embeddings = self.model.embeddings(x)
-        batch_size = embeddings.shape[0]
         cls_token = embeddings[:, :1, :]
         patch_tokens = embeddings[:, 1:, :]
-        drts = self.drt_tokens.expand(batch_size, -1, -1)
-        hidden_states = torch.cat([cls_token, drts, patch_tokens], dim=1)
+        hidden_states = torch.cat([cls_token, patch_tokens], dim=1)
         position_embeddings = self.model.rope_embeddings(x) if hasattr(self.model, "rope_embeddings") else None
         all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
 
@@ -679,8 +686,8 @@ class DualTowerGDRNet(nn.Module):
                 return outputs
             return new_forward
         hook_count = 0
-        for name, module in self.vit.model.named_modules():
-            if isinstance(module, nn.ModuleList) and len(module) >= 12:
+        for _, module in self.vit.model.named_modules():
+            if isinstance(module, nn.ModuleList) and len(module) >= max(self.target_layers) + 1:
                 for l_idx in self.target_layers:
                     if hasattr(module[l_idx], 'attention'):
                         target_attention = module[l_idx].attention
@@ -689,112 +696,90 @@ class DualTowerGDRNet(nn.Module):
                         self.hooked_attns[l_idx] = target_attention
                         hook_count += 1
                 break
-        if hook_count == len(self.target_layers):
-            print(f"✅ 成功注入 {hook_count} 个 Hook：已精准拦截 DINOv3 第 {self.target_layers} 层的 Attention Map。")
-        else:
-            print("⚠️ 警告：多层 Hook 注入不完整，请检查 DINOv3 结构。")
+        if hook_count != len(self.target_layers):
+            raise RuntimeError(f"Failed to register all attention hooks: expected {len(self.target_layers)}, got {hook_count}")
         self.bridge1 = BridgeModule(cnn_dim=256, vit_dim=self.vit_dim, project_dim=256, token_ratio=0.5)
         self.bridge2 = BridgeModule(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.4)
         self.bridge3 = BridgeModule(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.3)
-        proj_dim = 1024
-        self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
-        self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
 
-    def _strip_drts_and_attn(self, feat, attn):
-        """剥离序列中的 DRTs，防止污染 CNN，同时调整 Attention Map 维度"""
-        num_drts = self.vit.num_drts
-        feat_clean = torch.cat([feat[:, :1, :], feat[:, 1 + num_drts:, :]], dim=1)
-        if attn is not None:
-            attn_clean = torch.cat([attn[:, :, :1, :], attn[:, :, 1 + num_drts:, :]], dim=2)
-            attn_clean = torch.cat([attn_clean[:, :, :, :1], attn_clean[:, :, :, 1 + num_drts:]], dim=3)
-        else:
-            attn_clean = None
-        return feat_clean, attn_clean
+    def _clear_hook_cache(self):
+        for hook in self.hooked_attns.values():
+            if hasattr(hook, 'current_attn_map'):
+                hook.current_attn_map = None
 
     def forward(self, x_cnn, x_vit=None):
         res = {}
-        if x_vit is None:
-            img_for_vit = x_cnn
-            img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-        else:
-            if x_cnn.shape[-1] != 224:
+        try:
+            if x_vit is None:
+                img_for_vit = x_cnn
                 img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
             else:
-                img_for_cnn = x_cnn
-            img_for_vit = x_vit
-        vit_outputs = self.vit(img_for_vit)
-        feat_vit_3 = vit_outputs.hidden_states[3 + 1]
-        feat_vit_6 = vit_outputs.hidden_states[6 + 1]
-        feat_vit_9 = vit_outputs.hidden_states[9 + 1]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
-        feat_vit_final = vit_outputs.last_hidden_state[:, 0]
-        num_drts = self.vit.num_drts
-        drts_features = vit_outputs.last_hidden_state[:, 1:1 + num_drts, :]
-        spatial_features = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
-        x = self.cnn.conv1(img_for_cnn)
-        x = self.cnn.bn1(x)
-        x = self.cnn.relu(x)
-        x = self.cnn.maxpool(x)
-        x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
-        x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
-        x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
-        x = self.cnn.layer4(x)
-        x = self.cnn.global_avgpool(x)
-        feat_cnn_final = torch.flatten(x, 1)
-        logits_cnn = self.classifier_cnn(feat_cnn_final)
-        proj_cnn = self.projector_cnn(feat_cnn_final)
-        res['logits_cnn'] = logits_cnn
-        res['proj_cnn'] = proj_cnn
-        logits_vit = self.classifier_vit(feat_vit_final)
-        proj_vit = self.projector_vit(feat_vit_final)
-        res['logits_vit'] = logits_vit
-        res['proj_vit'] = proj_vit
-        res['drts'] = drts_features
-        res['spatial_tokens'] = spatial_features
-        return res
+                if x_cnn.shape[-1] != 224:
+                    img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
+                else:
+                    img_for_cnn = x_cnn
+                img_for_vit = x_vit
+            vit_outputs = self.vit(img_for_vit)
+            feat_vit_3 = vit_outputs.hidden_states[3 + 1]
+            feat_vit_6 = vit_outputs.hidden_states[6 + 1]
+            feat_vit_9 = vit_outputs.hidden_states[9 + 1]
+            attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
+            attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
+            attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
+            if attn_3 is None or attn_6 is None or attn_9 is None:
+                raise RuntimeError("Attention maps not found! Check if hook is properly registered in DINOv3.")
+            feat_vit_final = vit_outputs.last_hidden_state[:, 0]
+            x = self.cnn.conv1(img_for_cnn)
+            x = self.cnn.bn1(x)
+            x = self.cnn.relu(x)
+            x = self.cnn.maxpool(x)
+            x = self.cnn.layer1(x)
+            x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3, attn_map_vit=attn_3)
+            x = self.cnn.layer2(x)
+            x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6, attn_map_vit=attn_6)
+            x = self.cnn.layer3(x)
+            x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9, attn_map_vit=attn_9)
+            x = self.cnn.layer4(x)
+            x = self.cnn.global_avgpool(x)
+            feat_cnn_final = torch.flatten(x, 1)
+            logits_cnn = self.classifier_cnn(feat_cnn_final)
+            res['logits_cnn'] = logits_cnn
+            logits_vit = self.classifier_vit(feat_vit_final)
+            res['logits_vit'] = logits_vit
+            return res
+        finally:
+            self._clear_hook_cache()
 
     def extract_cnn_feature(self, x_cnn, x_vit=None):
-        if x_vit is None:
-            x_vit = x_cnn
-        if x_cnn.shape[-1] != 224:
-            x_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-        vit_outputs = self.vit(x_vit)
-        feat_vit_3 = vit_outputs.hidden_states[4]
-        feat_vit_6 = vit_outputs.hidden_states[7]
-        feat_vit_9 = vit_outputs.hidden_states[10]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
-        x = self.cnn.conv1(x_cnn)
-        x = self.cnn.bn1(x)
-        x = self.cnn.relu(x)
-        x = self.cnn.maxpool(x)
-        x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
-        x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
-        x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
-        x = self.cnn.layer4(x)
-        x = self.cnn.global_avgpool(x)
-        feat_cnn_final = torch.flatten(x, 1)
-        return feat_cnn_final
+        try:
+            if x_vit is None:
+                x_vit = x_cnn
+            if x_cnn.shape[-1] != 224:
+                x_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
+            vit_outputs = self.vit(x_vit)
+            feat_vit_3 = vit_outputs.hidden_states[4]
+            feat_vit_6 = vit_outputs.hidden_states[7]
+            feat_vit_9 = vit_outputs.hidden_states[10]
+            attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
+            attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
+            attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
+            if attn_3 is None or attn_6 is None or attn_9 is None:
+                raise RuntimeError("Attention maps not found! Check if hook is properly registered in DINOv3.")
+            x = self.cnn.conv1(x_cnn)
+            x = self.cnn.bn1(x)
+            x = self.cnn.relu(x)
+            x = self.cnn.maxpool(x)
+            x = self.cnn.layer1(x)
+            x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3, attn_map_vit=attn_3)
+            x = self.cnn.layer2(x)
+            x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6, attn_map_vit=attn_6)
+            x = self.cnn.layer3(x)
+            x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9, attn_map_vit=attn_9)
+            x = self.cnn.layer4(x)
+            x = self.cnn.global_avgpool(x)
+            feat_cnn_final = torch.flatten(x, 1)
+            return feat_cnn_final
+        finally:
+            self._clear_hook_cache()
