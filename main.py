@@ -1,4 +1,10 @@
 import os
+import importlib.util
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+if importlib.util.find_spec("cv2") is not None:
+    import cv2
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -93,7 +99,7 @@ def main():
     algorithm.to(args.device)
     if is_distributed:
         algorithm = nn.SyncBatchNorm.convert_sync_batchnorm(algorithm)
-        algorithm.network = DDP(algorithm.network, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        algorithm.network = DDP(algorithm.network, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
         if hasattr(algorithm, 'projector'):
             algorithm.projector = DDP(algorithm.projector, device_ids=[args.local_rank], output_device=args.local_rank)
         if hasattr(algorithm, 'predictor'):

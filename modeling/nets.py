@@ -681,6 +681,9 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[3 + 1]
         feat_vit_6 = vit_outputs.hidden_states[6 + 1]
         feat_vit_9 = vit_outputs.hidden_states[9 + 1]
+        attn_3 = None
+        attn_6 = None
+        attn_9 = None
         feat_vit_3_clean = feat_vit_3
         feat_vit_6_clean = feat_vit_6
         feat_vit_9_clean = feat_vit_9
@@ -690,11 +693,11 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=None)
+        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3)
         x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=None)
+        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6)
         x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=None)
+        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9)
         x = self.cnn.layer4(x)
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
@@ -713,6 +716,9 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[4]
         feat_vit_6 = vit_outputs.hidden_states[7]
         feat_vit_9 = vit_outputs.hidden_states[10]
+        attn_3 = None
+        attn_6 = None
+        attn_9 = None
         feat_vit_3_clean = feat_vit_3
         feat_vit_6_clean = feat_vit_6
         feat_vit_9_clean = feat_vit_9
@@ -721,11 +727,11 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=None)
+        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3)
         x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=None)
+        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6)
         x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=None)
+        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9)
         x = self.cnn.layer4(x)
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
