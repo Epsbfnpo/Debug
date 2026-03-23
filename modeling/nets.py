@@ -14,7 +14,6 @@ import logging
 from transformers import AutoModel, AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
 from .lora_utils import inject_lora_dinov3
-import types
 
 def important_token_selection(key_layer, value_layer, attention_probs, token_ratio=0.2):
     B, N, C = key_layer.shape
@@ -607,13 +606,8 @@ class DINOv3Wrapper(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
             print("🧊 [DINOv3] All base parameters frozen.")
-            self.num_drts = num_drts
-            self.drt_tokens = nn.Parameter(torch.zeros(1, num_drts, self._out_features))
-            nn.init.normal_(self.drt_tokens, std=0.02)
-            print(f"🧩 [DRTs] Initialized {num_drts} Domain-Absorbing Register Tokens.")
             inject_lora_dinov3(self.model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            trainable_params.append(self.drt_tokens)
             print(f"🔥 [LoRA Injected] Trainable parameters: {len(trainable_params)}")
         except Exception as e:
             print(f"❌ Error loading DINOv3: {e}")
@@ -621,11 +615,9 @@ class DINOv3Wrapper(nn.Module):
 
     def forward(self, x):
         embeddings = self.model.embeddings(x)
-        batch_size = embeddings.shape[0]
         cls_token = embeddings[:, :1, :]
         patch_tokens = embeddings[:, 1:, :]
-        drts = self.drt_tokens.expand(batch_size, -1, -1)
-        hidden_states = torch.cat([cls_token, drts, patch_tokens], dim=1)
+        hidden_states = torch.cat([cls_token, patch_tokens], dim=1)
         position_embeddings = self.model.rope_embeddings(x) if hasattr(self.model, "rope_embeddings") else None
         all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
 
