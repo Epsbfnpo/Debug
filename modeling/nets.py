@@ -14,7 +14,6 @@ import logging
 from transformers import AutoModel, AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
 from .lora_utils import inject_lora_dinov3
-import types
 
 def important_token_selection(key_layer, value_layer, attention_probs, token_ratio=0.2):
     B, N, C = key_layer.shape
