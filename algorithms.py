@@ -582,9 +582,17 @@ class CASS_GDRNet(Algorithm):
         loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
 
+        drts = res_combined['drts'].float()
+        spatial_tokens = res_combined['spatial_tokens'].float()
+        drts_norm = F.normalize(drts, dim=-1)
+        spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
+        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
+        loss_ortho = torch.mean(cos_sim_ortho ** 2)
+        lambda_ortho = 1.5
+
         lambda_at = 20.0
         loss_at = compute_attention_transfer_loss(spatial_cnn, spatial_vit)
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_at * loss_at
+        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + lambda_at * loss_at
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -598,6 +606,7 @@ class CASS_GDRNet(Algorithm):
 
         loss_dict['fastmoco'] = loss_fastmoco.item()
         loss_dict['loss_kd_total'] = loss_kd_total.item()
+        loss_dict['loss_ortho'] = loss_ortho.item()
         loss_dict['loss_at'] = loss_at.item()
         loss_dict['loss'] = total_loss.item()
         return loss_dict
@@ -623,7 +632,7 @@ class CASS_GDRNet(Algorithm):
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        return self.network(x_cnn=x, x_vit=x)['logits_cnn']
+        return self.network(x_cnn=x)['logits_cnn']
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
