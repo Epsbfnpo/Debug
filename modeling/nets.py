@@ -34,38 +34,6 @@ def important_token_selection(key_layer, value_layer, attention_probs, token_rat
     v_selected = torch.gather(value_layer, dim=1, index=gather_indices)
     return k_selected, v_selected
 
-class BridgeModule(nn.Module):
-    def __init__(self, cnn_dim, vit_dim, project_dim=512, num_heads=8, token_ratio=0.5):
-        super().__init__()
-        self.token_ratio = token_ratio
-        self.num_heads = num_heads
-        self.proj_cnn = nn.Linear(cnn_dim, project_dim)
-        self.proj_vit = nn.Linear(vit_dim, project_dim)
-        self.norm_q = nn.LayerNorm(project_dim)
-        self.norm_k = nn.LayerNorm(project_dim)
-        self.cross_attn = nn.MultiheadAttention(embed_dim=project_dim, num_heads=num_heads, batch_first=True)
-        self.gate = nn.Parameter(torch.ones(1) * 0.1)
-        self.norm = nn.LayerNorm(project_dim)
-        self.proj_back = nn.Linear(project_dim, cnn_dim)
-
-    def forward(self, feat_cnn, feat_vit, attn_map_vit=None):
-        B, C, H, W = feat_cnn.shape
-        cnn_flat = feat_cnn.flatten(2).transpose(1, 2).contiguous()
-        query = self.norm_q(self.proj_cnn(cnn_flat))
-        if attn_map_vit is not None:
-            key_vit, val_vit = important_token_selection(feat_vit, feat_vit, attn_map_vit, self.token_ratio)
-        else:
-            key_vit, val_vit = feat_vit, feat_vit
-        key_vit = key_vit.contiguous()
-        val_vit = val_vit.contiguous()
-        key = self.norm_k(self.proj_vit(key_vit))
-        value = self.proj_vit(val_vit)
-        attn_out, _ = self.cross_attn(query, key, value, need_weights=False)
-        out = torch.tanh(self.gate.to(attn_out.dtype)) * self.norm(attn_out)
-        out = self.proj_back(out)
-        out = out.transpose(1, 2).contiguous().reshape(B, C, H, W)
-        return feat_cnn + out
-
 class GraphConvolution(nn.Module):
     def __init__(self, in_features, out_features, bias=False):
         super(GraphConvolution, self).__init__()
@@ -668,133 +636,46 @@ class DualTowerGDRNet(nn.Module):
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
         self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
-        self.target_layers = [3, 6, 9]
-        self.hooked_attns = {}
-        def make_hook(layer_idx):
-            def new_forward(attn_self, *args, **kwargs):
-                kwargs['output_attentions'] = True
-                outputs = attn_self._original_forward(*args, **kwargs)
-                if isinstance(outputs, tuple) and len(outputs) > 1:
-                    attn_self.current_attn_map = outputs[1]
-                return outputs
-            return new_forward
-        hook_count = 0
-        for name, module in self.vit.model.named_modules():
-            if isinstance(module, nn.ModuleList) and len(module) >= 12:
-                for l_idx in self.target_layers:
-                    if hasattr(module[l_idx], 'attention'):
-                        target_attention = module[l_idx].attention
-                        target_attention._original_forward = target_attention.forward
-                        target_attention.forward = types.MethodType(make_hook(l_idx), target_attention)
-                        self.hooked_attns[l_idx] = target_attention
-                        hook_count += 1
-                break
-        if hook_count == len(self.target_layers):
-            print(f"✅ 成功注入 {hook_count} 个 Hook：已精准拦截 DINOv3 第 {self.target_layers} 层的 Attention Map。")
-        else:
-            print("⚠️ 警告：多层 Hook 注入不完整，请检查 DINOv3 结构。")
-        self.bridge1 = BridgeModule(cnn_dim=256, vit_dim=self.vit_dim, project_dim=256, token_ratio=0.5)
-        self.bridge2 = BridgeModule(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.4)
-        self.bridge3 = BridgeModule(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, token_ratio=0.3)
         proj_dim = 1024
         self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
         self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
 
-    def _strip_drts_and_attn(self, feat, attn):
-        """剥离序列中的 DRTs，防止污染 CNN，同时调整 Attention Map 维度"""
-        num_drts = self.vit.num_drts
-        feat_clean = torch.cat([feat[:, :1, :], feat[:, 1 + num_drts:, :]], dim=1)
-        if attn is not None:
-            attn_clean = torch.cat([attn[:, :, :1, :], attn[:, :, 1 + num_drts:, :]], dim=2)
-            attn_clean = torch.cat([attn_clean[:, :, :, :1], attn_clean[:, :, :, 1 + num_drts:]], dim=3)
-        else:
-            attn_clean = None
-        return feat_clean, attn_clean
-
     def forward(self, x_cnn, x_vit=None):
-        res = {}
-        if x_vit is None:
-            img_for_vit = x_cnn
-            img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-        else:
-            if x_cnn.shape[-1] != 224:
-                img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-            else:
-                img_for_cnn = x_cnn
-            img_for_vit = x_vit
-        vit_outputs = self.vit(img_for_vit)
-        feat_vit_3 = vit_outputs.hidden_states[3 + 1]
-        feat_vit_6 = vit_outputs.hidden_states[6 + 1]
-        feat_vit_9 = vit_outputs.hidden_states[9 + 1]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
-        feat_vit_final = vit_outputs.last_hidden_state[:, 0]
-        num_drts = self.vit.num_drts
-        drts_features = vit_outputs.last_hidden_state[:, 1:1 + num_drts, :]
-        spatial_features = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
-        x = self.cnn.conv1(img_for_cnn)
-        x = self.cnn.bn1(x)
-        x = self.cnn.relu(x)
-        x = self.cnn.maxpool(x)
-        x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
-        x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
-        x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
-        x = self.cnn.layer4(x)
-        x = self.cnn.global_avgpool(x)
-        feat_cnn_final = torch.flatten(x, 1)
-        logits_cnn = self.classifier_cnn(feat_cnn_final)
-        proj_cnn = self.projector_cnn(feat_cnn_final)
-        res['logits_cnn'] = logits_cnn
-        res['proj_cnn'] = proj_cnn
-        logits_vit = self.classifier_vit(feat_vit_final)
-        proj_vit = self.projector_vit(feat_vit_final)
-        res['logits_vit'] = logits_vit
-        res['proj_vit'] = proj_vit
-        res['drts'] = drts_features
-        res['spatial_tokens'] = spatial_features
-        return res
+        img_for_cnn = x_cnn if x_cnn.shape[-1] == 224 else F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
+        img_for_vit = x_cnn if x_vit is None else x_vit
+        if not self.training:
+            feat_cnn, _ = self.extract_cnn_feature(img_for_cnn)
+            logits_cnn = self.classifier_cnn(feat_cnn)
+            return logits_cnn
 
-    def extract_cnn_feature(self, x_cnn, x_vit=None):
-        if x_vit is None:
-            x_vit = x_cnn
-        if x_cnn.shape[-1] != 224:
-            x_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-        vit_outputs = self.vit(x_vit)
-        feat_vit_3 = vit_outputs.hidden_states[4]
-        feat_vit_6 = vit_outputs.hidden_states[7]
-        feat_vit_9 = vit_outputs.hidden_states[10]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
-        attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
-        attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
-        for l_idx in self.target_layers:
-            if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
-                self.hooked_attns[l_idx].current_attn_map = None
+        vit_outputs = self.vit(img_for_vit)
+        feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
+        logits_vit = self.classifier_vit(feat_vit_cls)
+        num_drts = self.vit.num_drts
+        patch_tokens_vit = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
+        B, N, D = patch_tokens_vit.shape
+        H_vit = W_vit = int(math.sqrt(N))
+        spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
+
+        feat_cnn, spatial_cnn = self.extract_cnn_feature(img_for_cnn)
+        logits_cnn = self.classifier_cnn(feat_cnn)
+        proj_cnn = self.projector_cnn(feat_cnn)
+        proj_cnn_norm = F.normalize(proj_cnn, dim=1)
+        proj_vit = self.projector_vit(feat_vit_cls)
+        proj_vit_norm = F.normalize(proj_vit, dim=1)
+        return logits_cnn, logits_vit, proj_cnn_norm, proj_vit_norm, feat_cnn, spatial_cnn, spatial_vit
+
+    def extract_cnn_feature(self, x_cnn):
         x = self.cnn.conv1(x_cnn)
         x = self.cnn.bn1(x)
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
-        x = self.bridge1(feat_cnn=x, feat_vit=feat_vit_3_clean, attn_map_vit=attn_3_clean)
         x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean, attn_map_vit=attn_6_clean)
         x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean, attn_map_vit=attn_9_clean)
-        x = self.cnn.layer4(x)
-        x = self.cnn.global_avgpool(x)
-        feat_cnn_final = torch.flatten(x, 1)
-        return feat_cnn_final
+        x_spatial = self.cnn.layer4(x)
+        x_pooled = self.cnn.global_avgpool(x_spatial)
+        feat_cnn_final = torch.flatten(x_pooled, 1)
+        return feat_cnn_final, x_spatial
