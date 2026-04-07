@@ -642,10 +642,10 @@ class DualTowerGDRNet(nn.Module):
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
 
-    def forward(self, x_cnn, x_vit=None):
+    def forward(self, x_cnn, x_vit=None, return_train_features=False):
         img_for_cnn = x_cnn if x_cnn.shape[-1] == 224 else F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
         img_for_vit = x_cnn if x_vit is None else x_vit
-        if not self.training:
+        if not return_train_features:
             feat_cnn, _ = self.extract_cnn_feature(img_for_cnn)
             logits_cnn = self.classifier_cnn(feat_cnn)
             return logits_cnn
@@ -653,7 +653,7 @@ class DualTowerGDRNet(nn.Module):
         vit_outputs = self.vit(img_for_vit)
         feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
         logits_vit = self.classifier_vit(feat_vit_cls)
-        num_drts = self.vit.num_drts
+        num_drts = getattr(self.vit.config, "num_register_tokens", self.vit.num_drts)
         patch_tokens_vit = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
         B, N, D = patch_tokens_vit.shape
         H_vit = W_vit = int(math.sqrt(N))

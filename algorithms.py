@@ -528,7 +528,9 @@ class CASS_GDRNet(Algorithm):
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
         with torch.amp.autocast('cuda'):
-            logits_cnn, logits_vit, proj_cnn, proj_vit, _, spatial_cnn, spatial_vit = self.network(x_cnn=img_strong, x_vit=img_strong)
+            logits_cnn, logits_vit, proj_cnn, proj_vit, _, spatial_cnn, spatial_vit = self.network(
+                x_cnn=img_strong, x_vit=img_strong, return_train_features=True
+            )
 
         res_clean_fp32 = {
             'proj_cnn': proj_cnn.float(),
@@ -541,7 +543,9 @@ class CASS_GDRNet(Algorithm):
 
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
-                _, _, momentum_proj_cnn, momentum_proj_vit, _, _, _ = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
+                _, _, momentum_proj_cnn, momentum_proj_vit, _, _, _ = momentum_inner(
+                    x_cnn=img_weak, x_vit=img_weak, return_train_features=True
+                )
             momentum_proj_vit = momentum_proj_vit.float()
             momentum_proj_cnn = momentum_proj_cnn.float()
 
