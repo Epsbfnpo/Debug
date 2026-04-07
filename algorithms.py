@@ -19,6 +19,15 @@ import contextlib
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
 
+
+def compute_attention_transfer_loss(map_cnn, map_vit):
+    at_cnn = map_cnn.pow(2).sum(dim=1, keepdim=True)
+    at_vit = map_vit.pow(2).sum(dim=1, keepdim=True)
+    at_cnn_resized = F.interpolate(at_cnn, size=at_vit.shape[2:], mode='bilinear', align_corners=False)
+    at_cnn_norm = F.normalize(at_cnn_resized.view(map_cnn.size(0), -1), p=2, dim=1)
+    at_vit_norm = F.normalize(at_vit.view(map_vit.size(0), -1), p=2, dim=1)
+    return F.mse_loss(at_cnn_norm, at_vit_norm)
+
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
         raise NotImplementedError("Algorithm not found: {}".format(algorithm_name))
@@ -507,11 +516,10 @@ class CASS_GDRNet(Algorithm):
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
 
         x_split_cnn = self._local_split(img_strong).contiguous()
-        x_split_vit = self._local_split(img_strong).contiguous()
 
         with get_sync_context():
             with torch.amp.autocast('cuda'):
-                feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn, x_vit=x_split_vit)
+                feat_split, _ = network_inner.extract_cnn_feature(x_split_cnn)
             feat_split = feat_split.float()
             if len(feat_split.shape) > 2:
                 feat_split = feat_split.view(feat_split.size(0), -1)
@@ -520,22 +528,26 @@ class CASS_GDRNet(Algorithm):
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
         with torch.amp.autocast('cuda'):
-            res_combined = self.network(x_cnn=img_strong, x_vit=img_strong)
+            logits_cnn, logits_vit, proj_cnn, proj_vit, _, spatial_cnn, spatial_vit = self.network(
+                x_cnn=img_strong, x_vit=img_strong, return_train_features=True
+            )
 
         res_clean_fp32 = {
-            'proj_cnn': res_combined['proj_cnn'].float(),
-            'proj_vit': res_combined['proj_vit'].float(),
-            'logits_cnn': res_combined['logits_cnn'].float(),
-            'logits_vit': res_combined['logits_vit'].float(),
-            'drts': res_combined['drts'].float(),
-            'spatial_tokens': res_combined['spatial_tokens'].float(),
+            'proj_cnn': proj_cnn.float(),
+            'proj_vit': proj_vit.float(),
+            'logits_cnn': logits_cnn.float(),
+            'logits_vit': logits_vit.float(),
         }
+        spatial_cnn = spatial_cnn.float()
+        spatial_vit = spatial_vit.float()
 
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
-                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
-            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
-            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+                _, _, momentum_proj_cnn, momentum_proj_vit, _, _, _ = momentum_inner(
+                    x_cnn=img_weak, x_vit=img_weak, return_train_features=True
+                )
+            momentum_proj_vit = momentum_proj_vit.float()
+            momentum_proj_cnn = momentum_proj_cnn.float()
 
         with get_sync_context():
             with torch.amp.autocast('cuda'):
@@ -570,15 +582,9 @@ class CASS_GDRNet(Algorithm):
         loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
 
-        drts = res_clean_fp32['drts']
-        spatial_tokens = res_clean_fp32['spatial_tokens']
-        drts_norm = F.normalize(drts, dim=-1)
-        spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
-        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
-        loss_ortho = torch.mean(cos_sim_ortho ** 2)
-
-        lambda_ortho = 1.5
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        lambda_at = 20.0
+        loss_at = compute_attention_transfer_loss(spatial_cnn, spatial_vit)
+        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_at * loss_at
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -592,11 +598,8 @@ class CASS_GDRNet(Algorithm):
 
         loss_dict['fastmoco'] = loss_fastmoco.item()
         loss_dict['loss_kd_total'] = loss_kd_total.item()
-        loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['loss_at'] = loss_at.item()
         loss_dict['loss'] = total_loss.item()
-        loss_dict['gate1'] = network_inner.bridge1.gate.item()
-        loss_dict['gate2'] = network_inner.bridge2.gate.item()
-        loss_dict['gate3'] = network_inner.bridge3.gate.item()
         return loss_dict
 
     def update_epoch(self, epoch):
@@ -606,30 +609,21 @@ class CASS_GDRNet(Algorithm):
         return epoch
 
     def validate(self, val_loader, test_loader, writer):
-        self.eval_branch = 'cnn'
         metrics_cnn_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_cnn')
         metrics_cnn_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
         val_auc_cnn = metrics_cnn_val['auc']
         test_auc_cnn = metrics_cnn_test['auc']
-        self.eval_branch = 'vit'
-        metrics_vit_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_vit')
-        metrics_vit_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_vit')
-        val_auc_vit = metrics_vit_val['auc']
-        test_auc_vit = metrics_vit_test['auc']
-        self.eval_branch = 'cnn'
         if self.epoch == self.cfg.EPOCHS:
             self.epoch += 1
         if self.epoch > self.cfg.EPOCHS:
             logging.info("=" * 30)
             logging.info(f"🚀 FINAL RESULTS (Epoch {self.epoch - 1})")
             logging.info(f"✅ CNN Branch >> Val AUC: {val_auc_cnn:.4f} | Test AUC: {test_auc_cnn:.4f}")
-            logging.info(f"✅ ViT Branch >> Val AUC: {val_auc_vit:.4f} | Test AUC: {test_auc_vit:.4f}")
             logging.info("=" * 30)
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        res = self.network(x_cnn=x, x_vit=x)
-        return res
+        return self.network(x_cnn=x, x_vit=x)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
