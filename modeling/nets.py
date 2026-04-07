@@ -643,24 +643,24 @@ class DualTowerGDRNet(nn.Module):
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
 
     def forward(self, x_cnn, x_vit=None, return_train_features=False):
-        img_for_cnn = x_cnn if x_cnn.shape[-1] == 224 else F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-        img_for_vit = x_cnn if x_vit is None else x_vit
-
         if not return_train_features:
-            feat_cnn, _ = self.extract_cnn_feature(img_for_cnn)
+            feat_cnn, _ = self.extract_cnn_feature(x_cnn)
             logits_cnn = self.classifier_cnn(feat_cnn)
             return {'logits_cnn': logits_cnn}
 
-        vit_outputs = self.vit(img_for_vit)
+        vit_outputs = self.vit(x_vit)
         feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
         logits_vit = self.classifier_vit(feat_vit_cls)
         num_drts = self.vit.num_drts
-        patch_tokens_vit = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
-        B, N, D = patch_tokens_vit.shape
-        H_vit = W_vit = int(math.sqrt(N))
+        total_tokens = vit_outputs.last_hidden_state.shape[1]
+        leftover_tokens = total_tokens - 1 - num_drts
+        H_vit = W_vit = int(math.sqrt(leftover_tokens))
+        num_spatial_tokens = H_vit * W_vit
+        patch_tokens_vit = vit_outputs.last_hidden_state[:, -num_spatial_tokens:, :]
+        B, _, D = patch_tokens_vit.shape
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
-        feat_cnn, spatial_cnn = self.extract_cnn_feature(img_for_cnn)
+        feat_cnn, spatial_cnn = self.extract_cnn_feature(x_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
         proj_cnn = self.projector_cnn(feat_cnn)
         proj_vit = self.projector_vit(feat_vit_cls)
