@@ -528,26 +528,26 @@ class CASS_GDRNet(Algorithm):
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
         with torch.amp.autocast('cuda'):
-            logits_cnn, logits_vit, proj_cnn, proj_vit, _, spatial_cnn, spatial_vit = self.network(
+            res_combined = self.network(
                 x_cnn=img_strong, x_vit=img_strong, return_train_features=True
             )
 
         res_clean_fp32 = {
-            'proj_cnn': proj_cnn.float(),
-            'proj_vit': proj_vit.float(),
-            'logits_cnn': logits_cnn.float(),
-            'logits_vit': logits_vit.float(),
+            'proj_cnn': F.normalize(res_combined['proj_cnn'].float(), dim=1),
+            'proj_vit': F.normalize(res_combined['proj_vit'].float(), dim=1),
+            'logits_cnn': res_combined['logits_cnn'].float(),
+            'logits_vit': res_combined['logits_vit'].float(),
         }
-        spatial_cnn = spatial_cnn.float()
-        spatial_vit = spatial_vit.float()
+        spatial_cnn = res_combined['spatial_cnn'].float()
+        spatial_vit = res_combined['spatial_vit'].float()
 
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
-                _, _, momentum_proj_cnn, momentum_proj_vit, _, _, _ = momentum_inner(
+                res_momentum = momentum_inner(
                     x_cnn=img_weak, x_vit=img_weak, return_train_features=True
                 )
-            momentum_proj_vit = momentum_proj_vit.float()
-            momentum_proj_cnn = momentum_proj_cnn.float()
+            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
+            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
 
         with get_sync_context():
             with torch.amp.autocast('cuda'):
@@ -623,7 +623,7 @@ class CASS_GDRNet(Algorithm):
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        return self.network(x_cnn=x, x_vit=x)
+        return self.network(x_cnn=x, x_vit=x)['logits_cnn']
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0

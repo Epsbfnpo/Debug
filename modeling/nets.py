@@ -645,15 +645,16 @@ class DualTowerGDRNet(nn.Module):
     def forward(self, x_cnn, x_vit=None, return_train_features=False):
         img_for_cnn = x_cnn if x_cnn.shape[-1] == 224 else F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
         img_for_vit = x_cnn if x_vit is None else x_vit
+
         if not return_train_features:
             feat_cnn, _ = self.extract_cnn_feature(img_for_cnn)
             logits_cnn = self.classifier_cnn(feat_cnn)
-            return logits_cnn
+            return {'logits_cnn': logits_cnn}
 
         vit_outputs = self.vit(img_for_vit)
         feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
         logits_vit = self.classifier_vit(feat_vit_cls)
-        num_drts = getattr(self.vit.config, "num_register_tokens", self.vit.num_drts)
+        num_drts = self.vit.num_drts
         patch_tokens_vit = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
         B, N, D = patch_tokens_vit.shape
         H_vit = W_vit = int(math.sqrt(N))
@@ -662,10 +663,17 @@ class DualTowerGDRNet(nn.Module):
         feat_cnn, spatial_cnn = self.extract_cnn_feature(img_for_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
         proj_cnn = self.projector_cnn(feat_cnn)
-        proj_cnn_norm = F.normalize(proj_cnn, dim=1)
         proj_vit = self.projector_vit(feat_vit_cls)
-        proj_vit_norm = F.normalize(proj_vit, dim=1)
-        return logits_cnn, logits_vit, proj_cnn_norm, proj_vit_norm, feat_cnn, spatial_cnn, spatial_vit
+        return {
+            'logits_cnn': logits_cnn,
+            'logits_vit': logits_vit,
+            'proj_cnn': proj_cnn,
+            'proj_vit': proj_vit,
+            'drts': vit_outputs.last_hidden_state[:, 1:1 + num_drts, :],
+            'spatial_tokens': patch_tokens_vit,
+            'spatial_cnn': spatial_cnn,
+            'spatial_vit': spatial_vit,
+        }
 
     def extract_cnn_feature(self, x_cnn):
         x = self.cnn.conv1(x_cnn)
