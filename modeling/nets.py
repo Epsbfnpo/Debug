@@ -646,7 +646,12 @@ class DualTowerGDRNet(nn.Module):
         if not return_train_features:
             feat_cnn, _ = self.extract_cnn_feature(x_cnn)
             logits_cnn = self.classifier_cnn(feat_cnn)
-            return {'logits_cnn': logits_cnn}
+            if x_vit is None:
+                x_vit = x_cnn
+            vit_outputs = self.vit(x_vit)
+            feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
+            logits_vit = self.classifier_vit(feat_vit_cls)
+            return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
 
         vit_outputs = self.vit(x_vit)
         feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]

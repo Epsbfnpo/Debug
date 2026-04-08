@@ -120,6 +120,8 @@ def main():
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(i)
         loss_avg = LossCounter()
+        train_metric_sums = {}
+        train_metric_counts = {}
         algorithm.train()
         for image, mask, label, domain, img_index in train_loader:
             image = image.to(args.device)
@@ -129,10 +131,20 @@ def main():
             minibatch = [image, mask, label, domain]
             loss_dict_iter = algorithm.update(minibatch)
             loss_avg.update(loss_dict_iter['loss'])
+            for k, v in loss_dict_iter.items():
+                if isinstance(v, torch.Tensor):
+                    v = v.item()
+                if isinstance(v, (int, float)):
+                    train_metric_sums[k] = train_metric_sums.get(k, 0.0) + float(v)
+                    train_metric_counts[k] = train_metric_counts.get(k, 0) + 1
         if hasattr(algorithm, 'update_epoch'):
             algorithm.update_epoch(epoch)
         if args.local_rank in [-1, 0]:
             update_writer(writer, epoch, scheduler, loss_avg)
+            if len(train_metric_sums) > 1:
+                train_metrics_avg = {k: train_metric_sums[k] / max(train_metric_counts[k], 1) for k in sorted(train_metric_sums.keys())}
+                metric_msg = ', '.join([f'{k}: {v:.4f}' for k, v in train_metrics_avg.items()])
+                logging.info(f"[Train Metrics] Epoch {epoch} - {metric_msg}")
         scheduler.step()
         if args.local_rank in [-1, 0]:
             save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance)

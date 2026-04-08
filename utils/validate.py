@@ -151,6 +151,7 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
                 final_metrics[f'{stream_name}_auc'] = metrics_stream['auc']
                 final_metrics[f'{stream_name}_acc'] = metrics_stream['acc']
                 final_metrics[f'{stream_name}_f1'] = metrics_stream['f1']
+                final_metrics[f'{stream_name}_loss'] = metrics_stream['loss']
             else:
                 final_metrics = metrics_stream
         if is_dual_stream:
