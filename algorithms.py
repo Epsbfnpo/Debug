@@ -515,7 +515,15 @@ class CASS_GDRNet(Algorithm):
         img_weak = image.clone() * mask
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
 
-        x_split_cnn = self._local_split(img_strong).contiguous()
+        # ========================================================
+        # [新增核心逻辑]: 显式生成 CNN 的 224x224 低分辨率视图
+        # ========================================================
+        cnn_size = (224, 224)
+        img_strong_cnn = F.interpolate(img_strong, size=cnn_size, mode='bilinear', align_corners=False)
+        img_weak_cnn = F.interpolate(img_weak, size=cnn_size, mode='bilinear', align_corners=False)
+
+        # 警告：Orthogonal Mix 的 local_split 必须作用于送入 CNN 的低分图像
+        x_split_cnn = self._local_split(img_strong_cnn).contiguous()
 
         with get_sync_context():
             with torch.amp.autocast('cuda'):
@@ -529,7 +537,9 @@ class CASS_GDRNet(Algorithm):
 
         with torch.amp.autocast('cuda'):
             res_combined = self.network(
-                x_cnn=img_strong, x_vit=img_strong, return_train_features=True
+                x_cnn=img_strong_cnn,   # <--- CNN 通道吃 224x224
+                x_vit=img_strong,       # <--- ViT 通道保持 512x512
+                return_train_features=True
             )
 
         res_clean_fp32 = {
@@ -544,7 +554,9 @@ class CASS_GDRNet(Algorithm):
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
                 res_momentum = momentum_inner(
-                    x_cnn=img_weak, x_vit=img_weak, return_train_features=True
+                    x_cnn=img_weak_cnn,     # <--- 动量 CNN 吃 224x224
+                    x_vit=img_weak,         # <--- 动量 ViT 保持 512x512
+                    return_train_features=True
                 )
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
@@ -632,7 +644,9 @@ class CASS_GDRNet(Algorithm):
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        return self.network(x_cnn=x)['logits_cnn']
+        # 推理阶段：拦截高分图像，强行降采样至与训练 CNN 对齐的 224x224
+        x_cnn_low_res = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        return self.network(x_cnn=x_cnn_low_res)['logits_cnn']
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
