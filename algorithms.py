@@ -21,12 +21,13 @@ ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fi
 
 
 def compute_attention_transfer_loss(map_cnn, map_vit):
-    at_cnn = map_cnn.pow(2).sum(dim=1, keepdim=True)
-    at_vit = map_vit.pow(2).sum(dim=1, keepdim=True)
+    at_cnn = map_cnn.pow(2).mean(dim=1, keepdim=True)
+    at_vit = map_vit.pow(2).mean(dim=1, keepdim=True)
     at_cnn_resized = F.interpolate(at_cnn, size=at_vit.shape[2:], mode='bilinear', align_corners=False)
-    at_cnn_norm = F.normalize(at_cnn_resized.view(map_cnn.size(0), -1), p=2, dim=1)
-    at_vit_norm = F.normalize(at_vit.view(map_vit.size(0), -1), p=2, dim=1)
-    return F.mse_loss(at_cnn_norm, at_vit_norm)
+    at_cnn_flat = at_cnn_resized.view(at_cnn_resized.size(0), -1)
+    at_vit_flat = at_vit.view(at_vit.size(0), -1)
+    cos_sim = F.cosine_similarity(at_cnn_flat, at_vit_flat, dim=1)
+    return (1.0 - cos_sim).mean()
 
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
@@ -520,37 +521,26 @@ class CASS_GDRNet(Algorithm):
             get_sync_context = contextlib.nullcontext
             momentum_inner = self.momentum_network
 
-        img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
-        img_strong = img_strong * mask_strong
-        img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
-
-        img_weak = image.clone() * mask
+        bg_color = torch.tensor([0.45, 0.32, 0.21], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
+        mask_float = (mask > 0).to(image.dtype)
+        img_weak = image.clone() * mask_float + bg_color * (1.0 - mask_float)
         img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
 
-        # ========================================================
-        # [新增核心逻辑]: 显式生成 CNN 的 224x224 低分辨率视图
-        # ========================================================
+        img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
+        mask_strong = (mask_strong > 0).to(img_strong.dtype)
+        img_strong = img_strong * mask_strong + bg_color * (1.0 - mask_strong)
+        img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
+
         cnn_size = (224, 224)
         img_strong_cnn = F.interpolate(img_strong, size=cnn_size, mode='bilinear', align_corners=False)
         img_weak_cnn = F.interpolate(img_weak, size=cnn_size, mode='bilinear', align_corners=False)
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        autocast_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
 
-        # 警告：Orthogonal Mix 的 local_split 必须作用于送入 CNN 的低分图像
-        x_split_cnn = self._local_split(img_strong_cnn).contiguous()
-
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                feat_split, _ = network_inner.extract_cnn_feature(x_split_cnn)
-            feat_split = feat_split.float()
-            if len(feat_split.shape) > 2:
-                feat_split = feat_split.view(feat_split.size(0), -1)
-            chunk_size = image.size(0)
-            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
-            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
-
-        with torch.amp.autocast('cuda'):
+        with autocast_ctx():
             res_combined = self.network(
-                x_cnn=img_strong_cnn,   # <--- CNN 通道吃 224x224
-                x_vit=img_strong,       # <--- ViT 通道保持 512x512
+                x_cnn=img_strong_cnn,
+                x_vit=img_strong,
                 return_train_features=True
             )
 
@@ -564,23 +554,14 @@ class CASS_GDRNet(Algorithm):
         spatial_vit = res_combined['spatial_vit'].float()
 
         with torch.no_grad():
-            with torch.amp.autocast('cuda'):
+            with autocast_ctx():
                 res_momentum = momentum_inner(
-                    x_cnn=img_weak_cnn,     # <--- 动量 CNN 吃 224x224
-                    x_vit=img_weak,         # <--- 动量 ViT 保持 512x512
+                    x_cnn=img_weak_cnn,
+                    x_vit=img_weak,
                     return_train_features=True
                 )
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
-
-        with get_sync_context():
-            with torch.amp.autocast('cuda'):
-                proj_mix = network_inner.projector_cnn(feat_orthmix)
-            proj_mix = F.normalize(proj_mix.float(), dim=1)
-            num_mixs = proj_mix.shape[0] // chunk_size
-            target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
-            cos_sim_mix = (proj_mix * target_proj_rep).sum(dim=1)
-            loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
 
         target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
         target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
@@ -588,45 +569,17 @@ class CASS_GDRNet(Algorithm):
 
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
-        loss_ce_student = F.cross_entropy(res_clean_fp32['logits_cnn'], label)
-        loss_ce_teacher = F.cross_entropy(res_clean_fp32['logits_vit'], label)
-
-        kd_temp, kd_alpha, label_smooth = 1.0, 0.5, 0.1
-        num_classes = self.cfg.DATASET.NUM_CLASSES
+        kd_temp = 2.0
         with torch.no_grad():
-            true_dist = F.one_hot(label, num_classes=num_classes).float()
-            true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
             vit_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
-            mixed_target_for_cnn = kd_alpha * vit_soft + (1.0 - kd_alpha) * true_dist
-            cnn_soft = F.softmax(res_clean_fp32['logits_cnn'].detach() / kd_temp, dim=1)
-            mixed_target_for_vit = kd_alpha * cnn_soft + (1.0 - kd_alpha) * true_dist
 
         log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = (-torch.sum(mixed_target_for_cnn * log_prob_cnn, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
-
-        log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
-        loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
-        loss_kd_total = loss_kd_cnn + loss_kd_vit
-
-        drts = res_combined['drts'].float()
-        spatial_tokens = res_combined['spatial_tokens'].float()
-        drts_norm = F.normalize(drts, dim=-1)
-        spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
-        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
-        loss_ortho = torch.mean(cos_sim_ortho ** 2)
-        lambda_ortho = 1.5
+        loss_kd_cnn = F.kl_div(log_prob_cnn, vit_soft, reduction='none').sum(dim=1)
+        loss_kd_cnn = (loss_kd_cnn * dcr_weight).mean() * (kd_temp ** 2)
 
         lambda_at = 1.0
         loss_at = compute_attention_transfer_loss(spatial_cnn, spatial_vit)
-        total_loss = (
-            loss_main
-            + loss_ce_student
-            + loss_ce_teacher
-            + 0.1 * loss_fastmoco
-            + 1.0 * loss_kd_total
-            + lambda_ortho * loss_ortho
-            + lambda_at * loss_at
-        )
+        total_loss = loss_main + 1.0 * loss_kd_cnn + lambda_at * loss_at
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -636,14 +589,20 @@ class CASS_GDRNet(Algorithm):
         self.scaler.update()
 
         with torch.no_grad():
-            for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
-                param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+            network_state = network_inner.state_dict()
+            momentum_state = momentum_inner.state_dict()
+            for key in network_state.keys():
+                if 'num_batches_tracked' in key:
+                    momentum_state[key].copy_(network_state[key])
+                    continue
+                param_q = network_state[key]
+                param_k = momentum_state[key]
+                if param_k.is_floating_point():
+                    param_k.data.mul_(self.m).add_(param_q.data, alpha=1.0 - self.m)
+                else:
+                    param_k.data.copy_(param_q.data)
 
-        loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_ce_S'] = loss_ce_student.item()
-        loss_dict['loss_ce_T'] = loss_ce_teacher.item()
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
-        loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
         loss_dict['loss_at'] = loss_at.item()
         loss_dict['grad_norm_cnn'] = grad_norm_cnn
         loss_dict['loss'] = total_loss.item()
