@@ -443,6 +443,18 @@ class CASS_GDRNet(Algorithm):
         self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
 
+    def _compute_cnn_grad_norm(self):
+        grad_norm_sq = 0.0
+        if hasattr(self.network, 'module'):
+            named_params = self.network.module.named_parameters()
+        else:
+            named_params = self.network.named_parameters()
+        for name, param in named_params:
+            if ('cnn' in name or 'resnet' in name or 'spatial_cnn' in name) and param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                grad_norm_sq += param_norm.item() ** 2
+        return grad_norm_sq ** 0.5
+
     @torch.no_grad()
     def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
         feat_cnn = feat_cnn.float()
@@ -576,6 +588,8 @@ class CASS_GDRNet(Algorithm):
 
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
+        loss_ce_student = F.cross_entropy(res_clean_fp32['logits_cnn'], label)
+        loss_ce_teacher = F.cross_entropy(res_clean_fp32['logits_vit'], label)
 
         kd_temp, kd_alpha, label_smooth = 1.0, 0.5, 0.1
         num_classes = self.cfg.DATASET.NUM_CLASSES
@@ -602,12 +616,21 @@ class CASS_GDRNet(Algorithm):
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
         lambda_ortho = 1.5
 
-        lambda_at = 20.0
+        lambda_at = 1.0
         loss_at = compute_attention_transfer_loss(spatial_cnn, spatial_vit)
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + lambda_at * loss_at
+        total_loss = (
+            loss_main
+            + loss_ce_student
+            + loss_ce_teacher
+            + 0.1 * loss_fastmoco
+            + 1.0 * loss_kd_total
+            + lambda_ortho * loss_ortho
+            + lambda_at * loss_at
+        )
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
+        grad_norm_cnn = self._compute_cnn_grad_norm()
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -617,9 +640,12 @@ class CASS_GDRNet(Algorithm):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
 
         loss_dict['fastmoco'] = loss_fastmoco.item()
+        loss_dict['loss_ce_S'] = loss_ce_student.item()
+        loss_dict['loss_ce_T'] = loss_ce_teacher.item()
         loss_dict['loss_kd_total'] = loss_kd_total.item()
         loss_dict['loss_ortho'] = loss_ortho.item()
         loss_dict['loss_at'] = loss_at.item()
+        loss_dict['grad_norm_cnn'] = grad_norm_cnn
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
@@ -646,7 +672,7 @@ class CASS_GDRNet(Algorithm):
     def predict(self, x):
         # 推理阶段：拦截高分图像，强行降采样至与训练 CNN 对齐的 224x224
         x_cnn_low_res = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-        return self.network(x_cnn=x_cnn_low_res)['logits_cnn']
+        return self.network(x_cnn=x_cnn_low_res, x_vit=x)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
