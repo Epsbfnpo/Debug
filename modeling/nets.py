@@ -13,7 +13,7 @@ from collections import deque
 import logging
 from transformers import AutoModel, AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
-from .lora_utils import inject_lora_dinov3
+from .lora_utils import inject_dinov3_lora
 import types
 
 def important_token_selection(key_layer, value_layer, attention_probs, token_ratio=0.2):
@@ -565,7 +565,7 @@ class DINOv3Wrapper(nn.Module):
             self.drt_tokens = nn.Parameter(torch.zeros(1, num_drts, self._out_features))
             nn.init.normal_(self.drt_tokens, std=0.02)
             print(f"🧩 [DRTs] Initialized {num_drts} Domain-Absorbing Register Tokens.")
-            inject_lora_dinov3(self.model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+            self.model = inject_dinov3_lora(self.model, rank=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             trainable_params.append(self.drt_tokens)
             print(f"🔥 [LoRA Injected] Trainable parameters: {len(trainable_params)}")
