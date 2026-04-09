@@ -1,51 +1,40 @@
 import torch
 import torch.nn as nn
-import math
 
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int = 8, alpha: float = 16.0, dropout: float = 0.0):
-        super().__init__()
-        self.base = base
-        in_f, out_f = base.in_features, base.out_features
-        self.in_features = in_f
-        self.out_features = out_f
-        self.bias = base.bias
-        self.r = r
-        self.alpha = alpha
-        self.scale = alpha / max(1, r)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        if r > 0:
-            self.lora_A = nn.Linear(in_f, r, bias=False)
-            self.lora_B = nn.Linear(r, out_f, bias=False)
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B.weight)
+
+def inject_dinov3_lora(model, rank=8, alpha=16.0, dropout=0.0):
+    """
+    精确打击 DINOv3 的四个核心门: attn.qkv, attn.proj, mlp.fc1, mlp.fc2
+    """
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError:
+        raise ImportError("🔥 严重错误: 请先安装 peft 库 (pip install peft)。这是微调大模型的标准武器。")
+
+    config = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        target_modules=["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"],
+        lora_dropout=dropout,
+        bias="none",
+        task_type="FEATURE_EXTRACTION"
+    )
+
+    # 注入 LoRA
+    peft_model = get_peft_model(model, config)
+
+    # 强制确保只有 LoRA 参数可训练
+    trainable_params = 0
+    total_params = 0
+    for name, param in peft_model.named_parameters():
+        total_params += param.numel()
+        if "lora" in name.lower():
+            param.requires_grad = True
+            trainable_params += param.numel()
         else:
-            self.lora_A = None
-            self.lora_B = None
-        for p in self.base.parameters():
-            p.requires_grad = False
+            param.requires_grad = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.base(x)
-        if self.r > 0 and self.lora_A is not None and self.lora_B is not None:
-            if self.lora_A.weight.device != x.device:
-                self.lora_A.to(x.device)
-                self.lora_B.to(x.device)
-            out = out + self.scale * self.lora_B(self.dropout(self.lora_A(x)))
-        return out
+    print(f"✅ [LoRA Injected] 目标层: qkv, proj, fc1, fc2 | Rank: {rank} | Alpha: {alpha}")
+    print(f"📊 [LoRA Params] 训练参数: {trainable_params / 1e6:.2f}M / 总参数: {total_params / 1e6:.2f}M")
 
-def inject_lora_dinov3(model: nn.Module, r: int = 8, alpha: float = 16.0, dropout: float = 0.0):
-    target_keywords = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"]
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            attr_name = name.split('.')[-1]
-            if attr_name in target_keywords:
-                parent_name = ".".join(name.split('.')[:-1])
-                if parent_name == "":
-                    continue
-                parent = model
-                for p in parent_name.split('.'):
-                    parent = getattr(parent, p)
-                print(f"Injecting LoRA into: {name}")
-                setattr(parent, attr_name, LoRALinear(module, r, alpha, dropout))
-    return model
+    return peft_model
