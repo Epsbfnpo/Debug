@@ -617,14 +617,18 @@ class CASS_GDRNet(Algorithm):
 
         self.scaler.step(self.opt_cnn)
         self.scaler.step(self.opt_vit)
+        self.optimizer.step()
         self.scaler.update()
 
         with torch.no_grad():
+            trainable_names = {k for k, v in network_inner.named_parameters() if v.requires_grad}
             network_state = network_inner.state_dict()
             momentum_state = momentum_inner.state_dict()
             for key in network_state.keys():
                 if 'num_batches_tracked' in key:
                     momentum_state[key].copy_(network_state[key])
+                    continue
+                if key not in trainable_names and 'running_mean' not in key and 'running_var' not in key:
                     continue
                 param_q = network_state[key]
                 param_k = momentum_state[key]
