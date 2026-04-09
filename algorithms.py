@@ -447,6 +447,12 @@ class CASS_GDRNet(Algorithm):
         self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=self.base_lr_vit, weight_decay=0.05)
         self.warmup_epochs = 3
         self.max_epochs = cfg.EPOCHS
+        # Compatibility placeholder for legacy outer-loop code that expects
+        # algorithm.optimizer to exist (e.g., global scheduler/logging hooks).
+        # This optimizer must not control real training params because this
+        # class uses self.opt_cnn + self.opt_vit with custom LR scheduling.
+        self.dummy_param = nn.Parameter(torch.zeros(1))
+        self.optimizer = torch.optim.Adam([self.dummy_param], lr=self.base_lr_cnn)
         self.K = 1024
         proj_dim = 1024
         self.num_positive = getattr(cfg, 'POSITIVE', 4)
