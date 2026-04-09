@@ -440,7 +440,7 @@ class CASS_GDRNet(Algorithm):
         self.cnn_params = cnn_params
         self.vit_lora_params = vit_lora_params
         self.base_lr_cnn = cfg.LEARNING_RATE
-        self.base_lr_vit = 5e-5
+        self.base_lr_vit = 4e-4
         if len(vit_lora_params) == 0:
             raise RuntimeError("未检测到任何 LoRA 参数。请确认 DINOv3 已通过 inject_dinov3_lora 正确注入。")
         self.opt_cnn = torch.optim.Adam(self.cnn_params, lr=self.base_lr_cnn, weight_decay=1e-4)
@@ -474,8 +474,8 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         self.mild_vit_aug = v2.Compose([
-            v2.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0), antialias=True),
-            v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+            v2.Resize((224, 224), antialias=True),
+            v2.ColorJitter(brightness=0.05, contrast=0.05),
         ])
 
     def _compute_cnn_grad_norm(self):
