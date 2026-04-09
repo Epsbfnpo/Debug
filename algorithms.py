@@ -16,6 +16,7 @@ from itertools import combinations
 import torch.distributed as dist
 import copy
 import contextlib
+import math
 import torchvision.transforms.v2 as v2
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
@@ -421,69 +422,61 @@ class CASS_GDRNet(Algorithm):
         for param in self.momentum_network.parameters():
             param.requires_grad = False
         self.m = 0.999
-        trainable_params = [p for p in self.network.parameters() if p.requires_grad]
-        total_params = sum(p.numel() for p in self.network.parameters())
-        trainable_num = sum(p.numel() for p in trainable_params)
-        print(f"Total Params: {total_params / 1e6:.2f}M, Trainable (LoRA+CNN): {trainable_num / 1e6:.2f}M")
-        cnn_params = []
-        vit_lora_params = []
-        for name, param in self.network.named_parameters():
-            if not param.requires_grad:
-                continue
-            lname = name.lower()
-            if 'cnn' in lname or 'resnet' in lname:
-                cnn_params.append(param)
-            elif 'lora' in lname:
-                vit_lora_params.append(param)
-            else:
-                cnn_params.append(param)
-        self.cnn_params = cnn_params
-        self.vit_lora_params = vit_lora_params
+
         self.base_lr_cnn = cfg.LEARNING_RATE
         self.base_lr_vit = 4e-4
-        if len(vit_lora_params) == 0:
-            raise RuntimeError("未检测到任何 LoRA 参数。请确认 DINOv3 已通过 inject_dinov3_lora 正确注入。")
+
+        self.cnn_params, self.vit_lora_params = self.network.get_custom_optim_params()
+
+        if len(self.vit_lora_params) == 0:
+            raise RuntimeError("未检测到任何 ViT/LoRA 参数。")
+
         self.opt_cnn = torch.optim.Adam(self.cnn_params, lr=self.base_lr_cnn, weight_decay=1e-4)
         self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=self.base_lr_vit, weight_decay=0.05)
-        self.warmup_epochs = 3
-        self.max_epochs = cfg.EPOCHS
-        # Compatibility placeholder for legacy outer-loop code that expects
-        # algorithm.optimizer to exist (e.g., global scheduler/logging hooks).
-        # This optimizer must not control real training params because this
-        # class uses self.opt_cnn + self.opt_vit with custom LR scheduling.
+
         self.dummy_param = nn.Parameter(torch.zeros(1))
         self.optimizer = torch.optim.Adam([self.dummy_param], lr=self.base_lr_cnn)
+
+        self.warmup_epochs = 3
+        self.max_epochs = cfg.EPOCHS
         self.K = 1024
         proj_dim = 1024
         self.num_positive = getattr(cfg, 'POSITIVE', 4)
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        batch_size_per_gpu = getattr(cfg, 'BATCH_SIZE', 16)
+        assert self.K % (batch_size_per_gpu * world_size) == 0, (
+            f"队列容量 K ({self.K}) 必须被全局 Batch Size ({batch_size_per_gpu * world_size}) 整除！"
+        )
+
         self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
         self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
         self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
         self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        init_prototypes = F.normalize(torch.randn(num_classes, proj_dim), dim=1)
-        self.register_buffer("prototypes", init_prototypes)
-        self.register_buffer("proto_initialized", torch.zeros(num_classes, dtype=torch.bool))
+
         self.split_num = 2
         self.combs = 3
         self.fundusAug = get_post_FundusAug(cfg)
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.eval_branch = 'cnn'
-        self.scaler = torch.cuda.amp.GradScaler()
+
+        self.use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        self.amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
+        self.scaler = torch.cuda.amp.GradScaler(enabled=not self.use_bf16)
+
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
         self.mild_vit_aug = v2.Compose([
-            v2.Resize((224, 224), antialias=True),
+            v2.Resize((518, 518), antialias=True),
             v2.ColorJitter(brightness=0.05, contrast=0.05),
         ])
 
     def _compute_cnn_grad_norm(self):
         grad_norm_sq = 0.0
-        if hasattr(self.network, 'module'):
-            named_params = self.network.module.named_parameters()
-        else:
-            named_params = self.network.named_parameters()
+        named_params = self.network.module.named_parameters() if hasattr(self.network, 'module') else self.network.named_parameters()
         for name, param in named_params:
             if ('cnn' in name or 'resnet' in name or 'spatial_cnn' in name) and param.grad is not None:
                 param_norm = param.grad.data.norm(2)
@@ -491,17 +484,27 @@ class CASS_GDRNet(Algorithm):
         return grad_norm_sq ** 0.5
 
     @torch.no_grad()
+    def concat_all_gather(self, tensor):
+        if not dist.is_initialized():
+            return tensor
+        tensors_gather = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+        dist.all_gather(tensors_gather, tensor, async_op=False)
+        return torch.cat(tensors_gather, dim=0)
+
+    @torch.no_grad()
     def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
-        feat_cnn = feat_cnn.float()
-        feat_vit = feat_vit.float()
+        feat_cnn = self.concat_all_gather(feat_cnn.float())
+        feat_vit = self.concat_all_gather(feat_vit.float())
+        labels = self.concat_all_gather(labels)
+
         batch_size = feat_cnn.shape[0]
         ptr = int(self.queue_ptr)
         replace_idx = torch.arange(ptr, ptr + batch_size).to(feat_cnn.device) % self.K
+
         self.queue_cnn[replace_idx, :] = feat_cnn
         self.queue_vit[replace_idx, :] = feat_vit
         self.queue_labels[replace_idx] = labels
-        ptr = (ptr + batch_size) % self.K
-        self.queue_ptr[0] = ptr
+        self.queue_ptr[0] = (ptr + batch_size) % self.K
 
     @torch.no_grad()
     def sample_target(self, current_features, labels, target_queue):
@@ -521,29 +524,7 @@ class CASS_GDRNet(Algorithm):
         targets = torch.stack(neighbor, dim=0)
         return F.normalize(targets, dim=-1)
 
-    @torch.no_grad()
-    def compute_prototypes_from_queue(self):
-        for c in range(self.cfg.DATASET.NUM_CLASSES):
-            idx = torch.nonzero(self.queue_labels == c).squeeze()
-            if idx.numel() > 0:
-                class_proto = self.queue_vit[idx].view(-1, self.queue_vit.shape[1]).mean(dim=0)
-                class_proto = F.normalize(class_proto, dim=0)
-                if not self.proto_initialized[c]:
-                    self.prototypes[c] = class_proto
-                    self.proto_initialized[c] = True
-                else:
-                    self.prototypes[c] = F.normalize(0.9 * self.prototypes[c] + 0.1 * class_proto, dim=0)
-
-    def _local_split(self, x):
-        _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
-        cols = x.split(_side_indent[1], dim=3)
-        xs = []
-        for _x in cols:
-            xs += _x.split(_side_indent[0], dim=2)
-        return torch.cat(xs, dim=0)
-
     def _to_vit_pixel_space(self, x):
-        # 若输入已经是 Normalize 后张量，先反归一化回 [0,1] 附近，再做 ColorJitter
         if x.min() < 0.0 or x.max() > 1.0:
             return (x * self.imagenet_std) + self.imagenet_mean
         return x
@@ -556,17 +537,12 @@ class CASS_GDRNet(Algorithm):
         self.opt_cnn.zero_grad()
         self.opt_vit.zero_grad()
 
-        if hasattr(self.network, 'module'):
-            network_inner = self.network.module
-            get_sync_context = self.network.no_sync
-            momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
-        else:
-            network_inner = self.network
-            get_sync_context = contextlib.nullcontext
-            momentum_inner = self.momentum_network
+        network_inner = self.network.module if hasattr(self.network, 'module') else self.network
+        momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
 
         bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
         mask_float = (mask > 0).to(image.dtype)
+
         img_base = image.clone() * mask_float + bg_color * (1.0 - mask_float)
         img_weak = self.fundusAug['post_aug2'](img_base.clone()).contiguous()
 
@@ -574,16 +550,18 @@ class CASS_GDRNet(Algorithm):
         mask_strong = (mask_strong > 0).to(img_strong_cnn.dtype)
         img_strong_cnn = img_strong_cnn * mask_strong + bg_color * (1.0 - mask_strong)
         img_strong_cnn = self.fundusAug['post_aug2'](img_strong_cnn).contiguous()
-        img_strong_cnn = F.interpolate(img_strong_cnn, size=(224, 224), mode='bilinear', align_corners=False)
+
         img_vit_base = self._to_vit_pixel_space(img_base.clone()).clamp(0.0, 1.0)
         img_strong_vit = self.mild_vit_aug(img_vit_base)
         img_strong_vit = self._vit_normalize(img_strong_vit)
 
-        img_weak_cnn = F.interpolate(img_weak, size=(224, 224), mode='bilinear', align_corners=False)
-        img_weak_vit = F.interpolate(img_vit_base, size=(224, 224), mode='bilinear', align_corners=False)
+        img_weak_cnn = img_weak
+        img_weak_vit = F.interpolate(img_vit_base, size=(518, 518), mode='bilinear', align_corners=False)
         img_weak_vit = self._vit_normalize(img_weak_vit)
-        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        autocast_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
+
+        autocast_ctx = contextlib.nullcontext
+        if torch.cuda.is_available():
+            autocast_ctx = lambda: torch.amp.autocast('cuda', dtype=self.amp_dtype)
 
         with autocast_ctx():
             res_combined = self.network(
@@ -598,8 +576,6 @@ class CASS_GDRNet(Algorithm):
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
         }
-        spatial_cnn = res_combined['spatial_cnn'].float()
-        spatial_vit = res_combined['spatial_vit'].float()
 
         with torch.no_grad():
             with autocast_ctx():
@@ -617,6 +593,7 @@ class CASS_GDRNet(Algorithm):
 
         target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
+
         kd_temp = 2.0
         with torch.no_grad():
             vit_soft = F.softmax(res_clean_fp32['logits_vit'].detach() / kd_temp, dim=1)
@@ -626,25 +603,32 @@ class CASS_GDRNet(Algorithm):
         loss_kd_cnn = (loss_kd_cnn * dcr_weight).mean() * (kd_temp ** 2)
 
         lambda_at = 1.0
-        loss_at = compute_attention_transfer_loss(spatial_cnn, spatial_vit)
+        loss_at = compute_attention_transfer_loss(res_combined['spatial_cnn'].float(), res_combined['spatial_vit'].float().detach())
+
         total_loss = loss_main + 1.0 * loss_kd_cnn + lambda_at * loss_at
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.opt_cnn)
         self.scaler.unscale_(self.opt_vit)
+
         grad_norm_cnn = self._compute_cnn_grad_norm()
         torch.nn.utils.clip_grad_norm_(self.cnn_params, max_norm=5.0)
         torch.nn.utils.clip_grad_norm_(self.vit_lora_params, max_norm=2.0)
+
         self.scaler.step(self.opt_cnn)
         self.scaler.step(self.opt_vit)
+        self.optimizer.step()
         self.scaler.update()
 
         with torch.no_grad():
+            trainable_names = {k for k, v in network_inner.named_parameters() if v.requires_grad}
             network_state = network_inner.state_dict()
             momentum_state = momentum_inner.state_dict()
             for key in network_state.keys():
                 if 'num_batches_tracked' in key:
                     momentum_state[key].copy_(network_state[key])
+                    continue
+                if key not in trainable_names and 'running_mean' not in key and 'running_var' not in key:
                     continue
                 param_q = network_state[key]
                 param_k = momentum_state[key]
@@ -660,7 +644,6 @@ class CASS_GDRNet(Algorithm):
         return loss_dict
 
     def adjust_learning_rate(self, epoch):
-        import math
         if epoch < self.warmup_epochs:
             warmup_factor = (epoch + 1) / self.warmup_epochs
             lr_cnn = self.base_lr_cnn * warmup_factor
@@ -679,8 +662,6 @@ class CASS_GDRNet(Algorithm):
     def update_epoch(self, epoch):
         self.epoch = epoch
         lr_cnn, lr_vit = self.adjust_learning_rate(epoch)
-        if epoch % 5 == 0:
-            print(f"📈 [Epoch {epoch}] LR Adjusted -> CNN: {lr_cnn:.2e} | DINOv3: {lr_vit:.2e}")
         if hasattr(self.criterion, 'update_alpha'):
             self.criterion.update_alpha(epoch)
         return epoch
@@ -692,17 +673,11 @@ class CASS_GDRNet(Algorithm):
         test_auc_cnn = metrics_cnn_test['auc']
         if self.epoch == self.cfg.EPOCHS:
             self.epoch += 1
-        if self.epoch > self.cfg.EPOCHS:
-            logging.info("=" * 30)
-            logging.info(f"🚀 FINAL RESULTS (Epoch {self.epoch - 1})")
-            logging.info(f"✅ CNN Branch >> Val AUC: {val_auc_cnn:.4f} | Test AUC: {test_auc_cnn:.4f}")
-            logging.info("=" * 30)
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        # 推理阶段：拦截高分图像，强行降采样至与训练 CNN 对齐的 224x224
-        x_cnn_low_res = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-        return self.network(x_cnn=x_cnn_low_res, x_vit=x)
+        x_aligned = F.interpolate(x, size=(518, 518), mode='bilinear', align_corners=False)
+        return self.network(x_cnn=x, x_vit=x_aligned)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
