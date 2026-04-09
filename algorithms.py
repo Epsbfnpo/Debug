@@ -441,6 +441,8 @@ class CASS_GDRNet(Algorithm):
         self.vit_lora_params = vit_lora_params
         self.base_lr_cnn = cfg.LEARNING_RATE
         self.base_lr_vit = 5e-5
+        if len(vit_lora_params) == 0:
+            raise RuntimeError("未检测到任何 LoRA 参数。请确认 DINOv3 已通过 inject_dinov3_lora 正确注入。")
         self.opt_cnn = torch.optim.Adam(self.cnn_params, lr=self.base_lr_cnn, weight_decay=1e-4)
         self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=self.base_lr_vit, weight_decay=0.05)
         self.warmup_epochs = 3
@@ -463,6 +465,8 @@ class CASS_GDRNet(Algorithm):
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         self.mild_vit_aug = v2.Compose([
             v2.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0), antialias=True),
             v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
@@ -532,6 +536,15 @@ class CASS_GDRNet(Algorithm):
             xs += _x.split(_side_indent[0], dim=2)
         return torch.cat(xs, dim=0)
 
+    def _to_vit_pixel_space(self, x):
+        # 若输入已经是 Normalize 后张量，先反归一化回 [0,1] 附近，再做 ColorJitter
+        if x.min() < 0.0 or x.max() > 1.0:
+            return (x * self.imagenet_std) + self.imagenet_mean
+        return x
+
+    def _vit_normalize(self, x):
+        return (x - self.imagenet_mean) / self.imagenet_std
+
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.opt_cnn.zero_grad()
@@ -556,9 +569,13 @@ class CASS_GDRNet(Algorithm):
         img_strong_cnn = img_strong_cnn * mask_strong + bg_color * (1.0 - mask_strong)
         img_strong_cnn = self.fundusAug['post_aug2'](img_strong_cnn).contiguous()
         img_strong_cnn = F.interpolate(img_strong_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-        img_strong_vit = self.mild_vit_aug(img_base.clone())
+        img_vit_base = self._to_vit_pixel_space(img_base.clone()).clamp(0.0, 1.0)
+        img_strong_vit = self.mild_vit_aug(img_vit_base)
+        img_strong_vit = self._vit_normalize(img_strong_vit)
 
         img_weak_cnn = F.interpolate(img_weak, size=(224, 224), mode='bilinear', align_corners=False)
+        img_weak_vit = F.interpolate(img_vit_base, size=(224, 224), mode='bilinear', align_corners=False)
+        img_weak_vit = self._vit_normalize(img_weak_vit)
         use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         autocast_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
 
@@ -582,7 +599,7 @@ class CASS_GDRNet(Algorithm):
             with autocast_ctx():
                 res_momentum = momentum_inner(
                     x_cnn=img_weak_cnn,
-                    x_vit=img_weak_cnn,
+                    x_vit=img_weak_vit,
                     return_train_features=True
                 )
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
