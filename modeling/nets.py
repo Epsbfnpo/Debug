@@ -546,29 +546,26 @@ class DINOv3Wrapper(nn.Module):
     def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, num_drts=4, use_grad_checkpointing=False):
         super().__init__()
         print(f"🚀 [DINOv3+LoRA+DRTs] Loading from local path: {local_path}")
+        from transformers import AutoModel, AutoConfig
         try:
             self.config = AutoConfig.from_pretrained(local_path, local_files_only=True)
             self.config.output_hidden_states = True
             self.config.output_attentions = False
             self._out_features = self.config.hidden_size
             self.model = AutoModel.from_pretrained(local_path, config=self.config, local_files_only=True)
+
             self.use_grad_checkpointing = use_grad_checkpointing and hasattr(self.model, "gradient_checkpointing_enable")
             if self.use_grad_checkpointing:
                 self.model.gradient_checkpointing_enable()
-                print("⚙️ [DINOv3] Gradient checkpointing enabled.")
-            else:
-                print("⚙️ [DINOv3] Gradient checkpointing disabled to avoid DDP re-entrant backward issues.")
+
             for param in self.model.parameters():
                 param.requires_grad = False
-            print("🧊 [DINOv3] All base parameters frozen.")
+
             self.num_drts = num_drts
             self.drt_tokens = nn.Parameter(torch.zeros(1, num_drts, self._out_features))
             nn.init.normal_(self.drt_tokens, std=0.02)
-            print(f"🧩 [DRTs] Initialized {num_drts} Domain-Absorbing Register Tokens.")
+
             self.model = inject_dinov3_lora(self.model, rank=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            trainable_params.append(self.drt_tokens)
-            print(f"🔥 [LoRA Injected] Trainable parameters: {len(trainable_params)}")
         except Exception as e:
             print(f"❌ Error loading DINOv3: {e}")
             raise e
@@ -576,11 +573,33 @@ class DINOv3Wrapper(nn.Module):
     def forward(self, x):
         embeddings = self.model.embeddings(x)
         batch_size = embeddings.shape[0]
+
         cls_token = embeddings[:, :1, :]
         patch_tokens = embeddings[:, 1:, :]
+
         drts = self.drt_tokens.expand(batch_size, -1, -1)
-        hidden_states = torch.cat([cls_token, drts, patch_tokens], dim=1)
+        hidden_states = torch.cat([cls_token, patch_tokens, drts], dim=1)
+
         position_embeddings = self.model.rope_embeddings(x) if hasattr(self.model, "rope_embeddings") else None
+
+        if position_embeddings is not None:
+            if isinstance(position_embeddings, torch.Tensor):
+                dummy_pos = torch.zeros(
+                    position_embeddings.shape[0],
+                    self.num_drts,
+                    position_embeddings.shape[-1],
+                    device=position_embeddings.device,
+                    dtype=position_embeddings.dtype,
+                )
+                position_embeddings = torch.cat([position_embeddings, dummy_pos], dim=1)
+            elif isinstance(position_embeddings, tuple):
+                dummy_cos = torch.ones_like(position_embeddings[0][:, :self.num_drts, :])
+                dummy_sin = torch.zeros_like(position_embeddings[1][:, :self.num_drts, :])
+                position_embeddings = (
+                    torch.cat([position_embeddings[0], dummy_cos], dim=1),
+                    torch.cat([position_embeddings[1], dummy_sin], dim=1),
+                )
+
         all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
 
         for layer_module in self.model.layer:
@@ -623,58 +642,78 @@ class DualTowerGDRNet(nn.Module):
     def __init__(self, cfg):
         super(DualTowerGDRNet, self).__init__()
         self.cnn = resnet50(pretrained=True)
-        if hasattr(self.cnn, 'out_features'):
-            self.cnn_dim = self.cnn.out_features()
-        else:
-            self.cnn_dim = 2048
-        default_dinov3_path = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16"
-        dinov3_path = getattr(cfg.GDRNET, 'DINOV3_PATH', default_dinov3_path)
+        self.cnn_dim = self.cnn.out_features() if hasattr(self.cnn, 'out_features') else 2048
+
+        default_dinov3_path = getattr(cfg.GDRNET, 'DINOV3_PATH', "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16")
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
         lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
         lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
         num_drts = getattr(cfg.GDRNET, 'NUM_DRTS', 4)
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
-        self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
+
+        self.vit = DINOv3Wrapper(local_path=default_dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
+
         proj_dim = 1024
         self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
         self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
+
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
-        self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
+        self.classifier_vit = nn.Linear(self.vit_dim * 3, cfg.DATASET.NUM_CLASSES)
+
+    def get_custom_optim_params(self):
+        vit_modules = [self.vit, self.projector_vit, self.classifier_vit]
+        vit_param_ids = set()
+        vit_params = []
+
+        for m in vit_modules:
+            for p in m.parameters():
+                if p.requires_grad:
+                    vit_params.append(p)
+                    vit_param_ids.add(id(p))
+
+        cnn_params = []
+        for p in self.parameters():
+            if p.requires_grad and id(p) not in vit_param_ids:
+                cnn_params.append(p)
+
+        return cnn_params, vit_params
 
     def forward(self, x_cnn, x_vit=None, return_train_features=False):
-        if not return_train_features:
-            feat_cnn, _ = self.extract_cnn_feature(x_cnn)
-            logits_cnn = self.classifier_cnn(feat_cnn)
-            if x_vit is None:
-                x_vit = x_cnn
-            vit_outputs = self.vit(x_vit)
-            feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
-            logits_vit = self.classifier_vit(feat_vit_cls)
-            return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
-
-        vit_outputs = self.vit(x_vit)
-        feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
-        logits_vit = self.classifier_vit(feat_vit_cls)
-        num_drts = self.vit.num_drts
-        total_tokens = vit_outputs.last_hidden_state.shape[1]
-        leftover_tokens = total_tokens - 1 - num_drts
-        H_vit = W_vit = int(math.sqrt(leftover_tokens))
-        num_spatial_tokens = H_vit * W_vit
-        patch_tokens_vit = vit_outputs.last_hidden_state[:, -num_spatial_tokens:, :]
-        B, _, D = patch_tokens_vit.shape
-        spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
+        if x_vit is None:
+            x_vit = x_cnn
 
         feat_cnn, spatial_cnn = self.extract_cnn_feature(x_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
+
+        vit_outputs = self.vit(x_vit)
+        feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
+        num_drts = self.vit.num_drts
+
+        patch_tokens_vit = vit_outputs.last_hidden_state[:, 1:-num_drts, :] if num_drts > 0 else vit_outputs.last_hidden_state[:, 1:, :]
+        drts = vit_outputs.last_hidden_state[:, -num_drts:, :] if num_drts > 0 else None
+
+        patch_mean = patch_tokens_vit.mean(dim=1)
+        patch_max = patch_tokens_vit.max(dim=1)[0]
+        feat_vit_combined = torch.cat([feat_vit_cls, patch_mean, patch_max], dim=1)
+        logits_vit = self.classifier_vit(feat_vit_combined)
+
+        if not return_train_features:
+            return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
+
+        B, N, D = patch_tokens_vit.shape
+        H_vit = W_vit = int(math.sqrt(N))
+        spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
+
         proj_cnn = self.projector_cnn(feat_cnn)
         proj_vit = self.projector_vit(feat_vit_cls)
+
         return {
             'logits_cnn': logits_cnn,
             'logits_vit': logits_vit,
             'proj_cnn': proj_cnn,
             'proj_vit': proj_vit,
-            'drts': vit_outputs.last_hidden_state[:, 1:1 + num_drts, :],
+            'drts': drts,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
             'spatial_vit': spatial_vit,
@@ -692,3 +731,4 @@ class DualTowerGDRNet(nn.Module):
         x_pooled = self.cnn.global_avgpool(x_spatial)
         feat_cnn_final = torch.flatten(x_pooled, 1)
         return feat_cnn_final, x_spatial
+
