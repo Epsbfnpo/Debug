@@ -151,29 +151,53 @@ def main():
         if epoch % cfg.VAL_EPOCH == 0:
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Validation...")
+
             val_metrics, val_loss = algorithm_validate(algorithm, val_loader, writer, epoch, 'val')
             is_dual_stream = ('cnn_auc' in val_metrics and 'vit_auc' in val_metrics)
+
+            if is_distributed:
+                dist.barrier()
+
             if is_dual_stream:
                 val_auc_cnn = val_metrics['cnn_auc']
-                if args.local_rank in [-1, 0]:
-                    if val_auc_cnn > best_performance_cnn:
-                        best_performance_cnn = val_auc_cnn
-                        logging.info(f"⭐️ [CNN] New Best! Val AUC: {val_auc_cnn:.4f}")
-                        algorithm.save_model(log_path, source='cnn')
                 val_auc_vit = val_metrics['vit_auc']
-                if args.local_rank in [-1, 0]:
-                    if val_auc_vit > best_performance_vit:
-                        best_performance_vit = val_auc_vit
+
+                if is_distributed:
+                    metrics_tensor = torch.tensor([val_auc_cnn, val_auc_vit], dtype=torch.float64, device=args.device)
+                    dist.broadcast(metrics_tensor, src=0)
+                    val_auc_cnn, val_auc_vit = metrics_tensor.tolist()
+
+                is_new_best_cnn = val_auc_cnn > best_performance_cnn
+                if is_new_best_cnn:
+                    best_performance_cnn = val_auc_cnn
+                    if args.local_rank in [-1, 0]:
+                        logging.info(f"⭐️ [CNN] New Best! Val AUC: {val_auc_cnn:.4f}")
+                    algorithm.save_model(log_path, source='cnn')
+
+                is_new_best_vit = val_auc_vit > best_performance_vit
+                if is_new_best_vit:
+                    best_performance_vit = val_auc_vit
+                    if args.local_rank in [-1, 0]:
                         logging.info(f"⭐️ [ViT] New Best! Val AUC: {val_auc_vit:.4f}")
-                        algorithm.save_model(log_path, source='vit')
+                    algorithm.save_model(log_path, source='vit')
+
                 best_performance = max(best_performance_cnn, best_performance_vit)
+
             else:
                 val_auc = val_metrics['auc']
-                if args.local_rank in [-1, 0]:
-                    if val_auc > best_performance:
-                        best_performance = val_auc
+
+                if is_distributed:
+                    metrics_tensor = torch.tensor([val_auc], dtype=torch.float64, device=args.device)
+                    dist.broadcast(metrics_tensor, src=0)
+                    val_auc = metrics_tensor.tolist()[0]
+
+                is_new_best = val_auc > best_performance
+                if is_new_best:
+                    best_performance = val_auc
+                    if args.local_rank in [-1, 0]:
                         logging.info(f"⭐️ New Best Model! Val AUC: {val_auc:.4f}")
-                        algorithm.save_model(log_path)
+                    algorithm.save_model(log_path)
+
             if is_distributed:
                 dist.barrier()
         if args.time_limit > 0:

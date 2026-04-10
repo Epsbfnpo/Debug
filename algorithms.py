@@ -681,12 +681,14 @@ class CASS_GDRNet(Algorithm):
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
+
         if rank == 0:
             logging.info(f"Saving {source} model...")
             if hasattr(self.network, 'module'):
                 state_dict = self.network.module.state_dict()
             else:
                 state_dict = self.network.state_dict()
+
             if source == 'cnn':
                 torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
                 torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state_cnn.pth'))
@@ -696,6 +698,9 @@ class CASS_GDRNet(Algorithm):
             else:
                 torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
                 torch.save({'queue_cnn': self.queue_cnn, 'queue_vit': self.queue_vit, 'queue_labels': self.queue_labels, 'queue_ptr': self.queue_ptr}, os.path.join(log_path, 'queue_state.pth'))
+
+        if dist.is_initialized():
+            dist.barrier()
 
     def renew_model(self, log_path, source='best'):
         if source == 'cnn':
