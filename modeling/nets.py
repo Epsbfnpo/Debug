@@ -680,6 +680,8 @@ class DualTowerGDRNet(nn.Module):
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim * 3, cfg.DATASET.NUM_CLASSES)
 
+        self.patch_size = 16
+
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.classifier_vit]
         vit_param_ids = set()
@@ -709,8 +711,16 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
         num_drts = self.vit.num_drts
 
-        patch_tokens_vit = vit_outputs.last_hidden_state[:, 1:-num_drts, :] if num_drts > 0 else vit_outputs.last_hidden_state[:, 1:, :]
-        drts = vit_outputs.last_hidden_state[:, -num_drts:, :] if num_drts > 0 else None
+        B_vit, C_vit, H_img, W_img = x_vit.shape
+        H_vit, W_vit = H_img // self.patch_size, W_img // self.patch_size
+        num_patches = H_vit * W_vit
+
+        if num_drts > 0:
+            patch_tokens_vit = vit_outputs.last_hidden_state[:, -num_drts - num_patches : -num_drts, :]
+            drts = vit_outputs.last_hidden_state[:, -num_drts:, :]
+        else:
+            patch_tokens_vit = vit_outputs.last_hidden_state[:, -num_patches:, :]
+            drts = None
 
         patch_mean = patch_tokens_vit.mean(dim=1)
         patch_max = patch_tokens_vit.max(dim=1)[0]
@@ -721,7 +731,6 @@ class DualTowerGDRNet(nn.Module):
             return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
 
         B, N, D = patch_tokens_vit.shape
-        H_vit = W_vit = int(math.sqrt(N))
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
         proj_cnn = self.projector_cnn(feat_cnn)
