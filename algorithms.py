@@ -470,7 +470,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.mild_vit_aug = v2.Compose([
-            v2.Resize((518, 518), antialias=True),
+            v2.Resize((512, 512), antialias=True),
             v2.ColorJitter(brightness=0.05, contrast=0.05),
         ])
 
@@ -556,7 +556,7 @@ class CASS_GDRNet(Algorithm):
         img_strong_vit = self._vit_normalize(img_strong_vit)
 
         img_weak_cnn = img_weak
-        img_weak_vit = F.interpolate(img_vit_base, size=(518, 518), mode='bilinear', align_corners=False)
+        img_weak_vit = F.interpolate(img_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
         img_weak_vit = self._vit_normalize(img_weak_vit)
 
         autocast_ctx = contextlib.nullcontext
@@ -676,7 +676,7 @@ class CASS_GDRNet(Algorithm):
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        x_aligned = F.interpolate(x, size=(518, 518), mode='bilinear', align_corners=False)
+        x_aligned = F.interpolate(x, size=(512, 512), mode='bilinear', align_corners=False)
         return self.network(x_cnn=x, x_vit=x_aligned)
 
     def save_model(self, log_path, source='best'):
