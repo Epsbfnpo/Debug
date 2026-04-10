@@ -487,7 +487,8 @@ class CASS_GDRNet(Algorithm):
     def concat_all_gather(self, tensor):
         if not dist.is_initialized():
             return tensor
-        tensors_gather = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+        tensor = tensor.contiguous()
+        tensors_gather = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
         dist.all_gather(tensors_gather, tensor, async_op=False)
         return torch.cat(tensors_gather, dim=0)
 
@@ -578,12 +579,15 @@ class CASS_GDRNet(Algorithm):
         }
 
         with torch.no_grad():
+            momentum_prev_mode = momentum_inner.training
+            momentum_inner.eval()
             with autocast_ctx():
                 res_momentum = momentum_inner(
                     x_cnn=img_weak_cnn,
                     x_vit=img_weak_vit,
                     return_train_features=True
                 )
+            momentum_inner.train(momentum_prev_mode)
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
 

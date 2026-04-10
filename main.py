@@ -93,7 +93,7 @@ def main():
     algorithm.to(args.device)
     if is_distributed:
         algorithm = nn.SyncBatchNorm.convert_sync_batchnorm(algorithm)
-        algorithm.network = DDP(algorithm.network, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        algorithm.network = DDP(algorithm.network, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
         if hasattr(algorithm, 'projector'):
             algorithm.projector = DDP(algorithm.projector, device_ids=[args.local_rank], output_device=args.local_rank)
         if hasattr(algorithm, 'predictor'):
