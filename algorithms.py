@@ -424,7 +424,8 @@ class CASS_GDRNet(Algorithm):
         self.m = 0.999
 
         self.base_lr_cnn = cfg.LEARNING_RATE
-        self.base_lr_vit = 4e-4
+        self.base_lr_vit = 5e-5
+        self.warmup_epochs = 5
 
         self.cnn_params, self.vit_lora_params = self.network.get_custom_optim_params()
 
@@ -432,12 +433,11 @@ class CASS_GDRNet(Algorithm):
             raise RuntimeError("未检测到任何 ViT/LoRA 参数。")
 
         self.opt_cnn = torch.optim.Adam(self.cnn_params, lr=self.base_lr_cnn, weight_decay=1e-4)
-        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=self.base_lr_vit, weight_decay=0.05)
+        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=self.base_lr_vit, weight_decay=1e-4)
 
         self.dummy_param = nn.Parameter(torch.zeros(1))
         self.optimizer = torch.optim.Adam([self.dummy_param], lr=self.base_lr_cnn)
 
-        self.warmup_epochs = 3
         self.max_epochs = cfg.EPOCHS
         self.K = 1024
         proj_dim = 1024
@@ -680,8 +680,20 @@ class CASS_GDRNet(Algorithm):
         return val_auc_cnn, test_auc_cnn
 
     def predict(self, x):
-        x_aligned = F.interpolate(x, size=(512, 512), mode='bilinear', align_corners=False)
-        return self.network(x_cnn=x, x_vit=x_aligned)
+        """
+        专家级对齐 Train / Test Data Pipeline，消灭背景 Domain Shift
+        """
+        x_pixel = self._to_vit_pixel_space(x)
+        mask_float = (x_pixel.sum(dim=1, keepdim=True) > 0.05).to(x.dtype)
+
+        bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        x_base = x * mask_float + bg_color * (1.0 - mask_float)
+
+        x_vit_base = self._to_vit_pixel_space(x_base.clone()).clamp(0.0, 1.0)
+        x_vit_aligned = F.interpolate(x_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
+        x_vit_norm = self._vit_normalize(x_vit_aligned)
+
+        return self.network(x_cnn=x_base, x_vit=x_vit_norm)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
