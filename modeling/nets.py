@@ -675,7 +675,13 @@ class DualTowerGDRNet(nn.Module):
 
         proj_dim = 1024
         self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
-        self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
+        vit_combined_dim = self.vit_dim * 3
+        self.projector_vit = nn.Sequential(
+            nn.Linear(vit_combined_dim, vit_combined_dim),
+            nn.BatchNorm1d(vit_combined_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(vit_combined_dim, proj_dim)
+        )
 
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim * 3, cfg.DATASET.NUM_CLASSES)
@@ -734,7 +740,7 @@ class DualTowerGDRNet(nn.Module):
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
         proj_cnn = self.projector_cnn(feat_cnn)
-        proj_vit = self.projector_vit(feat_vit_cls)
+        proj_vit = self.projector_vit(feat_vit_combined)
 
         return {
             'logits_cnn': logits_cnn,
@@ -759,4 +765,3 @@ class DualTowerGDRNet(nn.Module):
         x_pooled = self.cnn.global_avgpool(x_spatial)
         feat_cnn_final = torch.flatten(x_pooled, 1)
         return feat_cnn_final, x_spatial
-
