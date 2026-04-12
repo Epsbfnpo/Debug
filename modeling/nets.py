@@ -543,9 +543,9 @@ class AveragedModel(Module):
         return clone
 
 class DINOv3Wrapper(nn.Module):
-    def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, num_drts=4, use_grad_checkpointing=False):
+    def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, use_grad_checkpointing=False):
         super().__init__()
-        print(f"🚀 [DINOv3+LoRA+DRTs] Loading from local path: {local_path}")
+        print(f"🚀 [DINOv3+LoRA] Loading from local path: {local_path}")
         from transformers import AutoModel, AutoConfig
         try:
             self.config = AutoConfig.from_pretrained(local_path, local_files_only=True)
@@ -561,96 +561,20 @@ class DINOv3Wrapper(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
 
-            self.num_drts = num_drts
-            self.drt_tokens = nn.Parameter(torch.zeros(1, num_drts, self._out_features))
-            nn.init.normal_(self.drt_tokens, std=0.02)
-
             self.model = inject_dinov3_lora(self.model, rank=lora_r, alpha=lora_alpha, dropout=lora_dropout)
         except Exception as e:
             print(f"❌ Error loading DINOv3: {e}")
             raise e
 
     def forward(self, x):
-        embeddings = self.model.embeddings(x)
-        batch_size = embeddings.shape[0]
-
-        cls_token = embeddings[:, :1, :]
-        patch_tokens = embeddings[:, 1:, :]
-
-        drts = self.drt_tokens.expand(batch_size, -1, -1)
-        hidden_states = torch.cat([cls_token, patch_tokens, drts], dim=1)
-
-        position_embeddings = self.model.rope_embeddings(x) if hasattr(self.model, "rope_embeddings") else None
-
-        # 动态对齐位置编码的维度，完美骗过 Shape Mismatch，实现 DRT 的 0 度旋转
-        if position_embeddings is not None:
-            if isinstance(position_embeddings, torch.Tensor):
-                # 动态获取序列维度（通常是倒数第二个维度）
-                seq_dim = len(position_embeddings.shape) - 2
-                dummy_shape = list(position_embeddings.shape)
-                dummy_shape[seq_dim] = self.num_drts
-
-                dummy_pos = torch.zeros(
-                    dummy_shape,
-                    device=position_embeddings.device,
-                    dtype=position_embeddings.dtype,
-                )
-                position_embeddings = torch.cat([position_embeddings, dummy_pos], dim=seq_dim)
-
-            elif isinstance(position_embeddings, tuple):
-                # 动态获取 RoPE 缓存的序列维度
-                seq_dim = len(position_embeddings[0].shape) - 2
-                dummy_shape = list(position_embeddings[0].shape)
-                dummy_shape[seq_dim] = self.num_drts
-
-                dummy_cos = torch.ones(
-                    dummy_shape,
-                    device=position_embeddings[0].device,
-                    dtype=position_embeddings[0].dtype
-                )
-                dummy_sin = torch.zeros(
-                    dummy_shape,
-                    device=position_embeddings[1].device,
-                    dtype=position_embeddings[1].dtype
-                )
-
-                position_embeddings = (
-                    torch.cat([position_embeddings[0], dummy_cos], dim=seq_dim),
-                    torch.cat([position_embeddings[1], dummy_sin], dim=seq_dim),
-                )
-
-        all_hidden_states = (hidden_states,) if self.config.output_hidden_states else None
-
-        for layer_module in self.model.layer:
-            if self.use_grad_checkpointing and self.training and hasattr(self.model, "_gradient_checkpointing_func"):
-                hidden_states = self.model._gradient_checkpointing_func(
-                    layer_module.__call__,
-                    hidden_states,
-                    None,
-                    position_embeddings,
-                )
-            else:
-                hidden_states = layer_module(
-                    hidden_states,
-                    attention_mask=None,
-                    position_embeddings=position_embeddings,
-                )
-            if self.config.output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if hasattr(self.model, "norm"):
-            hidden_states = self.model.norm(hidden_states)
-        elif hasattr(self.model, "layernorm"):
-            hidden_states = self.model.layernorm(hidden_states)
-
-        if self.config.output_hidden_states:
-            all_hidden_states = all_hidden_states[:-1] + (hidden_states,)
-
-        return BaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=None,
+        # 显式指定 pixel_values=x，满足 HuggingFace + PEFT 的严格传参要求
+        outputs = self.model(
+            pixel_values=x,
+            output_hidden_states=self.config.output_hidden_states,
+            output_attentions=self.config.output_attentions,
+            return_dict=True
         )
+        return outputs
 
     @property
     def out_features(self):
@@ -667,15 +591,15 @@ class DualTowerGDRNet(nn.Module):
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
         lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
         lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
-        num_drts = getattr(cfg.GDRNET, 'NUM_DRTS', 4)
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
 
-        self.vit = DINOv3Wrapper(local_path=default_dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
+        self.vit = DINOv3Wrapper(local_path=default_dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
+        self.patch_size = getattr(self.vit.config, 'patch_size', 16)
 
         proj_dim = 1024
         self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
-        vit_combined_dim = self.vit_dim * 3
+        vit_combined_dim = self.vit_dim
         self.projector_vit = nn.Sequential(
             nn.Linear(vit_combined_dim, vit_combined_dim),
             nn.BatchNorm1d(vit_combined_dim),
@@ -684,9 +608,7 @@ class DualTowerGDRNet(nn.Module):
         )
 
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
-        self.classifier_vit = nn.Linear(self.vit_dim * 3, cfg.DATASET.NUM_CLASSES)
-
-        self.patch_size = 16
+        self.classifier_vit = nn.Linear(vit_combined_dim, cfg.DATASET.NUM_CLASSES)
 
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.classifier_vit]
@@ -715,28 +637,21 @@ class DualTowerGDRNet(nn.Module):
 
         vit_outputs = self.vit(x_vit)
         feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
-        num_drts = self.vit.num_drts
+        feat_vit_combined = feat_vit_cls
 
-        B_vit, C_vit, H_img, W_img = x_vit.shape
-        H_vit, W_vit = H_img // self.patch_size, W_img // self.patch_size
-        num_patches = H_vit * W_vit
-
-        if num_drts > 0:
-            patch_tokens_vit = vit_outputs.last_hidden_state[:, -num_drts - num_patches : -num_drts, :]
-            drts = vit_outputs.last_hidden_state[:, -num_drts:, :]
-        else:
-            patch_tokens_vit = vit_outputs.last_hidden_state[:, -num_patches:, :]
-            drts = None
-
-        patch_mean = patch_tokens_vit.mean(dim=1)
-        patch_max = patch_tokens_vit.max(dim=1)[0]
-        feat_vit_combined = torch.cat([feat_vit_cls, patch_mean, patch_max], dim=1)
         logits_vit = self.classifier_vit(feat_vit_combined)
 
         if not return_train_features:
             return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
 
+        patch_tokens_vit = vit_outputs.last_hidden_state[:, 1:, :]
+
+        B_vit, C_vit, H_img, W_img = x_vit.shape
+        H_vit, W_vit = H_img // self.patch_size, W_img // self.patch_size
+
         B, N, D = patch_tokens_vit.shape
+        assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}. Check patch_size and input resolution."
+
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
         proj_cnn = self.projector_cnn(feat_cnn)
@@ -747,7 +662,7 @@ class DualTowerGDRNet(nn.Module):
             'logits_vit': logits_vit,
             'proj_cnn': proj_cnn,
             'proj_vit': proj_vit,
-            'drts': drts,
+            'drts': None,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
             'spatial_vit': spatial_vit,
