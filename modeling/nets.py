@@ -567,8 +567,9 @@ class DINOv3Wrapper(nn.Module):
             raise e
 
     def forward(self, x):
+        # 显式指定 pixel_values=x，满足 HuggingFace + PEFT 的严格传参要求
         outputs = self.model(
-            x,
+            pixel_values=x,
             output_hidden_states=self.config.output_hidden_states,
             output_attentions=self.config.output_attentions,
             return_dict=True
