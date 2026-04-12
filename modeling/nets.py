@@ -567,9 +567,14 @@ class DINOv3Wrapper(nn.Module):
             raise e
 
     def forward(self, x):
-        # 显式指定 pixel_values=x，满足 HuggingFace + PEFT 的严格传参要求
-        outputs = self.model(
-            pixel_values=x,
+        # ✅ 终极防御：绕过 PEFT 专为 NLP 设计的顶层 wrapper (它会吞噬或错误映射像素参数)
+        # 获取底层注入了 LoRA 权重的实际视觉模型
+        actual_model = self.model.base_model if hasattr(self.model, "base_model") else self.model
+
+        # ✅ 直接将 x 作为第一个位置参数（Positional Argument）传入
+        # 完美契合 DINOv3 底层严格的 def forward(self, pixel_values, ...) 签名
+        outputs = actual_model(
+            x,
             output_hidden_states=self.config.output_hidden_states,
             output_attentions=self.config.output_attentions,
             return_dict=True
