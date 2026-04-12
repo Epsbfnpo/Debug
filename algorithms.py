@@ -536,6 +536,11 @@ class CASS_GDRNet(Algorithm):
     def _vit_normalize(self, x):
         return (x - self.imagenet_mean) / self.imagenet_std
 
+    def _ensure_cnn_normalized(self, x):
+        if x.min() < 0.0 or x.max() > 1.0:
+            return x
+        return self._cnn_normalize(x)
+
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.opt_cnn.zero_grad()
@@ -554,13 +559,14 @@ class CASS_GDRNet(Algorithm):
         img_strong_pixel, mask_strong = self.fundusAug['post_aug1'](image_pixel.clone(), mask.clone())
         mask_strong = (mask_strong > 0).to(img_strong_pixel.dtype)
         img_strong_pixel = img_strong_pixel * mask_strong + bg_color * (1.0 - mask_strong)
-        img_strong_cnn = self.fundusAug['post_aug2'](img_strong_pixel).contiguous()
+        img_strong_cnn_pixel = self.fundusAug['post_aug2'](img_strong_pixel).contiguous()
+        img_strong_cnn = self._ensure_cnn_normalized(img_strong_cnn_pixel)
 
         img_vit_base = img_base_pixel.clone()
         img_strong_vit = self.mild_vit_aug(img_vit_base)
         img_strong_vit = self._vit_normalize(img_strong_vit)
 
-        img_weak_cnn = img_weak
+        img_weak_cnn = self._ensure_cnn_normalized(img_weak.clone())
         img_weak_vit = F.interpolate(img_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
         img_weak_vit = self._vit_normalize(img_weak_vit)
 
