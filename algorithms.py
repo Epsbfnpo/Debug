@@ -424,7 +424,7 @@ class CASS_GDRNet(Algorithm):
         self.m = 0.999
 
         self.base_lr_cnn = cfg.LEARNING_RATE
-        self.base_lr_vit = 5e-5
+        self.base_lr_vit = 5e-4
         self.warmup_epochs = 5
 
         self.cnn_params, self.vit_lora_params = self.network.get_custom_optim_params()
@@ -525,13 +525,21 @@ class CASS_GDRNet(Algorithm):
         targets = torch.stack(neighbor, dim=0)
         return F.normalize(targets, dim=-1)
 
-    def _to_vit_pixel_space(self, x):
+    def _to_pixel_space(self, x):
         if x.min() < 0.0 or x.max() > 1.0:
             return (x * self.imagenet_std) + self.imagenet_mean
         return x
 
+    def _cnn_normalize(self, x):
+        return (x - self.imagenet_mean) / self.imagenet_std
+
     def _vit_normalize(self, x):
         return (x - self.imagenet_mean) / self.imagenet_std
+
+    def _ensure_cnn_normalized(self, x):
+        if x.min() < 0.0 or x.max() > 1.0:
+            return x
+        return self._cnn_normalize(x)
 
     def update(self, minibatch):
         image, mask, label, domain = minibatch
@@ -541,22 +549,24 @@ class CASS_GDRNet(Algorithm):
         network_inner = self.network.module if hasattr(self.network, 'module') else self.network
         momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
 
+        image_pixel = self._to_pixel_space(image.clone()).clamp(0.0, 1.0)
         bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
         mask_float = (mask > 0).to(image.dtype)
 
-        img_base = image.clone() * mask_float + bg_color * (1.0 - mask_float)
-        img_weak = self.fundusAug['post_aug2'](img_base.clone()).contiguous()
+        img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
+        img_weak = self.fundusAug['post_aug2'](img_base_pixel.clone()).contiguous()
 
-        img_strong_cnn, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
-        mask_strong = (mask_strong > 0).to(img_strong_cnn.dtype)
-        img_strong_cnn = img_strong_cnn * mask_strong + bg_color * (1.0 - mask_strong)
-        img_strong_cnn = self.fundusAug['post_aug2'](img_strong_cnn).contiguous()
+        img_strong_pixel, mask_strong = self.fundusAug['post_aug1'](image_pixel.clone(), mask.clone())
+        mask_strong = (mask_strong > 0).to(img_strong_pixel.dtype)
+        img_strong_pixel = img_strong_pixel * mask_strong + bg_color * (1.0 - mask_strong)
+        img_strong_cnn_pixel = self.fundusAug['post_aug2'](img_strong_pixel).contiguous()
+        img_strong_cnn = self._ensure_cnn_normalized(img_strong_cnn_pixel)
 
-        img_vit_base = self._to_vit_pixel_space(img_base.clone()).clamp(0.0, 1.0)
+        img_vit_base = img_base_pixel.clone()
         img_strong_vit = self.mild_vit_aug(img_vit_base)
         img_strong_vit = self._vit_normalize(img_strong_vit)
 
-        img_weak_cnn = img_weak
+        img_weak_cnn = self._ensure_cnn_normalized(img_weak.clone())
         img_weak_vit = F.interpolate(img_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
         img_weak_vit = self._vit_normalize(img_weak_vit)
 
@@ -683,17 +693,18 @@ class CASS_GDRNet(Algorithm):
         """
         专家级对齐 Train / Test Data Pipeline，消灭背景 Domain Shift
         """
-        x_pixel = self._to_vit_pixel_space(x)
+        x_pixel = self._to_pixel_space(x).clamp(0.0, 1.0)
         mask_float = (x_pixel.sum(dim=1, keepdim=True) > 0.05).to(x.dtype)
 
         bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-        x_base = x * mask_float + bg_color * (1.0 - mask_float)
+        x_base_pixel = x_pixel * mask_float + bg_color * (1.0 - mask_float)
 
-        x_vit_base = self._to_vit_pixel_space(x_base.clone()).clamp(0.0, 1.0)
+        x_cnn = self._cnn_normalize(x_base_pixel.clone())
+        x_vit_base = x_base_pixel.clone()
         x_vit_aligned = F.interpolate(x_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
         x_vit_norm = self._vit_normalize(x_vit_aligned)
 
-        return self.network(x_cnn=x_base, x_vit=x_vit_norm)
+        return self.network(x_cnn=x_cnn, x_vit=x_vit_norm)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
