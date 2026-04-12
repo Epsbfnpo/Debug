@@ -616,10 +616,9 @@ class CASS_GDRNet(Algorithm):
         loss_kd_cnn = F.kl_div(log_prob_cnn, vit_soft, reduction='none').sum(dim=1)
         loss_kd_cnn = (loss_kd_cnn * dcr_weight).mean() * (kd_temp ** 2)
 
-        lambda_at = 1.0
-        loss_at = compute_attention_transfer_loss(res_combined['spatial_cnn'].float(), res_combined['spatial_vit'].float().detach())
+        loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
-        total_loss = loss_main + 1.0 * loss_kd_cnn + lambda_at * loss_at
+        total_loss = loss_main + 1.0 * loss_kd_cnn
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.opt_cnn)
