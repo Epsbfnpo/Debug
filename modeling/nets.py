@@ -543,7 +543,7 @@ class AveragedModel(Module):
         return clone
 
 class DINOv3Wrapper(nn.Module):
-    def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, use_grad_checkpointing=False):
+    def __init__(self, local_path, lora_r=8, lora_alpha=8, lora_dropout=0.1, use_grad_checkpointing=False):
         super().__init__()
         print(f"🚀 [DINOv3+LoRA] Loading from local path: {local_path}")
         from transformers import AutoModel, AutoConfig
@@ -594,8 +594,8 @@ class DualTowerGDRNet(nn.Module):
 
         default_dinov3_path = getattr(cfg.GDRNET, 'DINOV3_PATH', "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16")
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
-        lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
-        lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
+        lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 8)
+        lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.1)
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
 
         self.vit = DINOv3Wrapper(local_path=default_dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, use_grad_checkpointing=use_grad_checkpointing)

@@ -433,7 +433,12 @@ class CASS_GDRNet(Algorithm):
             raise RuntimeError("未检测到任何 ViT/LoRA 参数。")
 
         self.opt_cnn = torch.optim.Adam(self.cnn_params, lr=self.base_lr_cnn, weight_decay=1e-4)
-        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=self.base_lr_vit, weight_decay=1e-4)
+        self.opt_vit = torch.optim.AdamW(
+            self.vit_lora_params,
+            lr=self.base_lr_vit,
+            weight_decay=0.05,
+            betas=(0.9, 0.999),
+        )
 
         self.dummy_param = nn.Parameter(torch.zeros(1))
         self.optimizer = torch.optim.Adam([self.dummy_param], lr=self.base_lr_cnn)
@@ -601,11 +606,11 @@ class CASS_GDRNet(Algorithm):
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
 
-        target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
-        target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
+        target_vit_for_vit = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
+        target_cnn_for_cnn = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
 
-        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
+        target_dict = {'target_vit': target_vit_for_vit, 'target_cnn': target_cnn_for_cnn}
         loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
 
         kd_temp = 2.0
@@ -620,7 +625,17 @@ class CASS_GDRNet(Algorithm):
 
         loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
-        total_loss = loss_main + 1.0 * loss_kd_cnn
+        warmup_epochs = self.warmup_epochs
+        max_epochs = getattr(getattr(self.cfg, 'OPTIM', object()), 'MAX_EPOCH', self.max_epochs)
+        current_epoch = self.epoch
+        if current_epoch < warmup_epochs:
+            kd_weight = 0.0
+        else:
+            denom = max(1, max_epochs - warmup_epochs)
+            progress = min(1.0, max(0.0, (current_epoch - warmup_epochs) / denom))
+            kd_weight = math.exp(-5.0 * (1.0 - progress) ** 2)
+
+        total_loss = loss_main + kd_weight * loss_kd_cnn
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.opt_cnn)
@@ -653,6 +668,7 @@ class CASS_GDRNet(Algorithm):
                     param_k.data.copy_(param_q.data)
 
         loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
+        loss_dict['kd_weight'] = kd_weight
         loss_dict['loss_at'] = loss_at.item()
         loss_dict['grad_norm_cnn'] = grad_norm_cnn
         loss_dict['loss'] = total_loss.item()
@@ -690,22 +706,15 @@ class CASS_GDRNet(Algorithm):
             self.epoch += 1
         return val_auc_cnn, test_auc_cnn
 
-    def predict(self, x):
-        """
-        专家级对齐 Train / Test Data Pipeline，消灭背景 Domain Shift
-        """
-        x_pixel = self._to_pixel_space(x).clamp(0.0, 1.0)
-        mask_float = (x_pixel.sum(dim=1, keepdim=True) > 0.05).to(x.dtype)
+    def predict(self, x, mask=None):
+        if mask is None:
+            mask = torch.ones(x.shape[0], 1, x.shape[2], x.shape[3], dtype=x.dtype, device=x.device)
+        else:
+            mask = mask.to(x.dtype)
 
-        bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-        x_base_pixel = x_pixel * mask_float + bg_color * (1.0 - mask_float)
-
-        x_cnn = self._cnn_normalize(x_base_pixel.clone())
-        x_vit_base = x_base_pixel.clone()
-        x_vit_aligned = F.interpolate(x_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
-        x_vit_norm = self._vit_normalize(x_vit_aligned)
-
-        return self.network(x_cnn=x_cnn, x_vit=x_vit_norm)
+        x_masked = x * mask
+        x_vit = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
+        return self.network(x_cnn=x_masked, x_vit=x_vit)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
