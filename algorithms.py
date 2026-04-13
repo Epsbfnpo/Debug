@@ -31,6 +31,12 @@ def compute_attention_transfer_loss(map_cnn, map_vit):
     cos_sim = F.cosine_similarity(at_cnn_flat, at_vit_flat, dim=1)
     return (1.0 - cos_sim).mean()
 
+
+def compute_entropy(probs):
+    """计算预测分布的信息熵。熵越高越不确定，熵越低越自信。"""
+    return -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean().item()
+
+
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
         raise NotImplementedError("Algorithm not found: {}".format(algorithm_name))
@@ -512,14 +518,24 @@ class CASS_GDRNet(Algorithm):
     def _apply_batch_transform(self, images, transform):
         return torch.stack([transform(img) for img in images], dim=0)
 
-    def _compute_cnn_grad_norm(self):
-        grad_norm_sq = 0.0
-        named_params = self.network.module.named_parameters() if hasattr(self.network, 'module') else self.network.named_parameters()
-        for name, param in named_params:
-            if ('cnn' in name or 'resnet' in name or 'spatial_cnn' in name) and param.grad is not None:
-                param_norm = param.grad.data.norm(2)
-                grad_norm_sq += param_norm.item() ** 2
-        return grad_norm_sq ** 0.5
+    def _compute_grad_norms(self):
+        grad_norm_cnn = 0.0
+        grad_norm_vit_lora = 0.0
+        grad_norm_vit_head = 0.0
+
+        for p in self.cnn_params:
+            if p.grad is not None:
+                grad_norm_cnn += p.grad.data.norm(2).item() ** 2
+
+        for p in self.vit_lora_params:
+            if p.grad is not None:
+                grad_norm_vit_lora += p.grad.data.norm(2).item() ** 2
+
+        for p in self.vit_head_params:
+            if p.grad is not None:
+                grad_norm_vit_head += p.grad.data.norm(2).item() ** 2
+
+        return grad_norm_cnn ** 0.5, grad_norm_vit_lora ** 0.5, grad_norm_vit_head ** 0.5
 
     @torch.no_grad()
     def concat_all_gather(self, tensor):
@@ -659,11 +675,28 @@ class CASS_GDRNet(Algorithm):
 
         total_loss = loss_main + kd_weight * loss_kd_cnn
 
+        with torch.no_grad():
+            pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
+            pred_vit_classes = res_momentum['logits_vit'].argmax(dim=1)
+            unique_classes_cnn = len(torch.unique(pred_cnn_classes))
+            unique_classes_vit = len(torch.unique(pred_vit_classes))
+
+            vit_soft_probs = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
+            ema_vit_entropy = compute_entropy(vit_soft_probs)
+            cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
+            cnn_entropy = compute_entropy(cnn_probs)
+
+            sim_cnn_to_target = F.cosine_similarity(res_clean_fp32['proj_cnn'], target_cnn_for_cnn, dim=-1).mean().item()
+            sim_vit_to_target = F.cosine_similarity(res_clean_fp32['proj_vit'], target_vit_for_vit, dim=-1).mean().item()
+
+            feat_norm_cnn_raw = res_combined['proj_cnn'].norm(dim=1).mean().item()
+            feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()
+
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.opt_cnn)
         self.scaler.unscale_(self.opt_vit)
 
-        grad_norm_cnn = self._compute_cnn_grad_norm()
+        grad_norm_cnn, grad_norm_vit_lora, grad_norm_vit_head = self._compute_grad_norms()
         torch.nn.utils.clip_grad_norm_(self.cnn_params, max_norm=5.0)
         torch.nn.utils.clip_grad_norm_(self.vit_lora_params, max_norm=2.0)
 
@@ -692,7 +725,17 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
         loss_dict['kd_weight'] = kd_weight
         loss_dict['loss_at'] = loss_at.item()
-        loss_dict['grad_norm_cnn'] = grad_norm_cnn
+        loss_dict['probe_grad_cnn'] = grad_norm_cnn
+        loss_dict['probe_grad_lora'] = grad_norm_vit_lora
+        loss_dict['probe_grad_head'] = grad_norm_vit_head
+        loss_dict['probe_sim_cnn'] = sim_cnn_to_target
+        loss_dict['probe_sim_vit'] = sim_vit_to_target
+        loss_dict['probe_ent_ema_teacher'] = ema_vit_entropy
+        loss_dict['probe_ent_cnn_student'] = cnn_entropy
+        loss_dict['probe_unique_cls_cnn'] = unique_classes_cnn
+        loss_dict['probe_unique_cls_vit'] = unique_classes_vit
+        loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
+        loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
