@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-def inject_dinov3_lora(model, rank=8, alpha=16.0, dropout=0.0):
+def inject_dinov3_lora(model, rank=8, alpha=8.0, dropout=0.1):
     """
     精确打击 DINOv3 (HuggingFace 格式) 的核心门控：
     Attention 层: q_proj, k_proj, v_proj, o_proj
@@ -17,6 +17,9 @@ def inject_dinov3_lora(model, rank=8, alpha=16.0, dropout=0.0):
         r=rank,
         lora_alpha=alpha,
         target_modules=[
+            "qkv",
+            "fc1",
+            "fc2",
             "q_proj",
             "k_proj",
             "v_proj",
