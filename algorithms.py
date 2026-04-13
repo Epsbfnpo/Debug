@@ -505,6 +505,12 @@ class CASS_GDRNet(Algorithm):
         self.weak_transforms = v2.Compose([
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        self.weak_transforms = v2.Compose([
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def _apply_batch_transform(self, images, transform):
+        return torch.stack([transform(img) for img in images], dim=0)
 
     def _compute_cnn_grad_norm(self):
         grad_norm_sq = 0.0

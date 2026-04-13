@@ -1,5 +1,6 @@
 from .GDRBench import GDRBench
 from . import fundusaug as FundusAug
+from .fundusaug import square_tight_crop
 from torchvision import transforms
 import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
