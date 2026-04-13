@@ -585,6 +585,27 @@ class DINOv3Wrapper(nn.Module):
     def out_features(self):
         return self._out_features
 
+class RobustViTHead(nn.Module):
+    def __init__(self, in_dim=768, hidden_dim=512, num_classes=5, dropout_rate=0.3):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        return self.head(x)
 
 class DualTowerGDRNet(nn.Module):
     def __init__(self, cfg):
@@ -613,7 +634,12 @@ class DualTowerGDRNet(nn.Module):
         )
 
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
-        self.classifier_vit = nn.Linear(vit_combined_dim, cfg.DATASET.NUM_CLASSES)
+        self.classifier_vit = RobustViTHead(
+            in_dim=vit_combined_dim,
+            hidden_dim=512,
+            num_classes=cfg.DATASET.NUM_CLASSES,
+            dropout_rate=0.3
+        )
 
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.classifier_vit]
