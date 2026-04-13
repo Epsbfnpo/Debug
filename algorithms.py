@@ -435,14 +435,20 @@ class CASS_GDRNet(Algorithm):
 
         network_inner = self.network.module if hasattr(self.network, 'module') else self.network
         id_to_name = {id(p): n for n, p in network_inner.named_parameters()}
-        self.vit_classifier_params = [p for p in vit_params_all if 'classifier_vit' in id_to_name.get(id(p), '')]
-        self.vit_lora_params = [p for p in vit_params_all if 'classifier_vit' not in id_to_name.get(id(p), '')]
+        self.vit_head_params = [
+            p for p in vit_params_all
+            if 'classifier_vit' in id_to_name.get(id(p), '') or 'projector_vit' in id_to_name.get(id(p), '')
+        ]
+        self.vit_lora_params = [
+            p for p in vit_params_all
+            if 'classifier_vit' not in id_to_name.get(id(p), '') and 'projector_vit' not in id_to_name.get(id(p), '')
+        ]
 
         self.opt_cnn = torch.optim.AdamW(self.cnn_params, lr=1e-4, weight_decay=1e-4)
         self.opt_vit = torch.optim.AdamW(
             [
                 {'params': self.vit_lora_params, 'lr': self.base_lr_vit, 'weight_decay': 0.05},
-                {'params': self.vit_classifier_params, 'lr': self.base_lr_vit_head, 'weight_decay': 1e-4},
+                {'params': self.vit_head_params, 'lr': self.base_lr_vit_head, 'weight_decay': 1e-4},
             ],
             betas=(0.9, 0.999),
         )
@@ -585,8 +591,8 @@ class CASS_GDRNet(Algorithm):
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
         img_weak_cnn = self.weak_transforms(img_base_pixel.clone()).contiguous()
         img_weak_vit = self.weak_transforms(img_base_pixel.clone()).contiguous()
-        img_strong_cnn = self._apply_batch_transform(img_base_pixel.clone(), self.cnn_train_transforms).contiguous()
-        img_strong_vit = self._apply_batch_transform(img_base_pixel.clone(), self.vit_train_transforms).contiguous()
+        img_strong_cnn = self.cnn_train_transforms(img_base_pixel.clone()).contiguous()
+        img_strong_vit = self.vit_train_transforms(img_base_pixel.clone()).contiguous()
 
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
