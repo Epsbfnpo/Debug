@@ -496,6 +496,9 @@ class CASS_GDRNet(Algorithm):
             v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        self.weak_transforms = v2.Compose([
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     def _apply_batch_transform(self, images, transform):
         return torch.stack([transform(img) for img in images], dim=0)
@@ -580,13 +583,10 @@ class CASS_GDRNet(Algorithm):
         mask_float = (mask > 0).to(image.dtype)
 
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
-        img_weak = self._apply_batch_transform(img_base_pixel.clone(), self.vit_train_transforms).contiguous()
-
+        img_weak_cnn = self.weak_transforms(img_base_pixel.clone()).contiguous()
+        img_weak_vit = self.weak_transforms(img_base_pixel.clone()).contiguous()
         img_strong_cnn = self._apply_batch_transform(img_base_pixel.clone(), self.cnn_train_transforms).contiguous()
         img_strong_vit = self._apply_batch_transform(img_base_pixel.clone(), self.vit_train_transforms).contiguous()
-
-        img_weak_cnn = self._apply_batch_transform(img_base_pixel.clone(), self.cnn_train_transforms).contiguous()
-        img_weak_vit = img_weak
 
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
