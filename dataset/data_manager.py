@@ -1,5 +1,6 @@
 from .GDRBench import GDRBench
 from . import fundusaug as FundusAug
+from .fundusaug import square_tight_crop
 from torchvision import transforms
 import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
@@ -7,15 +8,12 @@ import torch
 import numpy as np
 from PIL import Image
 
-class SquarePad:
+class SquareTightCropTransform:
+    def __init__(self, target_size=512):
+        self.target_size = target_size
+
     def __call__(self, image):
-        w, h = image.size
-        max_wh = max(w, h)
-        p_left = (max_wh - w) // 2
-        p_top = (max_wh - h) // 2
-        p_right = max_wh - w - p_left
-        p_bottom = max_wh - h - p_top
-        return F.pad(image, (p_left, p_top, p_right, p_bottom), 0, 'constant')
+        return square_tight_crop(image, target_size=self.target_size)
 
 def get_dataset(args, cfg):
     if cfg.ALGORITHM != 'GDRNet' and cfg.ALGORITHM != 'CASS_GDRNet':
@@ -48,9 +46,9 @@ def get_transform(cfg):
     size = 512
     re_size = 512
     normalize = get_normalize()
-    tra_train = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.RandomResizedCrop(re_size, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), normalize])
-    tra_test = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.Resize((re_size, re_size)), transforms.ToTensor(), normalize])
-    tra_mask = transforms.Compose([SquarePad(), transforms.Resize((re_size, re_size)), transforms.ToTensor()])
+    tra_train = transforms.Compose([SquareTightCropTransform(size), transforms.RandomResizedCrop(re_size, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), normalize])
+    tra_test = transforms.Compose([SquareTightCropTransform(size), transforms.ToTensor(), normalize])
+    tra_mask = transforms.Compose([SquareTightCropTransform(re_size), transforms.ToTensor()])
     return tra_train, tra_test, tra_mask
 
 def get_pre_FundusAug(cfg):
@@ -61,9 +59,9 @@ def get_pre_FundusAug(cfg):
     size = 512
     re_size = 512
     normalize = get_normalize()
-    tra_train = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
-    tra_test = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.CenterCrop(re_size), transforms.ToTensor(), normalize])
-    tra_mask = transforms.Compose([SquarePad(), transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST), transforms.ToTensor()])
+    tra_train = transforms.Compose([SquareTightCropTransform(size), transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
+    tra_test = transforms.Compose([SquareTightCropTransform(size), transforms.ToTensor(), normalize])
+    tra_mask = transforms.Compose([SquareTightCropTransform(size), transforms.ToTensor()])
     return tra_train, tra_test, tra_mask
 
 def get_post_FundusAug(cfg):

@@ -424,19 +424,26 @@ class CASS_GDRNet(Algorithm):
         self.m = 0.999
 
         self.base_lr_cnn = cfg.LEARNING_RATE
-        self.base_lr_vit = 5e-4
+        self.base_lr_vit = 2e-5
+        self.base_lr_vit_head = 5e-4
         self.warmup_epochs = 5
 
-        self.cnn_params, self.vit_lora_params = self.network.get_custom_optim_params()
+        self.cnn_params, vit_params_all = self.network.get_custom_optim_params()
 
-        if len(self.vit_lora_params) == 0:
+        if len(vit_params_all) == 0:
             raise RuntimeError("未检测到任何 ViT/LoRA 参数。")
 
-        self.opt_cnn = torch.optim.Adam(self.cnn_params, lr=self.base_lr_cnn, weight_decay=1e-4)
+        network_inner = self.network.module if hasattr(self.network, 'module') else self.network
+        id_to_name = {id(p): n for n, p in network_inner.named_parameters()}
+        self.vit_classifier_params = [p for p in vit_params_all if 'classifier_vit' in id_to_name.get(id(p), '')]
+        self.vit_lora_params = [p for p in vit_params_all if 'classifier_vit' not in id_to_name.get(id(p), '')]
+
+        self.opt_cnn = torch.optim.AdamW(self.cnn_params, lr=1e-4, weight_decay=1e-4)
         self.opt_vit = torch.optim.AdamW(
-            self.vit_lora_params,
-            lr=self.base_lr_vit,
-            weight_decay=0.05,
+            [
+                {'params': self.vit_lora_params, 'lr': self.base_lr_vit, 'weight_decay': 0.05},
+                {'params': self.vit_classifier_params, 'lr': self.base_lr_vit_head, 'weight_decay': 1e-4},
+            ],
             betas=(0.9, 0.999),
         )
 
@@ -474,10 +481,27 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-        self.mild_vit_aug = v2.Compose([
-            v2.Resize((512, 512), antialias=True),
-            v2.ColorJitter(brightness=0.05, contrast=0.05),
+        self.cnn_train_transforms = v2.Compose([
+            v2.RandomResizedCrop(512, scale=(0.6, 1.0), antialias=True),
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomVerticalFlip(p=0.5),
+            v2.RandomRotation(45),
+            v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=5)], p=0.3),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        self.vit_train_transforms = v2.Compose([
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomRotation(10),
+            v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        self.weak_transforms = v2.Compose([
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def _apply_batch_transform(self, images, transform):
+        return torch.stack([transform(img) for img in images], dim=0)
 
     def _compute_cnn_grad_norm(self):
         grad_norm_sq = 0.0
@@ -559,21 +583,10 @@ class CASS_GDRNet(Algorithm):
         mask_float = (mask > 0).to(image.dtype)
 
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
-        img_weak = self.fundusAug['post_aug2'](img_base_pixel.clone()).contiguous()
-
-        img_strong_pixel, mask_strong = self.fundusAug['post_aug1'](image_pixel.clone(), mask.clone())
-        mask_strong = (mask_strong > 0).to(img_strong_pixel.dtype)
-        img_strong_pixel = img_strong_pixel * mask_strong + bg_color * (1.0 - mask_strong)
-        img_strong_cnn_pixel = self.fundusAug['post_aug2'](img_strong_pixel).contiguous()
-        img_strong_cnn = self._ensure_cnn_normalized(img_strong_cnn_pixel)
-
-        img_vit_base = img_base_pixel.clone()
-        img_strong_vit = self.mild_vit_aug(img_vit_base)
-        img_strong_vit = self._vit_normalize(img_strong_vit)
-
-        img_weak_cnn = self._ensure_cnn_normalized(img_weak.clone())
-        img_weak_vit = F.interpolate(img_vit_base, size=(512, 512), mode='bilinear', align_corners=False)
-        img_weak_vit = self._vit_normalize(img_weak_vit)
+        img_weak_cnn = self.weak_transforms(img_base_pixel.clone()).contiguous()
+        img_weak_vit = self.weak_transforms(img_base_pixel.clone()).contiguous()
+        img_strong_cnn = self._apply_batch_transform(img_base_pixel.clone(), self.cnn_train_transforms).contiguous()
+        img_strong_vit = self._apply_batch_transform(img_base_pixel.clone(), self.vit_train_transforms).contiguous()
 
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
@@ -679,15 +692,19 @@ class CASS_GDRNet(Algorithm):
             warmup_factor = (epoch + 1) / self.warmup_epochs
             lr_cnn = self.base_lr_cnn * warmup_factor
             lr_vit = self.base_lr_vit * warmup_factor
+            lr_vit_head = self.base_lr_vit_head * warmup_factor
         else:
             progress = (epoch - self.warmup_epochs) / max(1, (self.max_epochs - self.warmup_epochs))
             cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
             lr_cnn = self.base_lr_cnn * cosine_factor
             lr_vit = self.base_lr_vit * cosine_factor
+            lr_vit_head = self.base_lr_vit_head * cosine_factor
         for param_group in self.opt_cnn.param_groups:
             param_group['lr'] = lr_cnn
-        for param_group in self.opt_vit.param_groups:
-            param_group['lr'] = lr_vit
+        if len(self.opt_vit.param_groups) > 0:
+            self.opt_vit.param_groups[0]['lr'] = lr_vit
+        if len(self.opt_vit.param_groups) > 1:
+            self.opt_vit.param_groups[1]['lr'] = lr_vit_head
         return lr_cnn, lr_vit
 
     def update_epoch(self, epoch):
