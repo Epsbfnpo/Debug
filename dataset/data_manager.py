@@ -8,13 +8,6 @@ import torch
 import numpy as np
 from PIL import Image
 
-class SquareTightCropTransform:
-    def __init__(self, target_size=512):
-        self.target_size = target_size
-
-    def __call__(self, image):
-        return square_tight_crop(image, target_size=self.target_size)
-
 def get_dataset(args, cfg):
     if cfg.ALGORITHM != 'GDRNet' and cfg.ALGORITHM != 'CASS_GDRNet':
         train_ts, test_ts, tra_fundus = get_transform(cfg)
@@ -43,12 +36,11 @@ def get_dataset(args, cfg):
     return train_loader, val_loader, test_loader, dataset_size, train_sampler
 
 def get_transform(cfg):
-    size = 512
     re_size = 512
     normalize = get_normalize()
-    tra_train = transforms.Compose([SquareTightCropTransform(size), transforms.RandomResizedCrop(re_size, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), normalize])
-    tra_test = transforms.Compose([SquareTightCropTransform(size), transforms.ToTensor(), normalize])
-    tra_mask = transforms.Compose([SquareTightCropTransform(re_size), transforms.ToTensor()])
+    tra_train = transforms.Compose([transforms.RandomResizedCrop(re_size, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), normalize])
+    tra_test = transforms.Compose([transforms.ToTensor(), normalize])
+    tra_mask = transforms.Compose([transforms.ToTensor()])
     return tra_train, tra_test, tra_mask
 
 def get_pre_FundusAug(cfg):
@@ -56,12 +48,10 @@ def get_pre_FundusAug(cfg):
     jitter_c = getattr(cfg.TRANSFORM, 'COLORJITTER_C', 0.2)
     jitter_s = getattr(cfg.TRANSFORM, 'COLORJITTER_S', 0.2)
     jitter_h = getattr(cfg.TRANSFORM, 'COLORJITTER_H', 0.1)
-    size = 512
-    re_size = 512
     normalize = get_normalize()
-    tra_train = transforms.Compose([SquareTightCropTransform(size), transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
-    tra_test = transforms.Compose([SquareTightCropTransform(size), transforms.ToTensor(), normalize])
-    tra_mask = transforms.Compose([SquareTightCropTransform(size), transforms.ToTensor()])
+    tra_train = transforms.Compose([transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
+    tra_test = transforms.Compose([transforms.ToTensor(), normalize])
+    tra_mask = transforms.Compose([transforms.ToTensor()])
     return tra_train, tra_test, tra_mask
 
 def get_post_FundusAug(cfg):
