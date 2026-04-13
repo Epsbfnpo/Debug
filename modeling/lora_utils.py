@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import re
 
 def inject_dinov3_lora(model, rank=8, alpha=8.0, dropout=0.1):
     """
@@ -12,7 +13,7 @@ def inject_dinov3_lora(model, rank=8, alpha=8.0, dropout=0.1):
     except ImportError:
         raise ImportError("🔥 严重错误: 请先安装 peft 库 (pip install peft)。这是微调大模型的标准武器。")
 
-    # 🔪 致命修正：完全匹配探针扫出来的底层组件名称
+    # 统一命中注意力/MLP层名，随后再二次冻结为仅最后4个block可训练
     config = LoraConfig(
         r=rank,
         lora_alpha=alpha,
@@ -35,18 +36,23 @@ def inject_dinov3_lora(model, rank=8, alpha=8.0, dropout=0.1):
     # 注入 LoRA
     peft_model = get_peft_model(model, config)
 
-    # 强制确保只有 LoRA 参数可训练
+    # 仅开放最后4个Transformer Block（8~11）的LoRA参数
+    deep_block_pattern = re.compile(r".*(blocks|layer)\.(8|9|10|11)\..*")
     trainable_params = 0
     total_params = 0
     for name, param in peft_model.named_parameters():
         total_params += param.numel()
-        if "lora" in name.lower():
+        is_lora = "lora" in name.lower()
+        is_deep_lora = is_lora and deep_block_pattern.match(name) is not None
+        is_classifier = "classifier" in name.lower()
+        if is_deep_lora or is_classifier:
             param.requires_grad = True
             trainable_params += param.numel()
         else:
             param.requires_grad = False
 
-    print(f"✅ [LoRA Injected] 目标层: q_proj, k_proj, v_proj, o_proj, up_proj, down_proj | Rank: {rank} | Alpha: {alpha}")
+    print(f"✅ [LoRA Injected] 仅训练最后4层 Block(8-11) | Rank: {rank} | Alpha: {alpha}")
     print(f"📊 [LoRA Params] 训练参数: {trainable_params / 1e6:.2f}M / 总参数: {total_params / 1e6:.2f}M")
+    peft_model.print_trainable_parameters()
 
     return peft_model

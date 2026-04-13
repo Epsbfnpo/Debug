@@ -1,6 +1,7 @@
 import os.path as osp
 from torch.utils.data.dataset import Dataset
 from PIL import Image
+from . import fundusaug as FundusAug
 
 class GDRBench(Dataset):
     def __init__(self, root, source_domains, target_domains, mode, trans_basic=None, trans_mask = None, trans_fundus=None):
@@ -63,6 +64,11 @@ class GDRBench(Dataset):
         data = Image.open(self.data[index]).convert("RGB")
         if self.mode == "train":
             mask = Image.open(self.masks[index]).convert("L")
+            crop_bounds = FundusAug.get_square_tight_crop_bounds(data)
+            data = FundusAug.apply_square_crop_from_bounds(data, crop_bounds, target_size=512, fill_value=0, interpolation=Image.BICUBIC)
+            mask = FundusAug.apply_square_crop_from_bounds(mask, crop_bounds, target_size=512, fill_value=0, interpolation=Image.NEAREST)
+        else:
+            data = FundusAug.square_tight_crop(data, target_size=512)
         label = self.label[index]
         domain = self.domain[index]
         if self.trans_basic is not None:
