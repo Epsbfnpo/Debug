@@ -2,12 +2,49 @@ import math
 import numpy as np
 import random
 import torch
+import cv2
 from torchvision import transforms as T
 from torchvision.transforms import functional as F
+from PIL import Image
 
 types=['brightness','contrast','saturation','hue','sharpness','HALO','HOLE','SPOT','BLUR']
 
 levels = {'SH': [0,2], 'HS': [[0,2],[1, 1.2, 1.5, 2],[0.8,0.1,0.05,0.05]], 'HG': [[0.4,0.9],[-0.06,-0.01]], 'SP': [[1,8],[0.01,0.08]], 'IB': [0.1,3]}
+
+def get_square_tight_crop_bounds(img_pil, threshold=10):
+    img_np = np.array(img_pil)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        h, w = img_np.shape[:2]
+        side = max(h, w)
+        return (0, 0, side)
+    c = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+    center_x, center_y = x + w // 2, y + h // 2
+    side = max(w, h)
+    x1 = center_x - side // 2
+    y1 = center_y - side // 2
+    return (x1, y1, side)
+
+def apply_square_crop_from_bounds(img_pil, bounds, target_size=512, fill_value=0, interpolation=Image.BICUBIC):
+    x1, y1, side = bounds
+    img_np = np.array(img_pil)
+    canvas = np.full((side, side, img_np.shape[2] if img_np.ndim == 3 else 1), fill_value, dtype=np.uint8)
+    src_x1, src_y1 = max(0, x1), max(0, y1)
+    src_x2, src_y2 = min(img_np.shape[1], x1 + side), min(img_np.shape[0], y1 + side)
+    dst_x1, dst_y1 = max(0, -x1), max(0, -y1)
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+    if img_np.ndim == 2:
+        canvas = np.full((side, side), fill_value, dtype=np.uint8)
+    canvas[dst_y1:dst_y2, dst_x1:dst_x2] = img_np[src_y1:src_y2, src_x1:src_x2]
+    return Image.fromarray(canvas).resize((target_size, target_size), interpolation)
+
+def square_tight_crop(img_pil, target_size=512):
+    bounds = get_square_tight_crop_bounds(img_pil)
+    return apply_square_crop_from_bounds(img_pil, bounds, target_size=target_size, fill_value=0, interpolation=Image.BICUBIC)
 
 class Compose(object):
     def __init__(self, transforms):
