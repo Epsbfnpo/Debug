@@ -506,6 +506,9 @@ class CASS_GDRNet(Algorithm):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
+    def _apply_batch_transform(self, images, transform):
+        return torch.stack([transform(img) for img in images], dim=0)
+
     def _compute_cnn_grad_norm(self):
         grad_norm_sq = 0.0
         named_params = self.network.module.named_parameters() if hasattr(self.network, 'module') else self.network.named_parameters()
