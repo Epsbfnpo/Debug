@@ -686,7 +686,7 @@ class CASS_GDRNet(Algorithm):
             lambda_grade = 0.5 * ((progress - 0.2) / 0.8)
 
         loss_contrastive = loss_instance + lambda_grade * loss_grade
-        self.dequeue_and_enqueue(raw_target_cnn, raw_target_vit, label)
+        self.dequeue_and_enqueue(z_target_cnn_inst, z_target_vit_inst, label)
 
         loss_main = loss_sup
         loss_dict = {
