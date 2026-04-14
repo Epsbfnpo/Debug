@@ -443,7 +443,7 @@ class CASS_GDRNet(Algorithm):
         id_to_name = {id(p): n for n, p in network_inner.named_parameters()}
         self.vit_head_params = [
             p for p in vit_params_all
-            if 'classifier_vit' in id_to_name.get(id(p), '') or 'projector_vit' in id_to_name.get(id(p), '')
+            if 'classifier_vit' in id_to_name.get(id(p), '') or 'projector_vit' in id_to_name.get(id(p), '') or 'predictor_vit' in id_to_name.get(id(p), '')
         ]
         self.vit_lora_params = [
             p for p in vit_params_all
@@ -625,8 +625,10 @@ class CASS_GDRNet(Algorithm):
             )
 
         res_clean_fp32 = {
-            'proj_cnn': F.normalize(res_combined['proj_cnn'].float(), dim=1),
-            'proj_vit': F.normalize(res_combined['proj_vit'].float(), dim=1),
+            'proj_cnn': res_combined['proj_cnn'].float(),
+            'proj_vit': res_combined['proj_vit'].float(),
+            'pred_cnn': res_combined['pred_cnn'].float(),
+            'pred_vit': res_combined['pred_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
         }
@@ -644,12 +646,32 @@ class CASS_GDRNet(Algorithm):
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
 
-        target_vit_for_vit = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
-        target_cnn_for_cnn = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
         self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
 
-        target_dict = {'target_vit': target_vit_for_vit, 'target_cnn': target_cnn_for_cnn}
-        loss_main, loss_dict, dcr_weight = self.criterion(res_clean_fp32, target_dict, label, domain)
+        dcr_weight = self.criterion.get_dcr_weights(label, domain)
+        loss_sup_cnn = (self.criterion.SupLoss(res_clean_fp32['logits_cnn'], label) * dcr_weight).mean()
+        loss_sup_vit = (self.criterion.SupLoss(res_clean_fp32['logits_vit'], label) * dcr_weight).mean()
+        loss_sup = loss_sup_cnn + loss_sup_vit
+
+        z_target_cnn = F.normalize(res_momentum['proj_cnn'].detach().float(), dim=-1)
+        z_target_vit = F.normalize(res_momentum['proj_vit'].detach().float(), dim=-1)
+        p_online_cnn = F.normalize(res_clean_fp32['pred_cnn'], dim=-1)
+        p_online_vit = F.normalize(res_clean_fp32['pred_vit'], dim=-1)
+
+        loss_sim_cnn_to_vit = - (p_online_cnn * z_target_vit).sum(dim=-1).mean()
+        loss_sim_vit_to_cnn = - (p_online_vit * z_target_cnn).sum(dim=-1).mean()
+        loss_contrastive = 0.5 * (loss_sim_cnn_to_vit + loss_sim_vit_to_cnn)
+
+        lambda_cass = 0.5
+        loss_main = loss_sup + lambda_cass * loss_contrastive
+        loss_dict = {
+            'loss': loss_main.item(),
+            'sup_cnn': loss_sup_cnn.item(),
+            'sup_vit': loss_sup_vit.item(),
+            'loss_contrastive': loss_contrastive.item(),
+            'loss_sim_cnn_to_vit': loss_sim_cnn_to_vit.item(),
+            'loss_sim_vit_to_cnn': loss_sim_vit_to_cnn.item(),
+        }
 
         kd_temp = 2.0
         with torch.no_grad():
@@ -686,8 +708,8 @@ class CASS_GDRNet(Algorithm):
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
             cnn_entropy = compute_entropy(cnn_probs)
 
-            sim_cnn_to_target = F.cosine_similarity(res_clean_fp32['proj_cnn'], target_cnn_for_cnn, dim=-1).mean().item()
-            sim_vit_to_target = F.cosine_similarity(res_clean_fp32['proj_vit'], target_vit_for_vit, dim=-1).mean().item()
+            sim_cnn_to_target = (p_online_cnn * z_target_vit).sum(dim=-1).mean().item()
+            sim_vit_to_target = (p_online_vit * z_target_cnn).sum(dim=-1).mean().item()
 
             feat_norm_cnn_raw = res_combined['proj_cnn'].norm(dim=1).mean().item()
             feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()

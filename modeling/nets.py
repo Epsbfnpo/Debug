@@ -624,13 +624,33 @@ class DualTowerGDRNet(nn.Module):
         self.patch_size = getattr(self.vit.config, 'patch_size', 16)
 
         proj_dim = 1024
-        self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
+        pred_dim = 256
         vit_combined_dim = self.vit_dim
-        self.projector_vit = nn.Sequential(
-            nn.Linear(vit_combined_dim, vit_combined_dim),
-            nn.BatchNorm1d(vit_combined_dim),
+        self.projector_cnn = nn.Sequential(
+            nn.Linear(self.cnn_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(vit_combined_dim, proj_dim)
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim, affine=False),
+        )
+        self.projector_vit = nn.Sequential(
+            nn.Linear(vit_combined_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim, affine=False),
+        )
+        self.predictor_cnn = nn.Sequential(
+            nn.Linear(proj_dim, pred_dim, bias=False),
+            nn.BatchNorm1d(pred_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(pred_dim, proj_dim),
+        )
+        self.predictor_vit = nn.Sequential(
+            nn.Linear(proj_dim, pred_dim, bias=False),
+            nn.BatchNorm1d(pred_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(pred_dim, proj_dim),
         )
 
         self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
@@ -642,7 +662,7 @@ class DualTowerGDRNet(nn.Module):
         )
 
     def get_custom_optim_params(self):
-        vit_modules = [self.vit, self.projector_vit, self.classifier_vit]
+        vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit]
         vit_param_ids = set()
         vit_params = []
 
@@ -688,12 +708,16 @@ class DualTowerGDRNet(nn.Module):
 
         proj_cnn = self.projector_cnn(feat_cnn)
         proj_vit = self.projector_vit(feat_vit_combined)
+        pred_cnn = self.predictor_cnn(proj_cnn)
+        pred_vit = self.predictor_vit(proj_vit)
 
         return {
             'logits_cnn': logits_cnn,
             'logits_vit': logits_vit,
             'proj_cnn': proj_cnn,
             'proj_vit': proj_vit,
+            'pred_cnn': pred_cnn,
+            'pred_vit': pred_vit,
             'drts': None,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
