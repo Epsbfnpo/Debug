@@ -698,6 +698,12 @@ class CASS_GDRNet(Algorithm):
             'loss_grade': loss_grade.item(),
             'lambda_grade': lambda_grade,
         }
+        loss_dict.update({
+            'loss_inst_cnn2vit': loss_inst_cnn2vit.item(),
+            'loss_inst_vit2cnn': loss_inst_vit2cnn.item(),
+            'loss_grade_cnn2vit': loss_grade_cnn2vit.item(),
+            'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
+        })
 
         kd_temp = 2.0
         with torch.no_grad():
@@ -738,8 +744,10 @@ class CASS_GDRNet(Algorithm):
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
             cnn_entropy = compute_entropy(cnn_probs)
 
-            sim_cnn_to_target = (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean().item()
-            sim_vit_to_target = (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean().item()
+            sim_inst_cnn = (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean().item()
+            sim_inst_vit = (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean().item()
+            sim_grade_cnn = (p_online_cnn * z_target_vit_grade).sum(dim=-1).mean().item()
+            sim_grade_vit = (p_online_vit * z_target_cnn_grade).sum(dim=-1).mean().item()
 
             feat_norm_cnn_raw = res_combined['proj_cnn'].norm(dim=1).mean().item()
             feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()
@@ -780,8 +788,10 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_grad_cnn'] = grad_norm_cnn
         loss_dict['probe_grad_lora'] = grad_norm_vit_lora
         loss_dict['probe_grad_head'] = grad_norm_vit_head
-        loss_dict['probe_sim_cnn'] = sim_cnn_to_target
-        loss_dict['probe_sim_vit'] = sim_vit_to_target
+        loss_dict['probe_sim_inst_cnn'] = sim_inst_cnn
+        loss_dict['probe_sim_inst_vit'] = sim_inst_vit
+        loss_dict['probe_sim_grade_cnn'] = sim_grade_cnn
+        loss_dict['probe_sim_grade_vit'] = sim_grade_vit
         loss_dict['probe_ent_ema_teacher'] = ema_vit_entropy
         loss_dict['probe_ent_cnn_student'] = cnn_entropy
         loss_dict['probe_unique_cls_cnn'] = unique_classes_cnn
