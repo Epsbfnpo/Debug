@@ -562,22 +562,27 @@ class CASS_GDRNet(Algorithm):
         self.queue_ptr[0] = (ptr + batch_size) % self.K
 
     @torch.no_grad()
-    def sample_target(self, current_features, labels, target_queue):
-        neighbor = []
+    def sample_queue_mean(self, current_features, labels, target_queue):
+        """
+        Grade-aware 专属靶子生成器：只负责提取同类别的历史共识。
+        包含冷启动安全机制：如果队列中没有同类，平滑退化为当前特征。
+        """
+        targets = []
         for i, label in enumerate(labels):
             pos = torch.where(self.queue_labels == label)[0]
+
             if len(pos) != 0:
-                if self.num_positive > 0:
+                if getattr(self, 'num_positive', 4) > 0:
                     weights = torch.ones_like(pos).float()
                     choice = torch.multinomial(weights, self.num_positive, replacement=True)
-                    idx = pos[choice]
-                    neighbor.append(target_queue[idx].mean(0))
+                    queue_mean = target_queue[pos[choice]].mean(0)
                 else:
-                    neighbor.append(target_queue[pos].mean(0))
+                    queue_mean = target_queue[pos].mean(0)
+                targets.append(queue_mean)
             else:
-                neighbor.append(current_features[i])
-        targets = torch.stack(neighbor, dim=0)
-        return F.normalize(targets, dim=-1)
+                targets.append(current_features[i])
+
+        return F.normalize(torch.stack(targets, dim=0), dim=-1)
 
     def _to_pixel_space(self, x):
         if x.min() < 0.0 or x.max() > 1.0:
@@ -643,34 +648,55 @@ class CASS_GDRNet(Algorithm):
                     return_train_features=True
                 )
             momentum_inner.train(momentum_prev_mode)
-            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
-            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
-
-        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
 
         dcr_weight = self.criterion.get_dcr_weights(label, domain)
         loss_sup_cnn = (self.criterion.SupLoss(res_clean_fp32['logits_cnn'], label) * dcr_weight).mean()
         loss_sup_vit = (self.criterion.SupLoss(res_clean_fp32['logits_vit'], label) * dcr_weight).mean()
         loss_sup = loss_sup_cnn + loss_sup_vit
 
-        z_target_cnn = F.normalize(res_momentum['proj_cnn'].detach().float(), dim=-1)
-        z_target_vit = F.normalize(res_momentum['proj_vit'].detach().float(), dim=-1)
-        p_online_cnn = F.normalize(res_clean_fp32['pred_cnn'], dim=-1)
-        p_online_vit = F.normalize(res_clean_fp32['pred_vit'], dim=-1)
+        # ===================================================================
+        # 🌟 终极解耦对比学习模块 (Decoupled Contrastive Learning)
+        # ===================================================================
+        raw_target_cnn = res_momentum['proj_cnn'].detach().float()
+        raw_target_vit = res_momentum['proj_vit'].detach().float()
 
-        loss_sim_cnn_to_vit = - (p_online_cnn * z_target_vit).sum(dim=-1).mean()
-        loss_sim_vit_to_cnn = - (p_online_vit * z_target_cnn).sum(dim=-1).mean()
-        loss_contrastive = 0.5 * (loss_sim_cnn_to_vit + loss_sim_vit_to_cnn)
+        z_target_cnn_inst = F.normalize(raw_target_cnn, dim=-1)
+        z_target_vit_inst = F.normalize(raw_target_vit, dim=-1)
+        z_target_cnn_grade = self.sample_queue_mean(raw_target_cnn, label, self.queue_cnn)
+        z_target_vit_grade = self.sample_queue_mean(raw_target_vit, label, self.queue_vit)
 
-        lambda_cass = 0.5
-        loss_main = loss_sup + lambda_cass * loss_contrastive
+        p_online_cnn = F.normalize(res_clean_fp32.get('pred_cnn', res_clean_fp32['proj_cnn']), dim=-1)
+        p_online_vit = F.normalize(res_clean_fp32.get('pred_vit', res_clean_fp32['proj_vit']), dim=-1)
+
+        loss_inst_cnn2vit = - (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean()
+        loss_inst_vit2cnn = - (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean()
+        loss_instance = 0.5 * (loss_inst_cnn2vit + loss_inst_vit2cnn)
+
+        loss_grade_cnn2vit = - (p_online_cnn * z_target_vit_grade).sum(dim=-1).mean()
+        loss_grade_vit2cnn = - (p_online_vit * z_target_cnn_grade).sum(dim=-1).mean()
+        loss_grade = 0.5 * (loss_grade_cnn2vit + loss_grade_vit2cnn)
+
+        current_epoch = self.epoch
+        max_epochs = self.cfg.EPOCHS if self.cfg.EPOCHS > 0 else 100
+        progress = current_epoch / max_epochs
+
+        if progress < 0.2:
+            lambda_grade = 0.0
+        else:
+            lambda_grade = 0.5 * ((progress - 0.2) / 0.8)
+
+        loss_contrastive = loss_instance + lambda_grade * loss_grade
+        self.dequeue_and_enqueue(raw_target_cnn, raw_target_vit, label)
+
+        loss_main = loss_sup
         loss_dict = {
             'loss': loss_main.item(),
             'sup_cnn': loss_sup_cnn.item(),
             'sup_vit': loss_sup_vit.item(),
             'loss_contrastive': loss_contrastive.item(),
-            'loss_sim_cnn_to_vit': loss_sim_cnn_to_vit.item(),
-            'loss_sim_vit_to_cnn': loss_sim_vit_to_cnn.item(),
+            'loss_instance': loss_instance.item(),
+            'loss_grade': loss_grade.item(),
+            'lambda_grade': lambda_grade,
         }
 
         kd_temp = 2.0
@@ -695,7 +721,11 @@ class CASS_GDRNet(Algorithm):
             progress = min(1.0, max(0.0, (current_epoch - warmup_epochs) / denom))
             kd_weight = math.exp(-5.0 * (1.0 - progress) ** 2)
 
-        total_loss = loss_main + kd_weight * loss_kd_cnn
+        loss_kd_total = kd_weight * loss_kd_cnn
+        lambda_contrastive = 1.0
+        lambda_ortho = 0.0
+        loss_ortho = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -708,8 +738,8 @@ class CASS_GDRNet(Algorithm):
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
             cnn_entropy = compute_entropy(cnn_probs)
 
-            sim_cnn_to_target = (p_online_cnn * z_target_vit).sum(dim=-1).mean().item()
-            sim_vit_to_target = (p_online_vit * z_target_cnn).sum(dim=-1).mean().item()
+            sim_cnn_to_target = (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean().item()
+            sim_vit_to_target = (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean().item()
 
             feat_norm_cnn_raw = res_combined['proj_cnn'].norm(dim=1).mean().item()
             feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()
