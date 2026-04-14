@@ -447,7 +447,7 @@ class CASS_GDRNet(Algorithm):
         ]
         self.vit_lora_params = [
             p for p in vit_params_all
-            if 'classifier_vit' not in id_to_name.get(id(p), '') and 'projector_vit' not in id_to_name.get(id(p), '')
+            if 'classifier_vit' not in id_to_name.get(id(p), '') and 'projector_vit' not in id_to_name.get(id(p), '') and 'predictor_vit' not in id_to_name.get(id(p), '')
         ]
 
         self.opt_cnn = torch.optim.AdamW(self.cnn_params, lr=1e-4, weight_decay=1e-4)
