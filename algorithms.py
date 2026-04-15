@@ -623,10 +623,25 @@ class CASS_GDRNet(Algorithm):
         mask_float = (mask > 0).to(image.dtype)
 
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
+        img_weak_split = self._local_split(img_base_pixel.clone())
+        img_strong_split = self._local_split(img_base_pixel.clone())
+
         img_weak_cnn = self.weak_transforms_cnn(img_base_pixel.clone()).contiguous()
         img_weak_vit = self.weak_transforms(img_base_pixel.clone()).contiguous()
         img_strong_cnn = self.cnn_train_transforms(img_base_pixel.clone()).contiguous()
         img_strong_vit = self.vit_train_transforms(img_base_pixel.clone()).contiguous()
+        img_weak_split_cnn = self._cnn_normalize(
+            F.interpolate(img_weak_split, size=(112, 112), mode='bilinear', align_corners=False)
+        ).contiguous()
+        img_weak_split_vit = self._vit_normalize(
+            F.interpolate(img_weak_split, size=(256, 256), mode='bilinear', align_corners=False)
+        ).contiguous()
+        img_strong_split_cnn = self._cnn_normalize(
+            F.interpolate(img_strong_split, size=(112, 112), mode='bilinear', align_corners=False)
+        ).contiguous()
+        img_strong_split_vit = self._vit_normalize(
+            F.interpolate(img_strong_split, size=(256, 256), mode='bilinear', align_corners=False)
+        ).contiguous()
 
         img_strong_split = self._local_split(img_base_pixel.clone())
         img_strong_split_cnn = self._cnn_normalize(
@@ -641,6 +656,11 @@ class CASS_GDRNet(Algorithm):
             res_combined = self.network(
                 x_cnn=img_strong_cnn,
                 x_vit=img_strong_vit,
+                return_train_features=True
+            )
+            res_split_student = self.network(
+                x_cnn=img_strong_split_cnn,
+                x_vit=img_strong_split_vit,
                 return_train_features=True
             )
 
@@ -658,6 +678,11 @@ class CASS_GDRNet(Algorithm):
                 res_momentum = momentum_inner(
                     x_cnn=img_weak_cnn,
                     x_vit=img_weak_vit,
+                    return_train_features=True
+                )
+                res_split_teacher = momentum_inner(
+                    x_cnn=img_weak_split_cnn,
+                    x_vit=img_weak_split_vit,
                     return_train_features=True
                 )
             momentum_inner.train(momentum_prev_mode)
@@ -681,6 +706,23 @@ class CASS_GDRNet(Algorithm):
         p_online_cnn = F.normalize(res_clean_fp32.get('pred_cnn', res_clean_fp32['proj_cnn']), dim=-1)
         p_online_vit = F.normalize(res_clean_fp32.get('pred_vit', res_clean_fp32['proj_vit']), dim=-1)
         p_patch_cnn_list = F.normalize(pred_cnn_patch_fp32, dim=-1).chunk(4, dim=0)
+
+        batch_size = label.shape[0]
+        mix_idx = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
+
+        f_cnn_patches_teacher = res_split_teacher['proj_cnn'].detach().float().view(4, batch_size, -1)
+        f_vit_patches_teacher = res_split_teacher['proj_vit'].detach().float().view(4, batch_size, -1)
+        f_cnn_mix_teacher = torch.stack([f_cnn_patches_teacher[idx].mean(0) for idx in mix_idx], dim=0).reshape(4 * batch_size, -1)
+        f_vit_mix_teacher = torch.stack([f_vit_patches_teacher[idx].mean(0) for idx in mix_idx], dim=0).reshape(4 * batch_size, -1)
+        z_mix_cnn_teacher = F.normalize(f_cnn_mix_teacher, dim=-1)
+        z_mix_vit_teacher = F.normalize(f_vit_mix_teacher, dim=-1)
+
+        f_cnn_patches_student = res_split_student['proj_cnn'].float().view(4, batch_size, -1)
+        f_vit_patches_student = res_split_student['proj_vit'].float().view(4, batch_size, -1)
+        f_cnn_mix_student = torch.stack([f_cnn_patches_student[idx].mean(0) for idx in mix_idx], dim=0).reshape(4 * batch_size, -1)
+        f_vit_mix_student = torch.stack([f_vit_patches_student[idx].mean(0) for idx in mix_idx], dim=0).reshape(4 * batch_size, -1)
+        pred_mix_cnn_student = F.normalize(network_inner.predictor_cnn(f_cnn_mix_student), dim=-1)
+        pred_mix_vit_student = F.normalize(network_inner.predictor_vit(f_vit_mix_student), dim=-1)
 
         loss_inst_cnn2vit = - (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean()
         loss_inst_vit2cnn = - (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean()
