@@ -519,6 +519,15 @@ class CASS_GDRNet(Algorithm):
     def _apply_batch_transform(self, images, transform):
         return torch.stack([transform(img) for img in images], dim=0)
 
+    def _local_split(self, x):
+        """将 NxCxHxW 的图片切分为 4NxCx(H/2)x(W/2)。"""
+        _, _, h, w = x.shape
+        h_half, w_half = h // 2, w // 2
+        top, bottom = torch.split(x, h_half, dim=2)
+        top_left, top_right = torch.split(top, w_half, dim=3)
+        bottom_left, bottom_right = torch.split(bottom, w_half, dim=3)
+        return torch.cat([top_left, top_right, bottom_left, bottom_right], dim=0)
+
     def _compute_grad_norms(self):
         grad_norm_cnn = 0.0
         grad_norm_vit_lora = 0.0
@@ -619,6 +628,11 @@ class CASS_GDRNet(Algorithm):
         img_strong_cnn = self.cnn_train_transforms(img_base_pixel.clone()).contiguous()
         img_strong_vit = self.vit_train_transforms(img_base_pixel.clone()).contiguous()
 
+        img_strong_split = self._local_split(img_base_pixel.clone())
+        img_strong_split_cnn = self._cnn_normalize(
+            F.interpolate(img_strong_split, size=(224, 224), mode='bilinear', align_corners=False)
+        ).contiguous()
+
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
             autocast_ctx = lambda: torch.amp.autocast('cuda', dtype=self.amp_dtype)
@@ -630,14 +644,12 @@ class CASS_GDRNet(Algorithm):
                 return_train_features=True
             )
 
-        res_clean_fp32 = {
-            'proj_cnn': res_combined['proj_cnn'].float(),
-            'proj_vit': res_combined['proj_vit'].float(),
-            'pred_cnn': res_combined['pred_cnn'].float(),
-            'pred_vit': res_combined['pred_vit'].float(),
-            'logits_cnn': res_combined['logits_cnn'].float(),
-            'logits_vit': res_combined['logits_vit'].float(),
-        }
+            f_cnn_patch_student = network_inner.cnn(img_strong_split_cnn)
+            proj_cnn_patch_student = network_inner.projector_cnn(f_cnn_patch_student)
+            pred_cnn_patch_student = network_inner.predictor_cnn(proj_cnn_patch_student)
+
+        res_clean_fp32 = {k: v.float() for k, v in res_combined.items() if 'proj' in k or 'pred' in k or 'logits' in k}
+        pred_cnn_patch_fp32 = pred_cnn_patch_student.float()
 
         with torch.no_grad():
             momentum_prev_mode = momentum_inner.training
@@ -668,6 +680,7 @@ class CASS_GDRNet(Algorithm):
 
         p_online_cnn = F.normalize(res_clean_fp32.get('pred_cnn', res_clean_fp32['proj_cnn']), dim=-1)
         p_online_vit = F.normalize(res_clean_fp32.get('pred_vit', res_clean_fp32['proj_vit']), dim=-1)
+        p_patch_cnn_list = F.normalize(pred_cnn_patch_fp32, dim=-1).chunk(4, dim=0)
 
         loss_inst_cnn2vit = - (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean()
         loss_inst_vit2cnn = - (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean()
@@ -676,6 +689,11 @@ class CASS_GDRNet(Algorithm):
         loss_grade_cnn2vit = - (p_online_cnn * z_target_vit_grade).sum(dim=-1).mean()
         loss_grade_vit2cnn = - (p_online_vit * z_target_cnn_grade).sum(dim=-1).mean()
         loss_grade = 0.5 * (loss_grade_cnn2vit + loss_grade_vit2cnn)
+        loss_local_to_global_cnn2vit = 0.0
+        for i in range(4):
+            loss_local_to_global_cnn2vit += - (p_patch_cnn_list[i] * z_target_vit_inst).sum(dim=-1).mean()
+        loss_local_to_global_cnn2vit = loss_local_to_global_cnn2vit / 4.0
+        loss_fastmoco = loss_local_to_global_cnn2vit
 
         current_epoch = self.epoch
         max_epochs = self.cfg.EPOCHS if self.cfg.EPOCHS > 0 else 100
@@ -686,7 +704,7 @@ class CASS_GDRNet(Algorithm):
         else:
             lambda_grade = 0.5 * ((progress - 0.2) / 0.8)
 
-        loss_contrastive = loss_instance + lambda_grade * loss_grade
+        loss_contrastive = loss_instance + lambda_grade * loss_grade + 0.5 * loss_fastmoco
         self.dequeue_and_enqueue(z_target_cnn_inst, z_target_vit_inst, label)
 
         loss_main = loss_sup
@@ -697,6 +715,7 @@ class CASS_GDRNet(Algorithm):
             'loss_contrastive': loss_contrastive.item(),
             'loss_instance': loss_instance.item(),
             'loss_grade': loss_grade.item(),
+            'loss_fastmoco': loss_fastmoco.item(),
             'lambda_grade': lambda_grade,
         }
         loss_dict.update({
@@ -704,6 +723,7 @@ class CASS_GDRNet(Algorithm):
             'loss_inst_vit2cnn': loss_inst_vit2cnn.item(),
             'loss_grade_cnn2vit': loss_grade_cnn2vit.item(),
             'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
+            'loss_local_to_global_cnn2vit': loss_local_to_global_cnn2vit.item(),
         })
 
         kd_temp = 2.0
