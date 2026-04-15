@@ -494,7 +494,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.cnn_train_transforms = v2.Compose([
-            v2.RandomResizedCrop(512, scale=(0.6, 1.0), antialias=True),
+            v2.RandomResizedCrop(224, scale=(0.6, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
             v2.RandomRotation(45),
@@ -511,7 +511,8 @@ class CASS_GDRNet(Algorithm):
         self.weak_transforms = v2.Compose([
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        self.weak_transforms = v2.Compose([
+        self.weak_transforms_cnn = v2.Compose([
+            v2.Resize((224, 224), antialias=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
@@ -613,7 +614,7 @@ class CASS_GDRNet(Algorithm):
         mask_float = (mask > 0).to(image.dtype)
 
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
-        img_weak_cnn = self.weak_transforms(img_base_pixel.clone()).contiguous()
+        img_weak_cnn = self.weak_transforms_cnn(img_base_pixel.clone()).contiguous()
         img_weak_vit = self.weak_transforms(img_base_pixel.clone()).contiguous()
         img_strong_cnn = self.cnn_train_transforms(img_base_pixel.clone()).contiguous()
         img_strong_vit = self.vit_train_transforms(img_base_pixel.clone()).contiguous()
@@ -845,7 +846,8 @@ class CASS_GDRNet(Algorithm):
 
         x_masked = x * mask
         x_vit = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
-        return self.network(x_cnn=x_masked, x_vit=x_vit)
+        x_cnn = F.interpolate(x_masked, size=(224, 224), mode='bilinear', align_corners=False)
+        return self.network(x_cnn=x_cnn, x_vit=x_vit)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
