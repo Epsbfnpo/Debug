@@ -40,6 +40,8 @@ _C.GDRNET.LORA_R = 8
 _C.GDRNET.LORA_ALPHA = 8.0
 _C.GDRNET.LORA_DROPOUT = 0.1
 _C.GDRNET.DINOV3_PATH = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16"
+_C.GDRNET.USE_RMLP_VIT = True
+_C.GDRNET.RMLP_AMPLITUDE = 0.1
 
 _C.TRANSFORM = CN()
 _C.TRANSFORM.NAME = []
