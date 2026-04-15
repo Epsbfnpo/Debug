@@ -607,6 +607,40 @@ class RobustViTHead(nn.Module):
     def forward(self, x):
         return self.head(x)
 
+class RMLP_Projector(nn.Module):
+    """
+    修正版 RMLP 投影头。
+    1. 动态采样（Dynamic Sampling）：保持“概率球”的正则化物理特性，作为特征级 Data Augmentation。
+    2. 修正标准差（Math Correction）：严格应用 sqrt(amplitude / dim)，修复官方代码低级 Bug。
+    """
+    def __init__(self, inp_dim: int = 768, out_dim: int = 1024, hidden_dim: int = 1024, amplitude: float = 0.1):
+        super().__init__()
+        self.inp_dim = inp_dim
+        self.out_dim = out_dim
+        self.hidden_dim = hidden_dim
+        self.amplitude = amplitude
+        self.gelu = nn.GELU()
+
+        self.std1 = math.sqrt(amplitude / hidden_dim)
+        self.std2 = math.sqrt(amplitude / hidden_dim)
+        self.std3 = math.sqrt(amplitude / out_dim)
+
+    def forward(self, x: torch.Tensor):
+        noise1 = torch.normal(0.0, self.std1, (self.inp_dim, self.hidden_dim), device=x.device, dtype=x.dtype)
+        eye1 = torch.eye(self.inp_dim, self.hidden_dim, device=x.device, dtype=x.dtype)
+        w1 = torch.matmul(x, eye1 + noise1)
+        w1 = self.gelu(w1)
+
+        noise2 = torch.normal(0.0, self.std2, (self.hidden_dim, self.hidden_dim), device=x.device, dtype=x.dtype)
+        eye2 = torch.eye(self.hidden_dim, self.hidden_dim, device=x.device, dtype=x.dtype)
+        w2 = torch.matmul(w1, eye2 + noise2)
+        w2 = self.gelu(w2)
+
+        noise3 = torch.normal(0.0, self.std3, (self.hidden_dim, self.out_dim), device=x.device, dtype=x.dtype)
+        eye3 = torch.eye(self.hidden_dim, self.out_dim, device=x.device, dtype=x.dtype)
+        w3 = torch.matmul(w2, eye3 + noise3)
+        return w3
+
 class DualTowerGDRNet(nn.Module):
     def __init__(self, cfg):
         super(DualTowerGDRNet, self).__init__()
@@ -633,13 +667,26 @@ class DualTowerGDRNet(nn.Module):
             nn.Linear(proj_dim, proj_dim, bias=False),
             nn.BatchNorm1d(proj_dim, affine=False),
         )
-        self.projector_vit = nn.Sequential(
-            nn.Linear(vit_combined_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim, affine=False),
-        )
+        self.use_rmlp_vit = getattr(cfg.GDRNET, 'USE_RMLP_VIT', True)
+        self.rmlp_amplitude = getattr(cfg.GDRNET, 'RMLP_AMPLITUDE', 0.1)
+
+        if self.use_rmlp_vit:
+            print(f"🚀 [DualTowerGDRNet] Activated RMLP for ViT Projector with amplitude {self.rmlp_amplitude}")
+            self.projector_vit = RMLP_Projector(
+                inp_dim=vit_combined_dim,
+                out_dim=proj_dim,
+                hidden_dim=proj_dim,
+                amplitude=self.rmlp_amplitude
+            )
+        else:
+            print("🚀 [DualTowerGDRNet] Using Standard MLP for ViT Projector")
+            self.projector_vit = nn.Sequential(
+                nn.Linear(vit_combined_dim, proj_dim, bias=False),
+                nn.BatchNorm1d(proj_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_dim, proj_dim, bias=False),
+                nn.BatchNorm1d(proj_dim, affine=False),
+            )
         self.predictor_cnn = nn.Sequential(
             nn.Linear(proj_dim, pred_dim, bias=False),
             nn.BatchNorm1d(pred_dim),
