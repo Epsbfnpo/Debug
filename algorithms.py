@@ -643,6 +643,11 @@ class CASS_GDRNet(Algorithm):
             F.interpolate(img_strong_split, size=(256, 256), mode='bilinear', align_corners=False)
         ).contiguous()
 
+        img_strong_split = self._local_split(img_base_pixel.clone())
+        img_strong_split_cnn = self._cnn_normalize(
+            F.interpolate(img_strong_split, size=(224, 224), mode='bilinear', align_corners=False)
+        ).contiguous()
+
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
             autocast_ctx = lambda: torch.amp.autocast('cuda', dtype=self.amp_dtype)
@@ -659,14 +664,12 @@ class CASS_GDRNet(Algorithm):
                 return_train_features=True
             )
 
-        res_clean_fp32 = {
-            'proj_cnn': res_combined['proj_cnn'].float(),
-            'proj_vit': res_combined['proj_vit'].float(),
-            'pred_cnn': res_combined['pred_cnn'].float(),
-            'pred_vit': res_combined['pred_vit'].float(),
-            'logits_cnn': res_combined['logits_cnn'].float(),
-            'logits_vit': res_combined['logits_vit'].float(),
-        }
+            f_cnn_patch_student = network_inner.cnn(img_strong_split_cnn)
+            proj_cnn_patch_student = network_inner.projector_cnn(f_cnn_patch_student)
+            pred_cnn_patch_student = network_inner.predictor_cnn(proj_cnn_patch_student)
+
+        res_clean_fp32 = {k: v.float() for k, v in res_combined.items() if 'proj' in k or 'pred' in k or 'logits' in k}
+        pred_cnn_patch_fp32 = pred_cnn_patch_student.float()
 
         with torch.no_grad():
             momentum_prev_mode = momentum_inner.training
@@ -702,6 +705,7 @@ class CASS_GDRNet(Algorithm):
 
         p_online_cnn = F.normalize(res_clean_fp32.get('pred_cnn', res_clean_fp32['proj_cnn']), dim=-1)
         p_online_vit = F.normalize(res_clean_fp32.get('pred_vit', res_clean_fp32['proj_vit']), dim=-1)
+        p_patch_cnn_list = F.normalize(pred_cnn_patch_fp32, dim=-1).chunk(4, dim=0)
 
         batch_size = label.shape[0]
         mix_idx = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
@@ -727,9 +731,11 @@ class CASS_GDRNet(Algorithm):
         loss_grade_cnn2vit = - (p_online_cnn * z_target_vit_grade).sum(dim=-1).mean()
         loss_grade_vit2cnn = - (p_online_vit * z_target_cnn_grade).sum(dim=-1).mean()
         loss_grade = 0.5 * (loss_grade_cnn2vit + loss_grade_vit2cnn)
-        loss_fastmoco_cnn2vit = - (pred_mix_cnn_student * z_mix_vit_teacher).sum(dim=-1).mean()
-        loss_fastmoco_vit2cnn = - (pred_mix_vit_student * z_mix_cnn_teacher).sum(dim=-1).mean()
-        loss_fastmoco = 0.5 * (loss_fastmoco_cnn2vit + loss_fastmoco_vit2cnn)
+        loss_local_to_global_cnn2vit = 0.0
+        for i in range(4):
+            loss_local_to_global_cnn2vit += - (p_patch_cnn_list[i] * z_target_vit_inst).sum(dim=-1).mean()
+        loss_local_to_global_cnn2vit = loss_local_to_global_cnn2vit / 4.0
+        loss_fastmoco = loss_local_to_global_cnn2vit
 
         current_epoch = self.epoch
         max_epochs = self.cfg.EPOCHS if self.cfg.EPOCHS > 0 else 100
@@ -759,8 +765,7 @@ class CASS_GDRNet(Algorithm):
             'loss_inst_vit2cnn': loss_inst_vit2cnn.item(),
             'loss_grade_cnn2vit': loss_grade_cnn2vit.item(),
             'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
-            'loss_fastmoco_cnn2vit': loss_fastmoco_cnn2vit.item(),
-            'loss_fastmoco_vit2cnn': loss_fastmoco_vit2cnn.item(),
+            'loss_local_to_global_cnn2vit': loss_local_to_global_cnn2vit.item(),
         })
 
         kd_temp = 2.0
