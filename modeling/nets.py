@@ -607,6 +607,34 @@ class RobustViTHead(nn.Module):
     def forward(self, x):
         return self.head(x)
 
+class RMLP_Projector(nn.Module):
+    """
+    终极混合 RMLP 投影头 (容量保全 + 拓扑正则)
+    1. 非线性容量：恢复 Linear-ReLU-Linear 结构，保住对比学习的表征映射能力。
+    2. 终末 RMLP：仅在输出前的一瞬间展开概率球，阻断捷径，拒绝伪影。
+    """
+    def __init__(self, inp_dim: int, proj_dim: int = 1024, amplitude: float = 0.1):
+        super().__init__()
+        self.learnable_proj = nn.Sequential(
+            nn.Linear(inp_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim, affine=False),
+        )
+
+        self.std = math.sqrt(amplitude / proj_dim)
+        self.register_buffer("eye_rmlp", torch.eye(proj_dim, proj_dim), persistent=False)
+
+    def forward(self, x: torch.Tensor):
+        x = self.learnable_proj(x)
+
+        dtype = x.dtype
+        noise = torch.normal(0.0, self.std, self.eye_rmlp.shape, device=x.device, dtype=dtype)
+        x = torch.matmul(x, self.eye_rmlp.to(dtype) + noise)
+
+        return x
+
 class DualTowerGDRNet(nn.Module):
     def __init__(self, cfg):
         super(DualTowerGDRNet, self).__init__()
@@ -626,20 +654,37 @@ class DualTowerGDRNet(nn.Module):
         proj_dim = 1024
         pred_dim = 256
         vit_combined_dim = self.vit_dim
-        self.projector_cnn = nn.Sequential(
-            nn.Linear(self.cnn_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim, affine=False),
-        )
-        self.projector_vit = nn.Sequential(
-            nn.Linear(vit_combined_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, proj_dim, bias=False),
-            nn.BatchNorm1d(proj_dim, affine=False),
-        )
+        self.use_rmlp_vit = getattr(cfg.GDRNET, 'USE_RMLP_VIT', True)
+        self.rmlp_amplitude = getattr(cfg.GDRNET, 'RMLP_AMPLITUDE', 0.1)
+
+        if self.use_rmlp_vit:
+            print(f"🚀 Using SYMMETRIC RMLP for BOTH Projectors with amplitude {self.rmlp_amplitude}")
+            self.projector_cnn = RMLP_Projector(
+                inp_dim=self.cnn_dim,
+                proj_dim=proj_dim,
+                amplitude=self.rmlp_amplitude
+            )
+            self.projector_vit = RMLP_Projector(
+                inp_dim=vit_combined_dim,
+                proj_dim=proj_dim,
+                amplitude=self.rmlp_amplitude
+            )
+        else:
+            print("🚀 [DualTowerGDRNet] Using Standard MLP for ViT Projector")
+            self.projector_cnn = nn.Sequential(
+                nn.Linear(self.cnn_dim, proj_dim, bias=False),
+                nn.BatchNorm1d(proj_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_dim, proj_dim, bias=False),
+                nn.BatchNorm1d(proj_dim, affine=False),
+            )
+            self.projector_vit = nn.Sequential(
+                nn.Linear(vit_combined_dim, proj_dim, bias=False),
+                nn.BatchNorm1d(proj_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_dim, proj_dim, bias=False),
+                nn.BatchNorm1d(proj_dim, affine=False),
+            )
         self.predictor_cnn = nn.Sequential(
             nn.Linear(proj_dim, pred_dim, bias=False),
             nn.BatchNorm1d(pred_dim),
