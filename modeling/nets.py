@@ -609,35 +609,29 @@ class RobustViTHead(nn.Module):
 
 class RMLP_Projector(nn.Module):
     """
-    终极跨模态 RMLP 投影头 (修复维度灾难 + 阻断捷径)
-    1. 可学习对齐：解决 768->1024 的截断补零问题，保证特征容量。
-    2. 方阵 RMLP：仅在 1024 维的对称空间内进行概率球拓扑正则化。
+    终极混合 RMLP 投影头 (容量保全 + 拓扑正则)
+    1. 非线性容量：恢复 Linear-ReLU-Linear 结构，保住对比学习的表征映射能力。
+    2. 终末 RMLP：仅在输出前的一瞬间展开概率球，阻断捷径，拒绝伪影。
     """
     def __init__(self, inp_dim: int, proj_dim: int = 1024, amplitude: float = 0.1):
         super().__init__()
-        self.proj_dim = proj_dim
-        self.amplitude = amplitude
-        self.gelu = nn.GELU()
-
-        self.align_layer = nn.Linear(inp_dim, proj_dim, bias=False)
-        self.bn_align = nn.BatchNorm1d(proj_dim)
+        self.learnable_proj = nn.Sequential(
+            nn.Linear(inp_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim, affine=False),
+        )
 
         self.std = math.sqrt(amplitude / proj_dim)
-        self.register_buffer("eye_rmlp1", torch.eye(proj_dim, proj_dim), persistent=False)
-        self.register_buffer("eye_rmlp2", torch.eye(proj_dim, proj_dim), persistent=False)
+        self.register_buffer("eye_rmlp", torch.eye(proj_dim, proj_dim), persistent=False)
 
     def forward(self, x: torch.Tensor):
-        x = self.align_layer(x)
-        x = self.bn_align(x)
-        x = self.gelu(x)
+        x = self.learnable_proj(x)
 
         dtype = x.dtype
-        noise1 = torch.normal(0.0, self.std, self.eye_rmlp1.shape, device=x.device, dtype=dtype)
-        x = torch.matmul(x, self.eye_rmlp1.to(dtype) + noise1)
-        x = self.gelu(x)
-
-        noise2 = torch.normal(0.0, self.std, self.eye_rmlp2.shape, device=x.device, dtype=dtype)
-        x = torch.matmul(x, self.eye_rmlp2.to(dtype) + noise2)
+        noise = torch.normal(0.0, self.std, self.eye_rmlp.shape, device=x.device, dtype=dtype)
+        x = torch.matmul(x, self.eye_rmlp.to(dtype) + noise)
 
         return x
 
