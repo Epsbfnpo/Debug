@@ -706,15 +706,29 @@ class CASS_GDRNet(Algorithm):
             'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
         })
 
+        # ==========================================
+        # 改进版：双向互蒸馏 (Mutual KD) + Label Smoothing
+        # 融合了复杂版的目标混合策略与简化版的 EMA 稳定性及 Warmup 机制
+        # ==========================================
         kd_temp = 2.0
+        kd_alpha = 0.5
+        label_smooth = 0.1
+        num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
-            # 【绝杀修复】：采纳同事的意见，使用极其平稳的 EMA 动量网络提供教师软标签！
-            # 彻底切断 Online ViT 带来的快速过拟合污染。
+            true_dist = F.one_hot(label, num_classes=num_classes).float()
+            true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
+
             vit_soft = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
+            cnn_soft = F.softmax(res_momentum['logits_cnn'].detach() / kd_temp, dim=1)
+
+            mixed_target_for_cnn = kd_alpha * vit_soft + (1.0 - kd_alpha) * true_dist
+            mixed_target_for_vit = kd_alpha * cnn_soft + (1.0 - kd_alpha) * true_dist
 
         log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = F.kl_div(log_prob_cnn, vit_soft, reduction='none').sum(dim=1)
-        loss_kd_cnn = (loss_kd_cnn * dcr_weight).mean() * (kd_temp ** 2)
+        loss_kd_cnn = (-torch.sum(mixed_target_for_cnn * log_prob_cnn, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
+
+        log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
+        loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
 
         loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
@@ -728,7 +742,7 @@ class CASS_GDRNet(Algorithm):
             progress = min(1.0, max(0.0, (current_epoch - warmup_epochs) / denom))
             kd_weight = math.exp(-5.0 * (1.0 - progress) ** 2)
 
-        loss_kd_total = kd_weight * loss_kd_cnn
+        loss_kd_total = kd_weight * (loss_kd_cnn + loss_kd_vit)
         lambda_contrastive = 1.0
         lambda_ortho = 0.0
         loss_ortho = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
@@ -783,7 +797,9 @@ class CASS_GDRNet(Algorithm):
                 else:
                     param_k.data.copy_(param_q.data)
 
-        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
+        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item() if kd_weight > 0 else 0.0
+        loss_dict['loss_kd_vit'] = loss_kd_vit.item() if kd_weight > 0 else 0.0
+        loss_dict['loss_kd_total'] = loss_kd_total.item()
         loss_dict['kd_weight'] = kd_weight
         loss_dict['loss_at'] = loss_at.item()
         loss_dict['probe_grad_cnn'] = grad_norm_cnn
