@@ -707,28 +707,23 @@ class CASS_GDRNet(Algorithm):
         })
 
         # ==========================================
-        # 改进版：双向互蒸馏 (Mutual KD) + Label Smoothing
-        # 融合了复杂版的目标混合策略与简化版的 EMA 稳定性及 Warmup 机制
+        # 真正完美的双向互蒸馏 (Mutual KD)
+        # 1) KD 只做分布对齐，不再混入 true_dist，避免与 supervised CE 双重计算
+        # 2) 纯 KL + T^2 缩放，保证温度补偿的数学一致性
         # ==========================================
         kd_temp = 2.0
         kd_alpha = 0.5
         label_smooth = 0.1
         num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
-            true_dist = F.one_hot(label, num_classes=num_classes).float()
-            true_dist = true_dist * (1.0 - label_smooth) + (label_smooth / num_classes)
-
             vit_soft = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
             cnn_soft = F.softmax(res_momentum['logits_cnn'].detach() / kd_temp, dim=1)
 
-            mixed_target_for_cnn = kd_alpha * vit_soft + (1.0 - kd_alpha) * true_dist
-            mixed_target_for_vit = kd_alpha * cnn_soft + (1.0 - kd_alpha) * true_dist
-
         log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = (-torch.sum(mixed_target_for_cnn * log_prob_cnn, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
+        loss_kd_cnn = (F.kl_div(log_prob_cnn, vit_soft, reduction='none').sum(dim=1) * dcr_weight).mean() * (kd_temp ** 2)
 
         log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
-        loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
+        loss_kd_vit = (F.kl_div(log_prob_vit, cnn_soft, reduction='none').sum(dim=1) * dcr_weight).mean() * (kd_temp ** 2)
 
         loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
