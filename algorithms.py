@@ -480,6 +480,11 @@ class CASS_GDRNet(Algorithm):
         self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+        self.prototype_momentum = getattr(cfg, 'PROTOTYPE_MOMENTUM', 0.9)
+        num_classes = cfg.DATASET.NUM_CLASSES
+        self.register_buffer("class_proto_cnn", F.normalize(torch.randn(num_classes, proj_dim), dim=-1))
+        self.register_buffer("class_proto_vit", F.normalize(torch.randn(num_classes, proj_dim), dim=-1))
+        self.register_buffer("class_proto_initialized", torch.zeros(num_classes, dtype=torch.bool))
 
         self.split_num = 2
         self.combs = 3
@@ -564,13 +569,18 @@ class CASS_GDRNet(Algorithm):
         self.queue_ptr[0] = (ptr + batch_size) % self.K
 
     @torch.no_grad()
-    def sample_queue_mean(self, current_features, labels, target_queue):
+    def sample_queue_mean(self, current_features, labels, target_queue, class_prototypes):
         """
         Grade-aware 专属靶子生成器：只负责提取同类别的历史共识。
         包含冷启动安全机制：如果队列中没有同类，平滑退化为当前特征。
         """
         targets = []
         for i, label in enumerate(labels):
+            class_idx = int(label.item())
+            if class_idx < class_prototypes.shape[0] and self.class_proto_initialized[class_idx]:
+                targets.append(class_prototypes[class_idx])
+                continue
+
             pos = torch.where(self.queue_labels == label)[0]
 
             if len(pos) != 0:
@@ -584,7 +594,40 @@ class CASS_GDRNet(Algorithm):
             else:
                 targets.append(current_features[i])
 
-        return F.normalize(torch.stack(targets, dim=0), dim=-1)
+        return F.normalize(torch.stack(targets, dim=0), dim=-1, eps=1e-6)
+
+    @torch.no_grad()
+    def _update_class_prototypes(self, feat_cnn, feat_vit, labels):
+        feat_cnn = self.concat_all_gather(feat_cnn.float())
+        feat_vit = self.concat_all_gather(feat_vit.float())
+        labels = self.concat_all_gather(labels)
+
+        unique_labels = torch.unique(labels)
+        for cls in unique_labels:
+            cls_idx = int(cls.item())
+            mask = labels == cls
+            if mask.sum() == 0:
+                continue
+
+            batch_center_cnn = F.normalize(feat_cnn[mask].mean(dim=0), dim=0, eps=1e-6)
+            batch_center_vit = F.normalize(feat_vit[mask].mean(dim=0), dim=0, eps=1e-6)
+
+            if not self.class_proto_initialized[cls_idx]:
+                self.class_proto_cnn[cls_idx] = batch_center_cnn
+                self.class_proto_vit[cls_idx] = batch_center_vit
+                self.class_proto_initialized[cls_idx] = True
+            else:
+                mom = self.prototype_momentum
+                self.class_proto_cnn[cls_idx] = F.normalize(
+                    mom * self.class_proto_cnn[cls_idx] + (1.0 - mom) * batch_center_cnn,
+                    dim=0,
+                    eps=1e-6,
+                )
+                self.class_proto_vit[cls_idx] = F.normalize(
+                    mom * self.class_proto_vit[cls_idx] + (1.0 - mom) * batch_center_vit,
+                    dim=0,
+                    eps=1e-6,
+                )
 
     def _to_pixel_space(self, x):
         if x.min() < 0.0 or x.max() > 1.0:
@@ -664,8 +707,9 @@ class CASS_GDRNet(Algorithm):
 
         z_target_cnn_inst = F.normalize(raw_target_cnn, dim=-1)
         z_target_vit_inst = F.normalize(raw_target_vit, dim=-1)
-        z_target_cnn_grade = self.sample_queue_mean(raw_target_cnn, label, self.queue_cnn)
-        z_target_vit_grade = self.sample_queue_mean(raw_target_vit, label, self.queue_vit)
+        self._update_class_prototypes(z_target_cnn_inst, z_target_vit_inst, label)
+        z_target_cnn_grade = self.sample_queue_mean(raw_target_cnn, label, self.queue_cnn, self.class_proto_cnn)
+        z_target_vit_grade = self.sample_queue_mean(raw_target_vit, label, self.queue_vit, self.class_proto_vit)
 
         p_online_cnn = F.normalize(res_clean_fp32.get('pred_cnn', res_clean_fp32['proj_cnn']), dim=-1)
         p_online_vit = F.normalize(res_clean_fp32.get('pred_vit', res_clean_fp32['proj_vit']), dim=-1)
@@ -721,10 +765,10 @@ class CASS_GDRNet(Algorithm):
             cnn_soft = F.softmax(res_momentum['logits_cnn'].detach() / kd_temp, dim=1)
 
         log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = (F.kl_div(log_prob_cnn, vit_soft, reduction='none').sum(dim=1) * dcr_weight).mean() * (kd_temp ** 2)
+        loss_kd_cnn = F.kl_div(log_prob_cnn, vit_soft, reduction='batchmean') * (kd_temp ** 2)
 
         log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
-        loss_kd_vit = (F.kl_div(log_prob_vit, cnn_soft, reduction='none').sum(dim=1) * dcr_weight).mean() * (kd_temp ** 2)
+        loss_kd_vit = F.kl_div(log_prob_vit, cnn_soft, reduction='batchmean') * (kd_temp ** 2)
 
         loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
