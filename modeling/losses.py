@@ -137,7 +137,7 @@ class GDRNetLoss_Integrated(nn.Module):
         self.register_buffer('domain_counts', torch.tensor(selected_domain_nums, dtype=torch.float))
         self.register_buffer('label_counts', torch.tensor(selected_label_nums, dtype=torch.float))
         self.beta = beta
-        self.SupLoss = nn.CrossEntropyLoss(reduction='none')
+        self.SupLoss = nn.CrossEntropyLoss(label_smoothing=0.1, reduction='none')
         self.MSELoss = nn.MSELoss(reduction='none')
 
     def multinomial_smoothing(self, probs, beta):
