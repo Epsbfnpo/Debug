@@ -757,6 +757,9 @@ class CASS_GDRNet(Algorithm):
         # 2) 纯 KL + T^2 缩放，保证温度补偿的数学一致性
         # ==========================================
         kd_temp = 2.0
+        kd_alpha = 0.5
+        label_smooth = 0.1
+        num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
             vit_soft = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
             cnn_soft = F.softmax(res_momentum['logits_cnn'].detach() / kd_temp, dim=1)
