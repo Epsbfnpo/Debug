@@ -127,7 +127,8 @@ class GDRNet(ERM):
         self.split_num = 2
         self.combs = 3
         self.fundusAug = get_post_FundusAug(cfg)
-        self.criterion = GDRNetLoss_Integrated(max_iteration=cfg.EPOCHS, training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA, gamma=cfg.GDRNET.GAMMA)
+        # 对齐 GDRNetLoss_Integrated 最新签名，避免运行 GDRNet 基线时参数不匹配
+        self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.optimizer = torch.optim.Adam([{"params": self.network.parameters()}, {"params": self.classifier.parameters()}, {"params": self.projector.parameters()}, {"params": self.predictor.parameters()}], lr=cfg.LEARNING_RATE, weight_decay=0.0001)
 
     @torch.no_grad()
@@ -749,8 +750,9 @@ class CASS_GDRNet(Algorithm):
             unique_classes_cnn = len(torch.unique(pred_cnn_classes))
             unique_classes_vit = len(torch.unique(pred_vit_classes))
 
-            vit_soft_probs = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
-            ema_vit_entropy = compute_entropy(vit_soft_probs)
+            # 监控熵时使用真实温度 T=1.0，避免日志被蒸馏温度扭曲
+            vit_probs_for_log = F.softmax(res_momentum['logits_vit'].detach(), dim=1)
+            ema_vit_entropy = compute_entropy(vit_probs_for_log)
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
             cnn_entropy = compute_entropy(cnn_probs)
 
