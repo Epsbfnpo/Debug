@@ -2,6 +2,7 @@ from .GDRBench import GDRBench
 from . import fundusaug as FundusAug
 from .fundusaug import square_tight_crop
 from torchvision import transforms
+import torchvision.transforms.v2 as v2
 import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import torch
@@ -38,19 +39,50 @@ def get_dataset(args, cfg):
 def get_transform(cfg):
     re_size = 512
     normalize = get_normalize()
-    tra_train = transforms.Compose([transforms.RandomResizedCrop(re_size, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), normalize])
-    tra_test = transforms.Compose([transforms.ToTensor(), normalize])
+    tra_train = v2.Compose([
+        lambda img: square_tight_crop(img, target_size=re_size),
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomVerticalFlip(p=0.5),
+        v2.RandomRotation(45),
+        v2.ColorJitter(0.3, 0.3, 0.3, 0.05),
+        v2.ToTensor(),
+        normalize,
+    ])
+    tra_test = v2.Compose([
+        lambda img: square_tight_crop(img, target_size=re_size),
+        v2.ToTensor(),
+        normalize,
+    ])
     tra_mask = transforms.Compose([transforms.ToTensor()])
     return tra_train, tra_test, tra_mask
 
 def get_pre_FundusAug(cfg):
-    jitter_b = getattr(cfg.TRANSFORM, 'COLORJITTER_B', 0.2)
-    jitter_c = getattr(cfg.TRANSFORM, 'COLORJITTER_C', 0.2)
-    jitter_s = getattr(cfg.TRANSFORM, 'COLORJITTER_S', 0.2)
-    jitter_h = getattr(cfg.TRANSFORM, 'COLORJITTER_H', 0.1)
+    jitter_b = getattr(cfg.TRANSFORM, 'COLORJITTER_B', 0.3)
+    jitter_c = getattr(cfg.TRANSFORM, 'COLORJITTER_C', 0.3)
+    jitter_s = getattr(cfg.TRANSFORM, 'COLORJITTER_S', 0.3)
+    jitter_h = getattr(cfg.TRANSFORM, 'COLORJITTER_H', 0.05)
     normalize = get_normalize()
-    tra_train = transforms.Compose([transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
-    tra_test = transforms.Compose([transforms.ToTensor(), normalize])
+
+    weak_transforms = v2.Compose([
+        lambda img: square_tight_crop(img, target_size=512),
+        v2.Resize((512, 512), antialias=True),
+        v2.ToTensor(),
+        normalize,
+    ])
+
+    vit_train_transforms = v2.Compose([
+        lambda img: square_tight_crop(img, target_size=512),
+        v2.Resize((512, 512), antialias=True),
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomVerticalFlip(p=0.5),
+        v2.RandomRotation(45),
+        v2.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h),
+        v2.ToTensor(),
+        normalize,
+    ])
+
+    tra_train = vit_train_transforms
+    tra_test = weak_transforms
     tra_mask = transforms.Compose([transforms.ToTensor()])
     return tra_train, tra_test, tra_mask
 
