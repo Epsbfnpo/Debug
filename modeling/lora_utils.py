@@ -5,10 +5,20 @@ from peft import LoraConfig, get_peft_model
 
 def inject_dinov3_lora(model, rank=8, alpha=16.0, dropout=0.0):
     """
-    全层精准注入 LoRA：覆盖 Attention (qkv, proj) 与 MLP (fc1, fc2)
+    全层精准注入 LoRA (HuggingFace Transformers 适配版)
+    根据 info.txt 的探针结果，精准锁定 HuggingFace DINOv3 的：
+    - Attention 层: q_proj, k_proj, v_proj, o_proj
+    - MLP 层: up_proj, down_proj
     解锁 DINOv3 映射医学底层纹理的能力。
     """
-    target_modules = ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"]
+    target_modules = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "up_proj",
+        "down_proj",
+    ]
 
     config = LoraConfig(
         r=rank,
