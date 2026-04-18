@@ -543,7 +543,7 @@ class AveragedModel(Module):
         return clone
 
 class DINOv3Wrapper(nn.Module):
-    def __init__(self, local_path, lora_r=8, lora_alpha=8, lora_dropout=0.1, use_grad_checkpointing=False):
+    def __init__(self, local_path, lora_r=8, lora_alpha=16, lora_dropout=0.0, use_grad_checkpointing=False):
         super().__init__()
         print(f"🚀 [DINOv3+LoRA] Loading from local path: {local_path}")
         from transformers import AutoModel, AutoConfig
@@ -566,18 +566,12 @@ class DINOv3Wrapper(nn.Module):
             print(f"❌ Error loading DINOv3: {e}")
             raise e
 
-    def forward(self, x):
-        # ✅ 终极防御：绕过 PEFT 专为 NLP 设计的顶层 wrapper (它会吞噬或错误映射像素参数)
-        # 获取底层注入了 LoRA 权重的实际视觉模型
-        actual_model = self.model.base_model if hasattr(self.model, "base_model") else self.model
-
-        # ✅ 直接将 x 作为第一个位置参数（Positional Argument）传入
-        # 完美契合 DINOv3 底层严格的 def forward(self, pixel_values, ...) 签名
-        outputs = actual_model(
-            x,
+    def forward(self, pixel_values):
+        outputs = self.model(
+            pixel_values=pixel_values,
             output_hidden_states=self.config.output_hidden_states,
             output_attentions=self.config.output_attentions,
-            return_dict=True
+            return_dict=True,
         )
         return outputs
 
@@ -643,8 +637,8 @@ class DualTowerGDRNet(nn.Module):
 
         default_dinov3_path = getattr(cfg.GDRNET, 'DINOV3_PATH', "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16")
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
-        lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 8)
-        lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.1)
+        lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
+        lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
 
         self.vit = DINOv3Wrapper(local_path=default_dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, use_grad_checkpointing=use_grad_checkpointing)
@@ -731,9 +725,9 @@ class DualTowerGDRNet(nn.Module):
         feat_cnn, spatial_cnn = self.extract_cnn_feature(x_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
 
-        vit_outputs = self.vit(x_vit)
-        feat_vit_cls = vit_outputs.last_hidden_state[:, 0, :]
-        feat_vit_combined = feat_vit_cls
+        vit_outputs = self.vit(pixel_values=x_vit)
+        feat_vit = vit_outputs.last_hidden_state[:, 0]
+        feat_vit_combined = feat_vit
 
         logits_vit = self.classifier_vit(feat_vit_combined)
 
@@ -744,7 +738,9 @@ class DualTowerGDRNet(nn.Module):
         H_vit, W_vit = H_img // self.patch_size, W_img // self.patch_size
         num_patches = H_vit * W_vit
 
-        patch_tokens_vit = vit_outputs.last_hidden_state[:, 1 : 1 + num_patches, :]
+        num_register_tokens = getattr(self.vit.config, "num_register_tokens", 4)
+        patch_start = 1 + num_register_tokens
+        patch_tokens_vit = vit_outputs.last_hidden_state[:, patch_start : patch_start + num_patches, :]
 
         B, N, D = patch_tokens_vit.shape
         assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}. Check patch_size and input resolution."
