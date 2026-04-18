@@ -18,6 +18,8 @@ import copy
 import contextlib
 import math
 import torchvision.transforms.v2 as v2
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
 
@@ -430,38 +432,39 @@ class CASS_GDRNet(Algorithm):
             param.requires_grad = False
         self.m = 0.999
 
-        self.base_lr_cnn = cfg.LEARNING_RATE
-        self.base_lr_vit = 2e-5
-        self.base_lr_vit_head = 5e-4
+        self.base_lr_backbone = 5e-5
+        self.base_lr_head = 5e-4
         self.warmup_epochs = 5
 
-        self.cnn_params, vit_params_all = self.network.get_custom_optim_params()
-
-        if len(vit_params_all) == 0:
-            raise RuntimeError("未检测到任何 ViT/LoRA 参数。")
-
-        network_inner = self.network.module if hasattr(self.network, 'module') else self.network
-        id_to_name = {id(p): n for n, p in network_inner.named_parameters()}
-        self.vit_head_params = [
-            p for p in vit_params_all
-            if 'classifier_vit' in id_to_name.get(id(p), '') or 'projector_vit' in id_to_name.get(id(p), '') or 'predictor_vit' in id_to_name.get(id(p), '')
+        head_modules = [
+            self.network.projector_cnn, self.network.projector_vit,
+            self.network.predictor_cnn, self.network.predictor_vit,
+            self.network.classifier_cnn, self.network.classifier_vit
         ]
-        self.vit_lora_params = [
-            p for p in vit_params_all
-            if 'classifier_vit' not in id_to_name.get(id(p), '') and 'projector_vit' not in id_to_name.get(id(p), '') and 'predictor_vit' not in id_to_name.get(id(p), '')
+        head_params = []
+        for module in head_modules:
+            if module is not None:
+                head_params.extend([p for p in module.parameters() if p.requires_grad])
+        self.head_params = head_params
+        head_param_ids = {id(p) for p in self.head_params}
+
+        self.backbone_params = [
+            p for p in self.network.parameters()
+            if p.requires_grad and id(p) not in head_param_ids
         ]
 
-        self.opt_cnn = torch.optim.AdamW(self.cnn_params, lr=1e-4, weight_decay=1e-4)
-        self.opt_vit = torch.optim.AdamW(
+        self.optimizer = AdamW(
             [
-                {'params': self.vit_lora_params, 'lr': self.base_lr_vit, 'weight_decay': 0.05},
-                {'params': self.vit_head_params, 'lr': self.base_lr_vit_head, 'weight_decay': 1e-4},
+                {'params': self.backbone_params, 'lr': self.base_lr_backbone},
+                {'params': self.head_params, 'lr': self.base_lr_head}
             ],
-            betas=(0.9, 0.999),
+            weight_decay=5e-2
         )
-
-        self.dummy_param = nn.Parameter(torch.zeros(1))
-        self.optimizer = torch.optim.Adam([self.dummy_param], lr=self.base_lr_cnn)
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(1, self.cfg.EPOCHS - self.warmup_epochs),
+            eta_min=1e-6
+        )
 
         self.max_epochs = cfg.EPOCHS
         self.K = 1024
@@ -500,7 +503,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.cnn_train_transforms = v2.Compose([
-            v2.RandomResizedCrop(224, scale=(0.6, 1.0), antialias=True),
+            v2.RandomResizedCrop(512, scale=(0.6, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
             v2.RandomRotation(45),
@@ -518,7 +521,7 @@ class CASS_GDRNet(Algorithm):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         self.weak_transforms_cnn = v2.Compose([
-            v2.Resize((224, 224), antialias=True),
+            v2.Resize((512, 512), antialias=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
@@ -526,23 +529,18 @@ class CASS_GDRNet(Algorithm):
         return torch.stack([transform(img) for img in images], dim=0)
 
     def _compute_grad_norms(self):
-        grad_norm_cnn = 0.0
-        grad_norm_vit_lora = 0.0
-        grad_norm_vit_head = 0.0
+        grad_norm_backbone = 0.0
+        grad_norm_head = 0.0
 
-        for p in self.cnn_params:
+        for p in self.backbone_params:
             if p.grad is not None:
-                grad_norm_cnn += p.grad.data.norm(2).item() ** 2
+                grad_norm_backbone += p.grad.data.norm(2).item() ** 2
 
-        for p in self.vit_lora_params:
+        for p in self.head_params:
             if p.grad is not None:
-                grad_norm_vit_lora += p.grad.data.norm(2).item() ** 2
+                grad_norm_head += p.grad.data.norm(2).item() ** 2
 
-        for p in self.vit_head_params:
-            if p.grad is not None:
-                grad_norm_vit_head += p.grad.data.norm(2).item() ** 2
-
-        return grad_norm_cnn ** 0.5, grad_norm_vit_lora ** 0.5, grad_norm_vit_head ** 0.5
+        return grad_norm_backbone ** 0.5, grad_norm_head ** 0.5
 
     @torch.no_grad()
     def concat_all_gather(self, tensor):
@@ -647,8 +645,7 @@ class CASS_GDRNet(Algorithm):
 
     def update(self, minibatch):
         image, mask, label, domain = minibatch
-        self.opt_cnn.zero_grad()
-        self.opt_vit.zero_grad()
+        self.optimizer.zero_grad()
 
         network_inner = self.network.module if hasattr(self.network, 'module') else self.network
         momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
@@ -809,16 +806,13 @@ class CASS_GDRNet(Algorithm):
             feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()
 
         self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.opt_cnn)
-        self.scaler.unscale_(self.opt_vit)
+        self.scaler.unscale_(self.optimizer)
 
-        grad_norm_cnn, grad_norm_vit_lora, grad_norm_vit_head = self._compute_grad_norms()
-        torch.nn.utils.clip_grad_norm_(self.cnn_params, max_norm=5.0)
-        torch.nn.utils.clip_grad_norm_(self.vit_lora_params, max_norm=2.0)
+        grad_norm_backbone, grad_norm_head = self._compute_grad_norms()
+        torch.nn.utils.clip_grad_norm_(self.backbone_params, max_norm=2.0)
+        torch.nn.utils.clip_grad_norm_(self.head_params, max_norm=5.0)
 
-        self.scaler.step(self.opt_cnn)
-        self.scaler.step(self.opt_vit)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
         self.scaler.update()
 
         with torch.no_grad():
@@ -843,9 +837,8 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss_kd_total'] = loss_kd_total.item()
         loss_dict['kd_weight'] = kd_weight
         loss_dict['loss_at'] = loss_at.item()
-        loss_dict['probe_grad_cnn'] = grad_norm_cnn
-        loss_dict['probe_grad_lora'] = grad_norm_vit_lora
-        loss_dict['probe_grad_head'] = grad_norm_vit_head
+        loss_dict['probe_grad_backbone'] = grad_norm_backbone
+        loss_dict['probe_grad_head'] = grad_norm_head
         loss_dict['probe_sim_inst_cnn'] = sim_inst_cnn
         loss_dict['probe_sim_inst_vit'] = sim_inst_vit
         loss_dict['probe_sim_grade_cnn'] = sim_grade_cnn
@@ -859,29 +852,14 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
-    def adjust_learning_rate(self, epoch):
-        if epoch < self.warmup_epochs:
-            warmup_factor = (epoch + 1) / self.warmup_epochs
-            lr_cnn = self.base_lr_cnn * warmup_factor
-            lr_vit = self.base_lr_vit * warmup_factor
-            lr_vit_head = self.base_lr_vit_head * warmup_factor
-        else:
-            progress = (epoch - self.warmup_epochs) / max(1, (self.max_epochs - self.warmup_epochs))
-            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-            lr_cnn = self.base_lr_cnn * cosine_factor
-            lr_vit = self.base_lr_vit * cosine_factor
-            lr_vit_head = self.base_lr_vit_head * cosine_factor
-        for param_group in self.opt_cnn.param_groups:
-            param_group['lr'] = lr_cnn
-        if len(self.opt_vit.param_groups) > 0:
-            self.opt_vit.param_groups[0]['lr'] = lr_vit
-        if len(self.opt_vit.param_groups) > 1:
-            self.opt_vit.param_groups[1]['lr'] = lr_vit_head
-        return lr_cnn, lr_vit
-
     def update_epoch(self, epoch):
         self.epoch = epoch
-        lr_cnn, lr_vit = self.adjust_learning_rate(epoch)
+        if epoch < self.warmup_epochs:
+            warmup_ratio = (epoch + 1) / self.warmup_epochs
+            self.optimizer.param_groups[0]['lr'] = self.base_lr_backbone * warmup_ratio
+            self.optimizer.param_groups[1]['lr'] = self.base_lr_head * warmup_ratio
+        else:
+            self.scheduler.step()
         if hasattr(self.criterion, 'update_alpha'):
             self.criterion.update_alpha(epoch)
         return epoch
@@ -903,7 +881,7 @@ class CASS_GDRNet(Algorithm):
 
         x_masked = x * mask
         x_vit = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
-        x_cnn = F.interpolate(x_masked, size=(224, 224), mode='bilinear', align_corners=False)
+        x_cnn = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
         return self.network(x_cnn=x_cnn, x_vit=x_vit)
 
     def save_model(self, log_path, source='best'):
