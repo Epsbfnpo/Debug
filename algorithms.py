@@ -678,7 +678,7 @@ class CASS_GDRNet(Algorithm):
             'pred_vit': res_combined['pred_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
-            'drts': res_combined['drts'].float(),
+            'tia_cls': res_combined['tia_cls'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
             'feat_vit': res_combined['feat_vit'].float(),
         }
@@ -789,25 +789,23 @@ class CASS_GDRNet(Algorithm):
         # 🚀 零参数正交解耦 (Zero-Param Orthogonal Disentanglement) - 专家修订版
         # 理论基础：强制 DINOv3 的 DRTs(TIA空间) 离开 Spatial Tokens(TRA空间)
         # ===================================================================
-        drts = res_clean_fp32['drts']
-        feat_vit = res_clean_fp32['feat_vit']
+        tra_cls = res_clean_fp32['feat_vit']
+        tia_cls = res_clean_fp32['tia_cls']
 
-        # 1. 归一化 DRTs (保留梯度，让它作为垃圾桶去被动适应)
-        drts_norm = F.normalize(drts, dim=-1)
+        # 1. 锚点设为不可撼动，阻断梯度，保护病理空间不被反向污染
+        tra_anchor_norm = F.normalize(tra_cls, dim=-1).unsqueeze(2).detach()
 
-        # 2. 🌟 终极修正：使用分类头直接监督的 CLS Token 作为纯净的病理锚点！
-        # 加入 .detach() 阻断梯度，禁止 CLS Token 去迎合 DRTs
-        cls_anchor_norm = F.normalize(feat_vit, dim=-1).unsqueeze(2).detach()
+        # 2. TIA 空间保留梯度，强迫其去参数化地拟合那些不属于疾病的相机特征
+        tia_norm = F.normalize(tia_cls, dim=-1).unsqueeze(1)
 
-        # 3. 批量矩阵乘法求余弦相似度：[B, 4, 768] x [B, 768, 1] -> [B, 4, 1]
-        cos_sim_ortho = torch.bmm(drts_norm, cls_anchor_norm).squeeze(2)
+        # 3. 计算同一样本在两个独立网络分支中的余弦相似度
+        cos_sim_ortho = torch.bmm(tia_norm, tra_anchor_norm).squeeze(2).squeeze(1)
 
-        # 4. 惩罚平方，让余弦相似度逼近 0
+        # 4. 平方惩罚
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
-        # 探针记录
         probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
-        probe_drt_norm = drts.norm(dim=-1).mean().item()
+        probe_tia_norm = tia_cls.norm(dim=-1).mean().item()
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
         lambda_ortho = 1.5
@@ -879,7 +877,7 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
         loss_dict['loss_ortho'] = loss_ortho.item()
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
-        loss_dict['probe_drt_norm'] = probe_drt_norm
+        loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
         loss_dict['loss'] = total_loss.item()
         return loss_dict
