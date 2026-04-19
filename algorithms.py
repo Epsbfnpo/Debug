@@ -439,7 +439,8 @@ class CASS_GDRNet(Algorithm):
         head_modules = [
             self.network.projector_cnn, self.network.projector_vit,
             self.network.predictor_cnn, self.network.predictor_vit,
-            self.network.classifier_cnn, self.network.classifier_vit
+            self.network.classifier_cnn, self.network.classifier_vit,
+            self.network.dual_stream_neck
         ]
         head_params = []
         for module in head_modules:
