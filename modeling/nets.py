@@ -579,6 +579,36 @@ class DINOv3Wrapper(nn.Module):
     def out_features(self):
         return self._out_features
 
+class MultiLayerDualStreamNeck(nn.Module):
+    """
+    多层物理双流解耦颈部 (Multi-Layer Dual-Stream Neck)
+    拦截 ViT 最后的多层特征，强制进行参数化的物理分流。
+    """
+    def __init__(self, in_dim=768, bottleneck_dim=128, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+
+        self.tra_adapter = nn.Sequential(
+            nn.Linear(in_dim * num_layers, bottleneck_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, in_dim)
+        )
+
+        self.tia_adapter = nn.Sequential(
+            nn.Linear(in_dim * num_layers, bottleneck_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, in_dim)
+        )
+
+    def forward(self, hidden_states):
+        last_n_states = hidden_states[-self.num_layers:]
+        concat_states = torch.cat(last_n_states, dim=-1)
+        tra_tokens = self.tra_adapter(concat_states)
+        tia_tokens = self.tia_adapter(concat_states)
+        return tra_tokens, tia_tokens
+
 class RobustViTHead(nn.Module):
     def __init__(self, in_dim=768, hidden_dim=512, num_classes=5, dropout_rate=0.3):
         super().__init__()
@@ -700,8 +730,14 @@ class DualTowerGDRNet(nn.Module):
             dropout_rate=0.3
         )
 
+        self.dual_stream_neck = MultiLayerDualStreamNeck(
+            in_dim=vit_combined_dim,
+            bottleneck_dim=128,
+            num_layers=4
+        )
+
     def get_custom_optim_params(self):
-        vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit]
+        vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit, self.dual_stream_neck]
         vit_param_ids = set()
         vit_params = []
 
@@ -726,7 +762,11 @@ class DualTowerGDRNet(nn.Module):
         logits_cnn = self.classifier_cnn(feat_cnn)
 
         vit_outputs = self.vit(pixel_values=x_vit)
-        feat_vit = vit_outputs.last_hidden_state[:, 0]
+        hidden_states = vit_outputs.hidden_states
+
+        tra_tokens, tia_tokens = self.dual_stream_neck(hidden_states)
+
+        feat_vit = tra_tokens[:, 0]
         feat_vit_combined = feat_vit
 
         logits_vit = self.classifier_vit(feat_vit_combined)
@@ -734,16 +774,19 @@ class DualTowerGDRNet(nn.Module):
         if not return_train_features:
             return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
 
+        tia_cls = tia_tokens[:, 0]
+
         B_vit, C_vit, H_img, W_img = x_vit.shape
         H_vit, W_vit = H_img // self.patch_size, W_img // self.patch_size
         num_patches = H_vit * W_vit
 
         num_register_tokens = getattr(self.vit.config, "num_register_tokens", 4)
         patch_start = 1 + num_register_tokens
-        patch_tokens_vit = vit_outputs.last_hidden_state[:, patch_start : patch_start + num_patches, :]
+
+        patch_tokens_vit = tra_tokens[:, patch_start : patch_start + num_patches, :]
 
         B, N, D = patch_tokens_vit.shape
-        assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}. Check patch_size and input resolution."
+        assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}."
 
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
@@ -759,7 +802,8 @@ class DualTowerGDRNet(nn.Module):
             'proj_vit': proj_vit,
             'pred_cnn': pred_cnn,
             'pred_vit': pred_vit,
-            'drts': None,
+            'feat_vit': feat_vit_combined if hasattr(self, 'rmlp_vit') else feat_vit,
+            'tia_cls': tia_cls,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
             'spatial_vit': spatial_vit,
