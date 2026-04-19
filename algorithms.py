@@ -678,6 +678,8 @@ class CASS_GDRNet(Algorithm):
             'pred_vit': res_combined['pred_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
+            'drts': res_combined['drts'].float(),
+            'spatial_tokens': res_combined['spatial_tokens'].float(),
         }
 
         with torch.no_grad():
@@ -781,8 +783,38 @@ class CASS_GDRNet(Algorithm):
 
         loss_kd_total = kd_weight * (loss_kd_cnn + loss_kd_vit)
         lambda_contrastive = 1.0
-        lambda_ortho = 0.0
-        loss_ortho = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+
+        # ===================================================================
+        # 🚀 零参数正交解耦 (Zero-Param Orthogonal Disentanglement) - 专家修订版
+        # 理论基础：强制 DINOv3 的 DRTs(TIA空间) 离开 Spatial Tokens(TRA空间)
+        # ===================================================================
+        drts = res_clean_fp32['drts']
+        spatial_tokens = res_clean_fp32['spatial_tokens']
+
+        # 1. 归一化 DRTs (作为需要被约束的“垃圾桶”向量，保留梯度，让它被优化)
+        drts_norm = F.normalize(drts, dim=-1)
+
+        # 2. 计算 Spatial Tokens 的均值，代表当前的全局病理语义
+        spatial_mean = spatial_tokens.mean(dim=1)
+
+        # 🌟 核心修正：加入 .detach() 阻断梯度！
+        # 强制 DRTs 去适应 Spatial，绝对不允许 Spatial 被反向污染！
+        spatial_mean_norm = F.normalize(spatial_mean, dim=-1).unsqueeze(2).detach()
+
+        # 3. 批量矩阵乘法求余弦相似度：[B, 4, 768] x [B, 768, 1] -> [B, 4, 1]
+        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean_norm).squeeze(2)
+
+        # 4. 惩罚平方，让余弦相似度逼近 0 (强行正交 90度)
+        loss_ortho = torch.mean(cos_sim_ortho ** 2)
+
+        # 探针：提取绝对相似度均值，用于监控解耦进度
+        probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
+
+        # 探针：监控两个空间的范数(Norm)
+        probe_drt_norm = drts.norm(dim=-1).mean().item()
+        probe_spatial_norm = spatial_tokens.norm(dim=-1).mean().item()
+
+        lambda_ortho = 1.5
         total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
 
         with torch.no_grad():
@@ -849,6 +881,10 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_unique_cls_vit'] = unique_classes_vit
         loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
+        loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['probe_ortho_sim'] = probe_ortho_sim
+        loss_dict['probe_drt_norm'] = probe_drt_norm
+        loss_dict['probe_spatial_norm'] = probe_spatial_norm
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
