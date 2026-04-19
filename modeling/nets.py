@@ -764,6 +764,7 @@ class DualTowerGDRNet(nn.Module):
             'proj_vit': proj_vit,
             'pred_cnn': pred_cnn,
             'pred_vit': pred_vit,
+            'feat_vit': feat_vit_combined if hasattr(self, 'rmlp_vit') else feat_vit,
             'drts': drts_vit,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
