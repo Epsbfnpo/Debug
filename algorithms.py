@@ -678,6 +678,9 @@ class CASS_GDRNet(Algorithm):
             'pred_vit': res_combined['pred_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
+            'tia_cls': res_combined['tia_cls'].float(),
+            'spatial_tokens': res_combined['spatial_tokens'].float(),
+            'feat_vit': res_combined['feat_vit'].float(),
         }
 
         with torch.no_grad():
@@ -781,8 +784,31 @@ class CASS_GDRNet(Algorithm):
 
         loss_kd_total = kd_weight * (loss_kd_cnn + loss_kd_vit)
         lambda_contrastive = 1.0
-        lambda_ortho = 0.0
-        loss_ortho = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+
+        # ===================================================================
+        # 🚀 零参数正交解耦 (Zero-Param Orthogonal Disentanglement) - 专家修订版
+        # 理论基础：强制 DINOv3 的 DRTs(TIA空间) 离开 Spatial Tokens(TRA空间)
+        # ===================================================================
+        tra_cls = res_clean_fp32['feat_vit']
+        tia_cls = res_clean_fp32['tia_cls']
+
+        # 1. 锚点设为不可撼动，阻断梯度，保护病理空间不被反向污染
+        tra_anchor_norm = F.normalize(tra_cls, dim=-1).unsqueeze(2).detach()
+
+        # 2. TIA 空间保留梯度，强迫其去参数化地拟合那些不属于疾病的相机特征
+        tia_norm = F.normalize(tia_cls, dim=-1).unsqueeze(1)
+
+        # 3. 计算同一样本在两个独立网络分支中的余弦相似度
+        cos_sim_ortho = torch.bmm(tia_norm, tra_anchor_norm).squeeze(2).squeeze(1)
+
+        # 4. 平方惩罚
+        loss_ortho = torch.mean(cos_sim_ortho ** 2)
+
+        probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
+        probe_tia_norm = tia_cls.norm(dim=-1).mean().item()
+        probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
+
+        lambda_ortho = 1.5
         total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
 
         with torch.no_grad():
@@ -849,6 +875,10 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_unique_cls_vit'] = unique_classes_vit
         loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
+        loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['probe_ortho_sim'] = probe_ortho_sim
+        loss_dict['probe_tia_norm'] = probe_tia_norm
+        loss_dict['probe_spatial_norm'] = probe_spatial_norm
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
