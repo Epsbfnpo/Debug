@@ -740,10 +740,15 @@ class DualTowerGDRNet(nn.Module):
 
         num_register_tokens = getattr(self.vit.config, "num_register_tokens", 4)
         patch_start = 1 + num_register_tokens
+
+        # 1. 提取 TIA (任务无关) 空间：即 Register Tokens（避开第0个CLS Token）
+        drts_vit = vit_outputs.last_hidden_state[:, 1 : patch_start, :]
+
+        # 2. 提取 TRA (任务相关) 空间：所有 Spatial Patch Tokens
         patch_tokens_vit = vit_outputs.last_hidden_state[:, patch_start : patch_start + num_patches, :]
 
         B, N, D = patch_tokens_vit.shape
-        assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}. Check patch_size and input resolution."
+        assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}."
 
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
@@ -759,7 +764,8 @@ class DualTowerGDRNet(nn.Module):
             'proj_vit': proj_vit,
             'pred_cnn': pred_cnn,
             'pred_vit': pred_vit,
-            'drts': None,
+            'feat_vit': feat_vit_combined if hasattr(self, 'rmlp_vit') else feat_vit,
+            'drts': drts_vit,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
             'spatial_vit': spatial_vit,
