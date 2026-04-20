@@ -440,7 +440,7 @@ class CASS_GDRNet(Algorithm):
             self.network.projector_cnn, self.network.projector_vit,
             self.network.predictor_cnn, self.network.predictor_vit,
             self.network.classifier_cnn, self.network.classifier_vit,
-            self.network.dual_stream_neck
+            self.network.dual_stream_neck, self.network.vit_to_cnn_proj
         ]
         head_params = []
         for module in head_modules:
@@ -682,6 +682,11 @@ class CASS_GDRNet(Algorithm):
             'tia_cls': res_combined['tia_cls'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
             'feat_vit': res_combined['feat_vit'].float(),
+            'spatial_cnn': res_combined['spatial_cnn'].float(),
+            'f_vit_aligned': res_combined['f_vit_aligned'].float(),
+            'probe_loasp_s_prime_norm': res_combined['probe_loasp_s_prime_norm'].float(),
+            'probe_loasp_offset_std': res_combined['probe_loasp_offset_std'].float(),
+            'probe_ac_weight_norm': res_combined['probe_ac_weight_norm'].float(),
         }
 
         with torch.no_grad():
@@ -773,6 +778,11 @@ class CASS_GDRNet(Algorithm):
 
         loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
+        f_cnn_norm = F.normalize(res_clean_fp32['spatial_cnn'].detach(), p=2, dim=1)
+        f_vit_norm = F.normalize(res_clean_fp32['f_vit_aligned'], p=2, dim=1)
+        loss_guide = F.mse_loss(f_vit_norm, f_cnn_norm)
+        weight_guide = 1.0
+
         warmup_epochs = self.warmup_epochs
         max_epochs = getattr(getattr(self.cfg, 'OPTIM', object()), 'MAX_EPOCH', self.max_epochs)
         current_epoch = self.epoch
@@ -810,7 +820,13 @@ class CASS_GDRNet(Algorithm):
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
         lambda_ortho = 1.5
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        total_loss = (
+            loss_main
+            + lambda_contrastive * loss_contrastive
+            + 1.0 * loss_kd_total
+            + lambda_ortho * loss_ortho
+            + weight_guide * loss_guide
+        )
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -877,9 +893,14 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
         loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['loss_guide'] = loss_guide.item()
+        loss_dict['weight_guide'] = weight_guide
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
+        loss_dict['probe_loasp_s_prime_norm'] = res_clean_fp32['probe_loasp_s_prime_norm'].item()
+        loss_dict['probe_loasp_offset_std'] = res_clean_fp32['probe_loasp_offset_std'].item()
+        loss_dict['probe_ac_weight_norm'] = res_clean_fp32['probe_ac_weight_norm'].item()
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 

@@ -735,6 +735,7 @@ class DualTowerGDRNet(nn.Module):
             bottleneck_dim=128,
             num_layers=4
         )
+        self.vit_to_cnn_proj = nn.Conv2d(self.vit_dim, self.cnn_dim, kernel_size=1)
 
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit, self.dual_stream_neck]
@@ -753,6 +754,25 @@ class DualTowerGDRNet(nn.Module):
                 cnn_params.append(p)
 
         return cnn_params, vit_params
+
+    def _collect_loasp_stats(self):
+        s_prime_norms = []
+        offset_stds = []
+        ac_weight_norms = []
+        for module in self.cnn.modules():
+            if hasattr(module, 'last_s_prime_norm') and module.last_s_prime_norm is not None:
+                s_prime_norms.append(module.last_s_prime_norm)
+            if hasattr(module, 'last_offset_std') and module.last_offset_std is not None:
+                offset_stds.append(module.last_offset_std)
+            if hasattr(module, 'ac') and hasattr(module.ac, 'weight'):
+                ac_weight_norms.append(module.ac.weight.detach().norm())
+
+        device = next(self.parameters()).device
+        zero = torch.tensor(0.0, device=device)
+        probe_loasp_s_prime_norm = torch.stack(s_prime_norms).mean() if s_prime_norms else zero
+        probe_loasp_offset_std = torch.stack(offset_stds).mean() if offset_stds else zero
+        probe_ac_weight_norm = torch.stack(ac_weight_norms).mean() if ac_weight_norms else zero
+        return probe_loasp_s_prime_norm, probe_loasp_offset_std, probe_ac_weight_norm
 
     def forward(self, x_cnn, x_vit=None, return_train_features=False):
         if x_vit is None:
@@ -789,11 +809,19 @@ class DualTowerGDRNet(nn.Module):
         assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}."
 
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
+        f_vit_proj = self.vit_to_cnn_proj(spatial_vit)
+        f_vit_aligned = F.interpolate(
+            f_vit_proj,
+            size=spatial_cnn.shape[2:],
+            mode='bilinear',
+            align_corners=False,
+        )
 
         proj_cnn = self.projector_cnn(feat_cnn)
         proj_vit = self.projector_vit(feat_vit_combined)
         pred_cnn = self.predictor_cnn(proj_cnn)
         pred_vit = self.predictor_vit(proj_vit)
+        probe_loasp_s_prime_norm, probe_loasp_offset_std, probe_ac_weight_norm = self._collect_loasp_stats()
 
         return {
             'logits_cnn': logits_cnn,
@@ -807,6 +835,10 @@ class DualTowerGDRNet(nn.Module):
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
             'spatial_vit': spatial_vit,
+            'f_vit_aligned': f_vit_aligned,
+            'probe_loasp_s_prime_norm': probe_loasp_s_prime_norm,
+            'probe_loasp_offset_std': probe_loasp_offset_std,
+            'probe_ac_weight_norm': probe_ac_weight_norm,
         }
 
     def extract_cnn_feature(self, x_cnn):
