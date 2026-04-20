@@ -89,12 +89,18 @@ class LoASP(nn.Module):
         )
         self.up_f = nn.Conv2d(f_reduced_channels, channels, kernel_size=1, bias=False)
         self.ac = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        nn.init.constant_(self.up_f.weight, 0.0)
+        nn.init.constant_(self.ac.weight, 0.0)
+
+        self.last_s_prime_norm = None
+        self.last_offset_std = None
 
     def forward(self, h_t):
         s_t = self.down_s(h_t)
         s_t = self.bn_down_s(s_t)
 
         offsets = self.offset_conv(s_t)
+        self.last_offset_std = offsets.detach().std()
         s_t = self.deform_conv(s_t, offsets)
         s_t = F.relu(self.bn_ds(s_t))
         s_t = self.bn_up_s(self.up_s(s_t))
@@ -102,6 +108,7 @@ class LoASP(nn.Module):
         s_prime = self.down_f(s_t)
         s_prime = self.spline_approx(s_prime)
         s_prime = self.up_f(s_prime)
+        self.last_s_prime_norm = s_prime.detach().norm(dim=1).mean()
 
         h_prime = self.ac(h_t) + h_t + s_prime
         return h_prime

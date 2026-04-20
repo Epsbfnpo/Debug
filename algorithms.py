@@ -684,6 +684,9 @@ class CASS_GDRNet(Algorithm):
             'feat_vit': res_combined['feat_vit'].float(),
             'spatial_cnn': res_combined['spatial_cnn'].float(),
             'f_vit_aligned': res_combined['f_vit_aligned'].float(),
+            'probe_loasp_s_prime_norm': res_combined['probe_loasp_s_prime_norm'].float(),
+            'probe_loasp_offset_std': res_combined['probe_loasp_offset_std'].float(),
+            'probe_ac_weight_norm': res_combined['probe_ac_weight_norm'].float(),
         }
 
         with torch.no_grad():
@@ -895,6 +898,9 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
+        loss_dict['probe_loasp_s_prime_norm'] = res_clean_fp32['probe_loasp_s_prime_norm'].item()
+        loss_dict['probe_loasp_offset_std'] = res_clean_fp32['probe_loasp_offset_std'].item()
+        loss_dict['probe_ac_weight_norm'] = res_clean_fp32['probe_ac_weight_norm'].item()
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
