@@ -735,6 +735,7 @@ class DualTowerGDRNet(nn.Module):
             bottleneck_dim=128,
             num_layers=4
         )
+        self.vit_to_cnn_proj = nn.Conv2d(self.vit_dim, self.cnn_dim, kernel_size=1)
 
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit, self.dual_stream_neck]
@@ -789,6 +790,13 @@ class DualTowerGDRNet(nn.Module):
         assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}."
 
         spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
+        f_vit_proj = self.vit_to_cnn_proj(spatial_vit)
+        f_vit_aligned = F.interpolate(
+            f_vit_proj,
+            size=spatial_cnn.shape[2:],
+            mode='bilinear',
+            align_corners=False,
+        )
 
         proj_cnn = self.projector_cnn(feat_cnn)
         proj_vit = self.projector_vit(feat_vit_combined)
@@ -807,6 +815,7 @@ class DualTowerGDRNet(nn.Module):
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
             'spatial_vit': spatial_vit,
+            'f_vit_aligned': f_vit_aligned,
         }
 
     def extract_cnn_feature(self, x_cnn):

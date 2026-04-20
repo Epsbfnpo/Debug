@@ -1,7 +1,9 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.model_zoo as model_zoo
+import torchvision.ops as ops
 from configs.defaults import _C as cfg
 
 model_urls = {"resnet18": "https://download.pytorch.org/models/resnet18-5c106cde.pth", "resnet34": "https://download.pytorch.org/models/resnet34-333f7ec4.pth", "resnet50": "https://download.pytorch.org/models/resnet50-19c8e357.pth", "resnet101": "https://download.pytorch.org/models/resnet101-5d3b4d8f.pth", "resnet152": "https://download.pytorch.org/models/resnet152-b121ed2d.pth",}
@@ -48,6 +50,63 @@ class BasicBlock(nn.Module):
         return out
 
 
+class LoASP(nn.Module):
+    def __init__(self, channels, rank=4):
+        super(LoASP, self).__init__()
+        reduced_channels = max(1, channels // rank)
+
+        self.down_s = nn.Conv2d(channels, reduced_channels, kernel_size=1, bias=False)
+        self.bn_down_s = nn.BatchNorm2d(reduced_channels)
+
+        self.offset_conv = nn.Conv2d(reduced_channels, 2 * 3 * 3, kernel_size=3, padding=1)
+        nn.init.constant_(self.offset_conv.weight, 0.0)
+        nn.init.constant_(self.offset_conv.bias, 0.0)
+
+        self.deform_conv = ops.DeformConv2d(
+            in_channels=reduced_channels,
+            out_channels=reduced_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn_ds = nn.BatchNorm2d(reduced_channels)
+
+        self.up_s = nn.Conv2d(reduced_channels, channels, kernel_size=1, bias=False)
+        self.bn_up_s = nn.BatchNorm2d(channels)
+
+        f_reduced_channels = max(1, channels // rank)
+        self.down_f = nn.Conv2d(channels, f_reduced_channels, kernel_size=1, bias=False)
+        self.spline_approx = nn.Sequential(
+            nn.Conv2d(
+                f_reduced_channels,
+                f_reduced_channels,
+                kernel_size=3,
+                padding=1,
+                groups=f_reduced_channels,
+                bias=False,
+            ),
+            nn.GELU(),
+        )
+        self.up_f = nn.Conv2d(f_reduced_channels, channels, kernel_size=1, bias=False)
+        self.ac = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+
+    def forward(self, h_t):
+        s_t = self.down_s(h_t)
+        s_t = self.bn_down_s(s_t)
+
+        offsets = self.offset_conv(s_t)
+        s_t = self.deform_conv(s_t, offsets)
+        s_t = F.relu(self.bn_ds(s_t))
+        s_t = self.bn_up_s(self.up_s(s_t))
+
+        s_prime = self.down_f(s_t)
+        s_prime = self.spline_approx(s_prime)
+        s_prime = self.up_f(s_prime)
+
+        h_prime = self.ac(h_t) + h_t + s_prime
+        return h_prime
+
+
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -62,6 +121,7 @@ class Bottleneck(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
+        self.loasp = LoASP(channels=planes * self.expansion, rank=4)
 
     def forward(self, x):
         residual = x
@@ -75,6 +135,7 @@ class Bottleneck(nn.Module):
         out = self.bn3(out)
         if self.downsample is not None:
             residual = self.downsample(x)
+        out = self.loasp(out)
         out += residual
         out = self.relu(out)
         return out
