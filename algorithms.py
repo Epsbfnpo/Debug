@@ -710,6 +710,7 @@ class CASS_GDRNet(Algorithm):
             'spatial_tokens': res_combined['spatial_tokens'].float(),
             'feat_vit': res_combined['feat_vit'].float(),
             'spatial_cnn': res_combined['spatial_cnn'].float(),
+            'spatial_vit': res_combined.get('spatial_vit', None).float() if res_combined.get('spatial_vit') is not None else None,
         }
 
         with torch.no_grad():
@@ -868,7 +869,9 @@ class CASS_GDRNet(Algorithm):
         if M_teacher_weak is None:
             loss_mask_con = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
         else:
-            grid_feat = F.affine_grid(theta, M_teacher_weak.size(), align_corners=False)
+            F_student = res_clean_fp32['spatial_cnn']
+            B_s, C_s, H_s, W_s = F_student.shape
+            grid_feat = F.affine_grid(theta, [B_s, 1, H_s, W_s], align_corners=False)
             M_teacher_aligned = F.grid_sample(
                 M_teacher_weak,
                 grid_feat,
@@ -876,7 +879,6 @@ class CASS_GDRNet(Algorithm):
                 align_corners=False,
                 padding_mode='zeros'
             )
-            F_student = res_clean_fp32['spatial_cnn']
             F_student_masked = F_student * M_teacher_aligned
             z_masked = F_student_masked.mean(dim=[2, 3])
             if hasattr(network_inner, 'projector_cnn'):
@@ -887,7 +889,25 @@ class CASS_GDRNet(Algorithm):
             loss_mask_con = (1.0 - (z_masked_norm * z_target_norm).sum(dim=-1)).mean()
 
         weight_mask_con = 0.0 if self.epoch < 10 else 1.0
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + loss_unsupervised_mask + weight_mask_con * loss_mask_con
+
+        f_cnn_norm = F.normalize(res_clean_fp32['spatial_cnn'].detach(), p=2, dim=1)
+        if res_clean_fp32.get('spatial_vit') is not None:
+            f_vit_aligned = F.interpolate(
+                res_clean_fp32['spatial_vit'],
+                size=(f_cnn_norm.size(2), f_cnn_norm.size(3)),
+                mode='bilinear',
+                align_corners=False
+            )
+            f_vit_norm = F.normalize(f_vit_aligned, p=2, dim=1)
+            f_cnn_map = F.normalize(f_cnn_norm.mean(dim=1, keepdim=True).flatten(1), p=2, dim=1)
+            f_vit_map = F.normalize(f_vit_norm.mean(dim=1, keepdim=True).flatten(1), p=2, dim=1)
+            loss_guide = (1.0 - F.cosine_similarity(f_vit_map, f_cnn_map, dim=1)).mean()
+            weight_guide = 1.0
+        else:
+            loss_guide = torch.tensor(0.0, device=device)
+            weight_guide = 0.0
+
+        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + loss_unsupervised_mask + weight_mask_con * loss_mask_con + weight_guide * loss_guide
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -961,6 +981,8 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss_sparsity'] = loss_sparsity.item()
         loss_dict['loss_mask_con'] = loss_mask_con.item()
         loss_dict['weight_mask_con'] = weight_mask_con
+        loss_dict['loss_guide'] = loss_guide.item()
+        loss_dict['weight_guide'] = weight_guide
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
