@@ -840,30 +840,34 @@ class CASS_GDRNet(Algorithm):
 
         lambda_ortho = 1.5
 
+        loss_sparsity = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+        loss_tv = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+        mask_count = 0
+
+        for m in network_inner.modules():
+            if m.__class__.__name__ == 'LoASP' and m.current_mask is not None:
+                mask_i = m.current_mask.float()
+                loss_sparsity += mask_i.mean()
+                tv_h = torch.abs(mask_i[:, :, 1:, :] - mask_i[:, :, :-1, :]).mean()
+                tv_w = torch.abs(mask_i[:, :, :, 1:] - mask_i[:, :, :, :-1]).mean()
+                loss_tv += (tv_h + tv_w)
+                mask_count += 1
+
+        if mask_count > 0:
+            loss_sparsity = loss_sparsity / mask_count
+            loss_tv = loss_tv / mask_count
+
+        lambda_tv = 0.05
+        lambda_sparse = 0.01
+        loss_unsupervised_mask = lambda_tv * loss_tv + lambda_sparse * loss_sparsity
+
         try:
-            student_loasp = network_inner.cnn.layer3[-1].loasp
             teacher_loasp = momentum_inner.cnn.layer3[-1].loasp
         except AttributeError:
             try:
-                student_loasp = network_inner.cnn_backbone.layer3[-1].loasp
                 teacher_loasp = momentum_inner.cnn_backbone.layer3[-1].loasp
             except AttributeError:
-                student_loasp = network_inner.backbone.layer3[-1].loasp
                 teacher_loasp = momentum_inner.backbone.layer3[-1].loasp
-
-        student_mask = student_loasp.current_mask.float() if student_loasp.current_mask is not None else None
-        if student_mask is None:
-            loss_sparsity = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-            loss_tv = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-            loss_unsupervised_mask = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        else:
-            loss_sparsity = student_mask.mean()
-            tv_h = torch.abs(student_mask[:, :, 1:, :] - student_mask[:, :, :-1, :]).mean()
-            tv_w = torch.abs(student_mask[:, :, :, 1:] - student_mask[:, :, :, :-1]).mean()
-            loss_tv = tv_h + tv_w
-            lambda_tv = 0.05
-            lambda_sparse = 0.01
-            loss_unsupervised_mask = lambda_tv * loss_tv + lambda_sparse * loss_sparsity
 
         M_teacher_weak = teacher_loasp.current_mask.detach().float() if teacher_loasp.current_mask is not None else None
         if M_teacher_weak is None:
