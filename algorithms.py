@@ -503,11 +503,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-        self.cnn_train_transforms = v2.Compose([
-            v2.RandomResizedCrop(512, scale=(0.6, 1.0), antialias=True),
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.RandomVerticalFlip(p=0.5),
-            v2.RandomRotation(45),
+        self.cnn_color_transforms = v2.Compose([
             v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
             v2.RandomApply([v2.GaussianBlur(kernel_size=5)], p=0.3),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -658,8 +654,39 @@ class CASS_GDRNet(Algorithm):
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
         img_weak_cnn = self.weak_transforms_cnn(img_base_pixel.clone()).contiguous()
         img_weak_vit = self.weak_transforms(img_base_pixel.clone()).contiguous()
-        img_strong_cnn = self.cnn_train_transforms(img_base_pixel.clone()).contiguous()
         img_strong_vit = self.vit_train_transforms(img_base_pixel.clone()).contiguous()
+
+        B, C, H_img, W_img = img_base_pixel.shape
+        device = img_base_pixel.device
+
+        angles = torch.empty(B, device=device).uniform_(-45, 45) * (math.pi / 180.0)
+        scales = torch.empty(B, device=device).uniform_(0.6, 1.0)
+        flips = torch.where(
+            torch.rand(B, device=device) > 0.5,
+            torch.tensor(-1.0, device=device),
+            torch.tensor(1.0, device=device)
+        )
+
+        tx = torch.empty(B, device=device).uniform_(-1.0, 1.0) * (1.0 - scales)
+        ty = torch.empty(B, device=device).uniform_(-1.0, 1.0) * (1.0 - scales)
+
+        theta = torch.zeros(B, 2, 3, device=device)
+        theta[:, 0, 0] = scales * flips * torch.cos(angles)
+        theta[:, 0, 1] = -scales * torch.sin(angles)
+        theta[:, 0, 2] = tx
+        theta[:, 1, 0] = scales * torch.sin(angles)
+        theta[:, 1, 1] = scales * torch.cos(angles)
+        theta[:, 1, 2] = ty
+
+        grid_img = F.affine_grid(theta, img_base_pixel.size(), align_corners=False)
+        img_strong_geom = F.grid_sample(
+            img_base_pixel,
+            grid_img,
+            align_corners=False,
+            padding_mode='reflection'
+        )
+
+        img_strong_cnn = self.cnn_color_transforms(img_strong_geom).contiguous()
 
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
@@ -682,6 +709,7 @@ class CASS_GDRNet(Algorithm):
             'tia_cls': res_combined['tia_cls'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
             'feat_vit': res_combined['feat_vit'].float(),
+            'spatial_cnn': res_combined['spatial_cnn'].float(),
         }
 
         with torch.no_grad():
@@ -810,7 +838,56 @@ class CASS_GDRNet(Algorithm):
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
         lambda_ortho = 1.5
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+
+        try:
+            student_loasp = network_inner.cnn.layer3[-1].loasp
+            teacher_loasp = momentum_inner.cnn.layer3[-1].loasp
+        except AttributeError:
+            try:
+                student_loasp = network_inner.cnn_backbone.layer3[-1].loasp
+                teacher_loasp = momentum_inner.cnn_backbone.layer3[-1].loasp
+            except AttributeError:
+                student_loasp = network_inner.backbone.layer3[-1].loasp
+                teacher_loasp = momentum_inner.backbone.layer3[-1].loasp
+
+        student_mask = student_loasp.current_mask.float() if student_loasp.current_mask is not None else None
+        if student_mask is None:
+            loss_sparsity = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+            loss_tv = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+            loss_unsupervised_mask = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+        else:
+            loss_sparsity = student_mask.mean()
+            tv_h = torch.abs(student_mask[:, :, 1:, :] - student_mask[:, :, :-1, :]).mean()
+            tv_w = torch.abs(student_mask[:, :, :, 1:] - student_mask[:, :, :, :-1]).mean()
+            loss_tv = tv_h + tv_w
+            lambda_tv = 0.05
+            lambda_sparse = 0.01
+            loss_unsupervised_mask = lambda_tv * loss_tv + lambda_sparse * loss_sparsity
+
+        M_teacher_weak = teacher_loasp.current_mask.detach().float() if teacher_loasp.current_mask is not None else None
+        if M_teacher_weak is None:
+            loss_mask_con = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+        else:
+            grid_feat = F.affine_grid(theta, M_teacher_weak.size(), align_corners=False)
+            M_teacher_aligned = F.grid_sample(
+                M_teacher_weak,
+                grid_feat,
+                mode='bilinear',
+                align_corners=False,
+                padding_mode='zeros'
+            )
+            F_student = res_clean_fp32['spatial_cnn']
+            F_student_masked = F_student * M_teacher_aligned
+            z_masked = F_student_masked.mean(dim=[2, 3])
+            if hasattr(network_inner, 'projector_cnn'):
+                z_masked = network_inner.projector_cnn(z_masked)
+
+            z_masked_norm = F.normalize(z_masked, dim=-1)
+            z_target_norm = F.normalize(res_momentum['proj_cnn'].detach().float(), dim=-1)
+            loss_mask_con = (1.0 - (z_masked_norm * z_target_norm).sum(dim=-1)).mean()
+
+        weight_mask_con = 0.0 if self.epoch < 10 else 1.0
+        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + loss_unsupervised_mask + weight_mask_con * loss_mask_con
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -880,6 +957,10 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
+        loss_dict['loss_tv'] = loss_tv.item()
+        loss_dict['loss_sparsity'] = loss_sparsity.item()
+        loss_dict['loss_mask_con'] = loss_mask_con.item()
+        loss_dict['weight_mask_con'] = weight_mask_con
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 
