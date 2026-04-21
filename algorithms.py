@@ -780,7 +780,7 @@ class CASS_GDRNet(Algorithm):
 
         f_cnn_norm = F.normalize(res_clean_fp32['spatial_cnn'].detach(), p=2, dim=1)
         f_vit_norm = F.normalize(res_clean_fp32['f_vit_aligned'], p=2, dim=1)
-        loss_guide = F.mse_loss(f_vit_norm, f_cnn_norm)
+        loss_guide = (1.0 - F.cosine_similarity(f_vit_norm, f_cnn_norm, dim=1)).mean()
         weight_guide = 1.0
 
         warmup_epochs = self.warmup_epochs
@@ -819,6 +819,20 @@ class CASS_GDRNet(Algorithm):
         probe_tia_norm = tia_cls.norm(dim=-1).mean().item()
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
+        # ===================================================================
+        # 🚀 新增：可导的形变正则化 (Offset Regularization)
+        # ===================================================================
+        loss_offset_reg = torch.tensor(0.0, device=img_strong_cnn.device)
+        offset_layer_count = 0
+        for m in network_inner.modules():
+            if hasattr(m, 'current_offsets') and m.current_offsets is not None:
+                loss_offset_reg += m.current_offsets.pow(2).mean()
+                offset_layer_count += 1
+        if offset_layer_count > 0:
+            loss_offset_reg = loss_offset_reg / offset_layer_count
+        lambda_offset_reg = 0.1
+        # ===================================================================
+
         lambda_ortho = 1.5
         total_loss = (
             loss_main
@@ -826,6 +840,7 @@ class CASS_GDRNet(Algorithm):
             + 1.0 * loss_kd_total
             + lambda_ortho * loss_ortho
             + weight_guide * loss_guide
+            + lambda_offset_reg * loss_offset_reg
         )
 
         with torch.no_grad():
@@ -894,6 +909,7 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
         loss_dict['loss_ortho'] = loss_ortho.item()
         loss_dict['loss_guide'] = loss_guide.item()
+        loss_dict['loss_offset_reg'] = loss_offset_reg.item()
         loss_dict['weight_guide'] = weight_guide
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm

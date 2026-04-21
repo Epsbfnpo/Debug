@@ -94,12 +94,14 @@ class LoASP(nn.Module):
 
         self.last_s_prime_norm = None
         self.last_offset_std = None
+        self.current_offsets = None
 
     def forward(self, h_t):
         s_t = self.down_s(h_t)
         s_t = self.bn_down_s(s_t)
 
         offsets = self.offset_conv(s_t)
+        self.current_offsets = offsets
         self.last_offset_std = offsets.detach().std()
         s_t = self.deform_conv(s_t, offsets)
         s_t = F.relu(self.bn_ds(s_t))
