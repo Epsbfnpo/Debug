@@ -129,7 +129,7 @@ class GDRNet(ERM):
         self.split_num = 2
         self.combs = 3
         self.fundusAug = get_post_FundusAug(cfg)
-        # 对齐 GDRNetLoss_Integrated 最新签名，避免运行 GDRNet 基线时参数不匹配
+
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.optimizer = torch.optim.Adam([{"params": self.network.parameters()}, {"params": self.classifier.parameters()}, {"params": self.projector.parameters()}, {"params": self.predictor.parameters()}], lr=cfg.LEARNING_RATE, weight_decay=0.0001)
 
@@ -730,7 +730,7 @@ class CASS_GDRNet(Algorithm):
         loss_sup = loss_sup_cnn + loss_sup_vit
 
         # ===================================================================
-        # 🌟 终极解耦对比学习模块 (Decoupled Contrastive Learning)
+
         # ===================================================================
         raw_target_cnn = res_momentum['proj_cnn'].detach().float()
         raw_target_vit = res_momentum['proj_vit'].detach().float()
@@ -782,9 +782,9 @@ class CASS_GDRNet(Algorithm):
         })
 
         # ==========================================
-        # 真正完美的双向互蒸馏 (Mutual KD)
-        # 1) KD 只做分布对齐，不再混入 true_dist，避免与 supervised CE 双重计算
-        # 2) 纯 KL + T^2 缩放，保证温度补偿的数学一致性
+
+
+
         # ==========================================
         kd_temp = 2.0
         kd_alpha = 0.5
@@ -816,22 +816,18 @@ class CASS_GDRNet(Algorithm):
         lambda_contrastive = 1.0
 
         # ===================================================================
-        # 🚀 零参数正交解耦 (Zero-Param Orthogonal Disentanglement) - 专家修订版
-        # 理论基础：强制 DINOv3 的 DRTs(TIA空间) 离开 Spatial Tokens(TRA空间)
+
+
         # ===================================================================
         tra_cls = res_clean_fp32['feat_vit']
         tia_cls = res_clean_fp32['tia_cls']
 
-        # 1. 锚点设为不可撼动，阻断梯度，保护病理空间不被反向污染
         tra_anchor_norm = F.normalize(tra_cls, dim=-1).unsqueeze(2).detach()
 
-        # 2. TIA 空间保留梯度，强迫其去参数化地拟合那些不属于疾病的相机特征
         tia_norm = F.normalize(tia_cls, dim=-1).unsqueeze(1)
 
-        # 3. 计算同一样本在两个独立网络分支中的余弦相似度
         cos_sim_ortho = torch.bmm(tia_norm, tra_anchor_norm).squeeze(2).squeeze(1)
 
-        # 4. 平方惩罚
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
         probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
@@ -922,7 +918,6 @@ class CASS_GDRNet(Algorithm):
             unique_classes_cnn = len(torch.unique(pred_cnn_classes))
             unique_classes_vit = len(torch.unique(pred_vit_classes))
 
-            # 监控熵时使用真实温度 T=1.0，避免日志被蒸馏温度扭曲
             vit_probs_for_log = F.softmax(res_momentum['logits_vit'].detach(), dim=1)
             ema_vit_entropy = compute_entropy(vit_probs_for_log)
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)

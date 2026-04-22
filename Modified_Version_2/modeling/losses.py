@@ -121,7 +121,7 @@ def D(p, z, version='simplified'):
         p = F.normalize(p, dim=1)
         z = F.normalize(z, dim=1)
         return -(p * z).sum(dim=1).mean()
-    elif version == 'simplified':  # 推荐使用
+    elif version == 'simplified':
         return - F.cosine_similarity(p, z.detach(), dim=-1).mean()
     else:
         raise Exception
