@@ -883,8 +883,11 @@ class CASS_GDRNet(Algorithm):
                 align_corners=False,
                 padding_mode='zeros'
             )
-            F_student_masked = F_student * M_teacher_aligned
-            z_masked = F_student_masked.mean(dim=[2, 3])
+            threshold = 0.5
+            M_teacher_aligned_hard = (M_teacher_aligned >= threshold).float()
+            F_student_masked = F_student * M_teacher_aligned_hard
+            active_pixels = M_teacher_aligned_hard.sum(dim=[2, 3]) + 1e-6
+            z_masked = F_student_masked.sum(dim=[2, 3]) / active_pixels
             if hasattr(network_inner, 'projector_cnn'):
                 z_masked = network_inner.projector_cnn(z_masked)
 
