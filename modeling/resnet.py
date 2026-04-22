@@ -1,7 +1,9 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.model_zoo as model_zoo
+import torchvision.ops as ops
 from configs.defaults import _C as cfg
 
 model_urls = {"resnet18": "https://download.pytorch.org/models/resnet18-5c106cde.pth", "resnet34": "https://download.pytorch.org/models/resnet34-333f7ec4.pth", "resnet50": "https://download.pytorch.org/models/resnet50-19c8e357.pth", "resnet101": "https://download.pytorch.org/models/resnet101-5d3b4d8f.pth", "resnet152": "https://download.pytorch.org/models/resnet152-b121ed2d.pth",}
@@ -20,6 +22,38 @@ class Backbone(nn.Module):
 
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+
+class LoASP(nn.Module):
+    def __init__(self, channels, rank=4):
+        super().__init__()
+        reduced_channels = max(1, channels // rank)
+        self.down_s = nn.Conv2d(channels, reduced_channels, kernel_size=1, bias=False)
+        self.offset_conv = nn.Conv2d(reduced_channels, 2 * 3 * 3, kernel_size=3, padding=1, bias=True)
+        self.deform_conv = ops.DeformConv2d(reduced_channels, reduced_channels, kernel_size=3, padding=1, bias=False)
+        self.bn_ds = nn.BatchNorm2d(reduced_channels)
+        self.splin_approx = nn.Conv2d(reduced_channels, channels, kernel_size=1, bias=False)
+        self.ac = nn.Sigmoid()
+
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(reduced_channels, 1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+        self.current_mask = None
+
+    def forward(self, h_t):
+        s_t = self.down_s(h_t)
+        offsets = self.offset_conv(s_t)
+        s_t_deform = self.deform_conv(s_t, offsets)
+        self.current_mask = self.mask_head(s_t_deform)
+
+        s_t = F.relu(self.bn_ds(s_t_deform), inplace=True)
+        s_t = self.splin_approx(s_t)
+
+        gate = self.ac(s_t)
+        h_prime = h_t + gate * s_t
+        return h_prime
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -58,6 +92,7 @@ class Bottleneck(nn.Module):
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
+        self.loasp = LoASP(planes)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
@@ -71,6 +106,7 @@ class Bottleneck(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
+        out = self.loasp(out)
         out = self.conv3(out)
         out = self.bn3(out)
         if self.downsample is not None:
@@ -130,6 +166,16 @@ class ResNet(Backbone):
                 nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        for m in self.modules():
+            if m.__class__.__name__ == 'LoASP':
+                if hasattr(m, 'offset_conv'):
+                    nn.init.constant_(m.offset_conv.weight, 0.0)
+                    if m.offset_conv.bias is not None:
+                        nn.init.constant_(m.offset_conv.bias, 0.0)
+                if hasattr(m, 'splin_approx'):
+                    nn.init.constant_(m.splin_approx.weight, 0.0)
+                    if m.splin_approx.bias is not None:
+                        nn.init.constant_(m.splin_approx.bias, 0.0)
 
     def featuremaps(self, x):
         x = self.conv1(x)
