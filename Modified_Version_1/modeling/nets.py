@@ -83,7 +83,7 @@ class SoftLabelGCN(nn.Module):
         self.avg = nn.AdaptiveAvgPool2d(1)
         self.cnn_linear = nn.Linear(in_features, cfg.DATASET.NUM_CLASSES)
         self.remove_gcngate = False
-    
+
     def get_gcn_inp(self):
         inp = np.eye(self.cfg.DATASET.NUM_CLASSES)
         return inp
@@ -110,7 +110,7 @@ class SoftLabelGCN(nn.Module):
         x = self.sigmoid(x)
         if self.remove_gcngate: x = 0
         return x * cnn_x + cnn_x
-    
+
     def get_config_optim(self, lr_cnn, lr_gcn, lr_adj):
         return [{'params': self.cnn.parameters(), 'lr': lr_cnn}, {'params': self.cnn_linear.parameters(), 'lr': lr_cnn}, {'params': self.gcn1.parameters(), 'lr': lr_gcn}, {'params': self.gcn2.parameters(), 'lr': lr_gcn}, {'params': self.adj, 'lr': lr_adj},]
 
@@ -140,13 +140,13 @@ class ChannelGate(nn.Module):
         self.gate_channels = gate_channels
         self.mlp = nn.Sequential(Flatten(), nn.Linear(gate_channels, gate_channels // reduction_ratio), nn.ReLU(), nn.Linear(gate_channels // reduction_ratio, gate_channels))
         self.pool_types = pool_types
-    
+
     def logsumexp_2d(self, tensor):
         tensor_flatten = tensor.view(tensor.size(0), tensor.size(1), -1)
         s, _ = torch.max(tensor_flatten, dim=2, keepdim=True)
         outputs = s + (tensor_flatten - s).exp().sum(dim=2, keepdim=True).log()
         return outputs
-    
+
     def forward(self, x):
         channel_att_sum = None
         for pool_type in self.pool_types:
@@ -240,7 +240,7 @@ class CABNet(nn.Module):
         if self.__dict__.get("_out_features") is None:
             return None
         return self._out_features
-    
+
     def forward(self, x):
         feature = self.dropout(self.model(x))
         feature = self.global_attention(feature).unsqueeze(dim=2).unsqueeze(dim=3)
@@ -261,7 +261,7 @@ class MixupNet(nn.Module):
         if self.__dict__.get("_out_features") is None:
             return None
         return self._out_features
-    
+
     def forward(self, x):
         x = self.model(x)
         x = x.view(x.size(0), x.size(1), 1, -1)
@@ -344,7 +344,7 @@ class MixStyleNet(nn.Module):
         if self.__dict__.get("_out_features") is None:
             return None
         return self._out_features
-    
+
     def conv_layer(self, in_channel, out_channel, index):
         if index < 3:
             conv_block = nn.Sequential(nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=3, padding=1), nn.BatchNorm2d(out_channel), nn.ReLU(inplace=True), nn.Conv2d(in_channels=out_channel, out_channels=out_channel, kernel_size=3, padding=1), nn.BatchNorm2d(out_channel), nn.ReLU(inplace=True), nn.MaxPool2d(kernel_size=2, stride=2),)
@@ -390,7 +390,7 @@ class FishrNet(torch.nn.Module):
         if self.__dict__.get("_out_features") is None:
             return None
         return self._out_features
-    
+
     def train(self, mode=True):
         super().train(mode)
         self.freeze_bn()
@@ -580,10 +580,7 @@ class DINOv3Wrapper(nn.Module):
         return self._out_features
 
 class MultiLayerDualStreamNeck(nn.Module):
-    """
-    多层物理双流解耦颈部 (Multi-Layer Dual-Stream Neck)
-    拦截 ViT 最后的多层特征，强制进行参数化的物理分流。
-    """
+
     def __init__(self, in_dim=768, bottleneck_dim=128, num_layers=4):
         super().__init__()
         self.num_layers = num_layers
@@ -632,11 +629,7 @@ class RobustViTHead(nn.Module):
         return self.head(x)
 
 class RMLP_Projector(nn.Module):
-    """
-    终极混合 RMLP 投影头 (容量保全 + 拓扑正则)
-    1. 非线性容量：恢复 Linear-ReLU-Linear 结构，保住对比学习的表征映射能力。
-    2. 终末 RMLP：仅在输出前的一瞬间展开概率球，阻断捷径，拒绝伪影。
-    """
+
     def __init__(self, inp_dim: int, proj_dim: int = 1024, amplitude: float = 0.1):
         super().__init__()
         self.learnable_proj = nn.Sequential(

@@ -49,7 +49,6 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
         return out
 
-
 class LoASP(nn.Module):
     def __init__(self, channels, rank=4):
         super(LoASP, self).__init__()
@@ -115,7 +114,6 @@ class LoASP(nn.Module):
         h_prime = self.ac(h_t) + h_t + s_prime
         return h_prime
 
-
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -148,7 +146,6 @@ class Bottleneck(nn.Module):
         out += residual
         out = self.relu(out)
         return out
-
 
 class ResNet(Backbone):
     def __init__(self, block, layers, ms_class=None, ms_layers=[], ms_p=0.5, ms_a=0.1, **kwargs):
@@ -201,18 +198,17 @@ class ResNet(Backbone):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
         # ====================================================================
-        # 🚀 绝地反击补丁：在全局粗暴初始化之后，专门为 LoASP 强行恢复“零恒等映射”！
+
         # ====================================================================
         for m in self.modules():
-            # 使用类名字符串匹配，避免潜在的循环 Import 风险
+
             if m.__class__.__name__ == 'LoASP':
-                # 1. 锁死形变卷积的初始感受野，防止乱飞 (处理 weight 和 bias)
+
                 if hasattr(m, 'offset_conv'):
                     nn.init.constant_(m.offset_conv.weight, 0.0)
                     if m.offset_conv.bias is not None:
                         nn.init.constant_(m.offset_conv.bias, 0.0)
 
-                # 2. 强行闭合旁支，保证在 Epoch 0 时 h_prime = h_t，完美保护预训练骨干！
                 if hasattr(m, 'up_f'):
                     nn.init.constant_(m.up_f.weight, 0.0)
                     if m.up_f.bias is not None:

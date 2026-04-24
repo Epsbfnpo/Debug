@@ -41,7 +41,7 @@ class DahLoss(nn.Module):
         class_prob = torch.index_select(self.label_prob, 0, labels).cuda()
         class_weight = 1 / class_prob
         return domain_weight, class_weight
-                            
+
     def forward(self, output, features, labels, domains):
         domain_weight, class_weight = self.get_weights(labels, domains)
         loss_dict = {}
@@ -121,11 +121,10 @@ def D(p, z, version='simplified'):
         p = F.normalize(p, dim=1)
         z = F.normalize(z, dim=1)
         return -(p * z).sum(dim=1).mean()
-    elif version == 'simplified':  # 推荐使用
+    elif version == 'simplified':
         return - F.cosine_similarity(p, z.detach(), dim=-1).mean()
     else:
         raise Exception
-
 
 class GDRNetLoss_Integrated(nn.Module):
     def __init__(self, training_domains, beta):
