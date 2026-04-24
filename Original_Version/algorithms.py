@@ -23,7 +23,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
 
-
 def compute_attention_transfer_loss(map_cnn, map_vit):
     at_cnn = map_cnn.pow(2).mean(dim=1, keepdim=True)
     at_vit = map_vit.pow(2).mean(dim=1, keepdim=True)
@@ -33,11 +32,9 @@ def compute_attention_transfer_loss(map_cnn, map_vit):
     cos_sim = F.cosine_similarity(at_cnn_flat, at_vit_flat, dim=1)
     return (1.0 - cos_sim).mean()
 
-
 def compute_entropy(probs):
-    """计算预测分布的信息熵。熵越高越不确定，熵越低越自信。"""
-    return -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean().item()
 
+    return -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean().item()
 
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
@@ -52,11 +49,11 @@ class Algorithm(torch.nn.Module):
 
     def update(self, minibatches):
         raise NotImplementedError
-    
+
     def update_epoch(self, epoch):
         self.epoch = epoch
         return epoch
-    
+
     def validate(self, val_loader, test_loader, writer):
         raise NotImplementedError
 
@@ -65,7 +62,7 @@ class Algorithm(torch.nn.Module):
 
     def renew_model(self, log_path, **kwargs):
         raise NotImplementedError
-    
+
     def predict(self, x):
         raise NotImplementedError
 
@@ -85,7 +82,7 @@ class ERM(Algorithm):
         loss.backward()
         self.optimizer.step()
         return {'loss':loss}
-    
+
     def validate(self, val_loader, test_loader, writer):
         val_auc = -1
         test_auc = -1
@@ -113,7 +110,6 @@ class ERM(Algorithm):
     def predict(self, x):
         return self.classifier(self.network(x))
 
-
 class GDRNet(ERM):
     def __init__(self, num_classes, cfg):
         super(GDRNet, self).__init__(num_classes, cfg)
@@ -129,7 +125,7 @@ class GDRNet(ERM):
         self.split_num = 2
         self.combs = 3
         self.fundusAug = get_post_FundusAug(cfg)
-        # 对齐 GDRNetLoss_Integrated 最新签名，避免运行 GDRNet 基线时参数不匹配
+
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.optimizer = torch.optim.Adam([{"params": self.network.parameters()}, {"params": self.classifier.parameters()}, {"params": self.projector.parameters()}, {"params": self.predictor.parameters()}], lr=cfg.LEARNING_RATE, weight_decay=0.0001)
 
@@ -222,7 +218,7 @@ class GREEN(Algorithm):
         super(GREEN, self).__init__(num_classes, cfg)
         self.network = models.get_net(cfg)
         self.optimizer = torch.optim.Adam([{"params": self.network.parameters()}, {"params": self.classifier.parameters()}], lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-    
+
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
@@ -231,7 +227,7 @@ class GREEN(Algorithm):
         loss.backward()
         self.optimizer.step()
         return {'loss':loss}
-    
+
     def validate(self, val_loader, test_loader, writer):
         val_auc = -1
         test_auc = -1
@@ -244,31 +240,31 @@ class GREEN(Algorithm):
             test_auc, test_loss = algorithm_validate(self, test_loader, writer, self.cfg.EPOCHS + self.cfg.VAL_EPOCH, 'test')
             logging.info('Best performance on test domain(s): {}'.format(test_auc))
         return val_auc, test_auc
-    
+
     def save_model(self, log_path):
         logging.info("Saving best model...")
         torch.save(self.network.state_dict(), os.path.join(log_path, 'best_model.pth'))
-    
+
     def renew_model(self, log_path):
         net_path = os.path.join(log_path, 'best_model.pth')
         self.network.load_state_dict(torch.load(net_path))
-    
+
     def predict(self, x):
         return self.network(x)
-    
+
 class CABNet(ERM):
     def __init__(self, num_classes, cfg):
         super(CABNet, self).__init__(num_classes, cfg)
-        
+
 class MixStyleNet(ERM):
     def __init__(self, num_classes, cfg):
         super(MixStyleNet, self).__init__(num_classes, cfg)
-        
+
 class MixupNet(ERM):
     def __init__(self, num_classes, cfg):
         super(MixupNet, self).__init__(num_classes, cfg)
         self.criterion_CE = torch.nn.CrossEntropyLoss()
-    
+
     def update(self, minibatch, env_feats=None):
         image, mask, label, domain = minibatch
         self.optimizer.zero_grad()
@@ -278,7 +274,7 @@ class MixupNet(ERM):
         loss.backward()
         self.optimizer.step()
         return {'loss':loss}
-    
+
     def mixup_data(self, x, y, alpha=1.0, use_cuda=True):
         if alpha > 0:
             lam = np.random.beta(alpha, alpha)
@@ -292,10 +288,10 @@ class MixupNet(ERM):
         mixed_x = lam * x + (1 - lam) * x[index, :]
         y_a, y_b = y, y[index]
         return mixed_x, y_a, y_b, lam
-    
+
     def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-    
+
 class Fishr(ERM):
     def __init__(self, num_classes, cfg):
         super(Fishr, self).__init__(num_classes, cfg)
@@ -307,10 +303,10 @@ class Fishr(ERM):
         self.bce_extended = extend(nn.CrossEntropyLoss(reduction='none'))
         self.ema_per_domain = [misc.MovingAverage(cfg.FISHR.EMA, oneminusema_correction=True) for _ in range(self.num_groups)]
         self._init_optimizer()
-    
+
     def _init_optimizer(self):
         self.optimizer = torch.optim.Adam([{"params": self.network.parameters()}, {"params": self.classifier.parameters()}], lr=cfg.LEARNING_RATE, weight_decay=0.0001)
-        
+
     def update(self, minibatch):
         image, mask, label, domain = minibatch
         all_x = image
@@ -381,13 +377,13 @@ class DRGen(Algorithm):
         self.swad_algorithm = AveragedModel(self.algorithm)
         self.swad_algorithm.cuda()
         self.swad = LossValley(None, cfg.DRGEN.N_CONVERGENCE, cfg.DRGEN.N_TOLERANCE, cfg.DRGEN.TOLERANCE_RATIO)
-        
+
     def update(self, minibatch):
         loss_dict_iter = self.algorithm.update(minibatch)
         if self.swad:
             self.swad_algorithm.update_parameters(self.algorithm, step = self.epoch)
         return loss_dict_iter
-    
+
     def validate(self, val_loader, test_loader, writer):
         swad_val_auc = -1
         swad_auc = -1
@@ -412,14 +408,14 @@ class DRGen(Algorithm):
             logging.warning("Evaluate SWAD ...")
             swad_auc, swad_loss = algorithm_validate(self.swad_algorithm, test_loader, writer, self.cfg.EPOCHS + self.cfg.VAL_EPOCH , 'test')
             logging.info('(last) swad test auc: {}  loss: {}'.format(swad_auc,swad_loss))
-        return swad_val_auc, swad_auc    
-        
+        return swad_val_auc, swad_auc
+
     def save_model(self, log_path):
         self.algorithm.save_model(log_path)
-    
+
     def renew_model(self, log_path):
         self.algorithm.renew_model(log_path)
-    
+
     def predict(self, x):
         return self.swad_algorithm.predict(x)
 
@@ -569,10 +565,7 @@ class CASS_GDRNet(Algorithm):
 
     @torch.no_grad()
     def sample_queue_mean(self, current_features, labels, target_queue, class_prototypes):
-        """
-        Grade-aware 专属靶子生成器：只负责提取同类别的历史共识。
-        包含冷启动安全机制：如果队列中没有同类，平滑退化为当前特征。
-        """
+
         targets = []
         for i, label in enumerate(labels):
             class_idx = int(label.item())
@@ -701,7 +694,7 @@ class CASS_GDRNet(Algorithm):
         loss_sup = loss_sup_cnn + loss_sup_vit
 
         # ===================================================================
-        # 🌟 终极解耦对比学习模块 (Decoupled Contrastive Learning)
+
         # ===================================================================
         raw_target_cnn = res_momentum['proj_cnn'].detach().float()
         raw_target_vit = res_momentum['proj_vit'].detach().float()
@@ -753,9 +746,7 @@ class CASS_GDRNet(Algorithm):
         })
 
         # ==========================================
-        # 真正完美的双向互蒸馏 (Mutual KD)
-        # 1) KD 只做分布对齐，不再混入 true_dist，避免与 supervised CE 双重计算
-        # 2) 纯 KL + T^2 缩放，保证温度补偿的数学一致性
+
         # ==========================================
         kd_temp = 2.0
         kd_alpha = 0.5
@@ -787,22 +778,17 @@ class CASS_GDRNet(Algorithm):
         lambda_contrastive = 1.0
 
         # ===================================================================
-        # 🚀 零参数正交解耦 (Zero-Param Orthogonal Disentanglement) - 专家修订版
-        # 理论基础：强制 DINOv3 的 DRTs(TIA空间) 离开 Spatial Tokens(TRA空间)
+
         # ===================================================================
         tra_cls = res_clean_fp32['feat_vit']
         tia_cls = res_clean_fp32['tia_cls']
 
-        # 1. 锚点设为不可撼动，阻断梯度，保护病理空间不被反向污染
         tra_anchor_norm = F.normalize(tra_cls, dim=-1).unsqueeze(2).detach()
 
-        # 2. TIA 空间保留梯度，强迫其去参数化地拟合那些不属于疾病的相机特征
         tia_norm = F.normalize(tia_cls, dim=-1).unsqueeze(1)
 
-        # 3. 计算同一样本在两个独立网络分支中的余弦相似度
         cos_sim_ortho = torch.bmm(tia_norm, tra_anchor_norm).squeeze(2).squeeze(1)
 
-        # 4. 平方惩罚
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
         probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
@@ -818,7 +804,6 @@ class CASS_GDRNet(Algorithm):
             unique_classes_cnn = len(torch.unique(pred_cnn_classes))
             unique_classes_vit = len(torch.unique(pred_vit_classes))
 
-            # 监控熵时使用真实温度 T=1.0，避免日志被蒸馏温度扭曲
             vit_probs_for_log = F.softmax(res_momentum['logits_vit'].detach(), dim=1)
             ema_vit_entropy = compute_entropy(vit_probs_for_log)
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)

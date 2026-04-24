@@ -23,8 +23,6 @@ class Backbone(nn.Module):
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
-
-
 class LoASP(nn.Module):
     def __init__(self, channels, rank=4):
         super().__init__()
@@ -81,7 +79,6 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
         return out
 
-
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -114,7 +111,6 @@ class Bottleneck(nn.Module):
         out += residual
         out = self.relu(out)
         return out
-
 
 class ResNet(Backbone):
     def __init__(self, block, layers, ms_class=None, ms_layers=[], ms_p=0.5, ms_a=0.1, **kwargs):

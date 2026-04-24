@@ -47,7 +47,6 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
         return out
 
-
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -78,7 +77,6 @@ class Bottleneck(nn.Module):
         out += residual
         out = self.relu(out)
         return out
-
 
 class ResNet(Backbone):
     def __init__(self, block, layers, ms_class=None, ms_layers=[], ms_p=0.5, ms_a=0.1, **kwargs):
