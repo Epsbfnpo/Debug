@@ -61,11 +61,12 @@ def update_writer(writer, epoch, scheduler, loss_avg):
     lr = scheduler.get_last_lr()[0]
     writer.add_scalar('info/lr', lr, epoch)
     if isinstance(loss_avg, dict):
-        main_loss = loss_avg.get('loss', 0.0)
-        logging.info('epoch: {}, lr: {:.8f}, total loss: {}'.format(epoch, lr, main_loss))
+        log_str = f"epoch: {epoch}, lr: {lr:.8f}"
         for k, v in loss_avg.items():
+            log_str += f", {k}: {v:.4f}"
             writer.add_scalar(f'Train/{k}', v, epoch)
-        writer.add_scalar('info/loss', main_loss, epoch)
+        logging.info(log_str)
+        writer.add_scalar('info/loss', loss_avg.get('loss', 0.0), epoch)
     else:
         logging.info('epoch: {}, lr: {:.8f}, total loss: {}'.format(epoch, lr, loss_avg.mean()))
         writer.add_scalar('info/loss', loss_avg.mean(), epoch)
