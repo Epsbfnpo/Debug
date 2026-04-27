@@ -83,7 +83,7 @@ def _normalize_domain_loaders(test_loader):
 
 def _branch_candidates(algorithm):
     if algorithm.__class__.__name__ == 'CASS_GDRNet':
-        return ['cnn', 'vit', 'fusion']
+        return ['cnn', 'vit']
     return ['fusion']
 
 
@@ -173,8 +173,14 @@ def main():
 
     start_epoch = 1
     best_performance = 0.0
-    best_val_metrics = {k: 0.0 for k in BEST_MODEL_METRICS}
-    best_val_epochs = {k: 0 for k in BEST_MODEL_METRICS}
+
+    branch_candidates = _branch_candidates(algorithm)
+    if branch_candidates == ['cnn', 'vit']:
+        best_val_metrics = {f"{b}_{m}": 0.0 for b in ['cnn', 'vit'] for m in BEST_MODEL_METRICS}
+        best_val_epochs = {f"{b}_{m}": 0 for b in ['cnn', 'vit'] for m in BEST_MODEL_METRICS}
+    else:
+        best_val_metrics = {f"{b}_{m}": 0.0 for b in branch_candidates for m in BEST_MODEL_METRICS}
+        best_val_epochs = {f"{b}_{m}": 0 for b in branch_candidates for m in BEST_MODEL_METRICS}
 
     if os.path.exists(latest_ckpt_path):
         debug_log(f"Found {latest_ckpt_path}. Resuming training...", args.local_rank)
@@ -193,8 +199,6 @@ def main():
         initial=start_epoch - 1,
         total=cfg.EPOCHS,
     )
-
-    branch_candidates = _branch_candidates(algorithm)
 
     for i in iterator:
         epoch = i + 1
@@ -230,32 +234,30 @@ def main():
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Validation...")
 
-            # 1. 所有 rank 共同参与源域验证
-            current_val_metrics, _ = algorithm_validate(
-                algorithm,
-                val_loader,
-                writer,
-                epoch,
-                'val',
-                branch='fusion',
-            )
+            for branch in branch_candidates:
+                metrics, _ = algorithm_validate(
+                    algorithm,
+                    val_loader,
+                    writer,
+                    epoch,
+                    'val',
+                    branch=branch,
+                )
 
-            # 2. 只有 rank 0 负责判断和保存模型
-            if args.local_rank in [-1, 0]:
-                for metric_name in BEST_MODEL_METRICS:
-                    current_val = current_val_metrics.get(metric_name, 0.0)
-                    if current_val > best_val_metrics[metric_name]:
-                        best_val_metrics[metric_name] = current_val
-                        best_val_epochs[metric_name] = epoch
-                        save_path = _save_best_metric_model(algorithm, log_path, metric_name)
-                        logging.info(f"[{metric_name}] improved to {current_val:.6f}, saving model to {save_path}")
+                if args.local_rank in [-1, 0]:
+                    for metric_name in BEST_MODEL_METRICS:
+                        key = f"{branch}_{metric_name}"
+                        current_val = metrics.get(metric_name, 0.0)
+                        if current_val > best_val_metrics[key]:
+                            best_val_metrics[key] = current_val
+                            best_val_epochs[key] = epoch
+                            _save_best_metric_model(algorithm, log_path, key)
+                            logging.info(f"[{key}] improved to {current_val:.6f}, saving model")
 
-                best_performance = max(best_performance, current_val_metrics.get('macro_f1', 0.0))
+                    best_performance = max(best_performance, metrics.get('macro_f1', 0.0))
 
-            # 3. 【核心修复点】：诊断测试必须让所有 rank 参与，因此移出 if 块
             for test_env_name, test_env_loader in test_loaders.items():
                 for branch in branch_candidates:
-                    # 所有卡都进 algorithm_validate 进行分布式推理和 all_gather
                     test_metrics, _ = algorithm_validate(
                         algorithm,
                         test_env_loader,
@@ -265,7 +267,6 @@ def main():
                         branch=branch,
                     )
 
-                    # 4. 推理完之后，只有 rank 0 负责把收集齐的指标写入日志和 CSV
                     if args.local_rank in [-1, 0]:
                         for metric_name, val in test_metrics.items():
                             if metric_name in METRIC_NAMES:

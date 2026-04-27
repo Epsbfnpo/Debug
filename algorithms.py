@@ -590,13 +590,21 @@ class CASS_GDRNet(Algorithm):
             for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
 
-        loss_dict['fastmoco'] = loss_fastmoco.item()
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
+        # ==========================================
+        # 深度探测点 (Probes): 监控每一个模块的工作状态
+        # ==========================================
+        loss_dict = {}
+        loss_dict['loss_main'] = loss_main.item()
+        loss_dict['moco_sim'] = cos_sim_mix.mean().item()
+        loss_dict['loss_moco'] = loss_fastmoco.item()
+        loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
+        loss_dict['loss_kd_vit'] = loss_kd_vit.item()
         loss_dict['loss_ortho'] = loss_ortho.item()
-        loss_dict['loss'] = total_loss.item()
         loss_dict['gate1'] = network_inner.bridge1.gate.item()
         loss_dict['gate2'] = network_inner.bridge2.gate.item()
         loss_dict['gate3'] = network_inner.bridge3.gate.item()
+        loss_dict['loss'] = total_loss.item()
+
         return loss_dict
 
     def update_epoch(self, epoch):
