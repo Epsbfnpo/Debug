@@ -1,25 +1,40 @@
-import os
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import numpy as np
-import random
-import time
-import logging
+import csv
 import datetime
+import logging
+import os
+import random
 import sys
-from tqdm import tqdm
-import algorithms
-from utils.args import get_args, setup_cfg
-from utils.misc import init_log, LossCounter, get_scheduler, update_writer
-from utils.validate import algorithm_validate
-from dataset.data_manager import get_dataset
+import time
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+
+import algorithms
+from dataset.data_manager import get_dataset
+from utils.args import get_args, setup_cfg
+from utils.misc import MultiLossCounter, init_log, update_writer
+from utils.validate import METRIC_NAMES, algorithm_validate
+
+
+BEST_MODEL_METRICS = [
+    'macro_f1',
+    'weighted_f1',
+    'macro_ovr_auc',
+    'macro_ovo_auc',
+    'weighted_ovr_auc',
+    'weighted_ovo_auc',
+]
+
 
 def debug_log(msg, rank):
     timestamp = datetime.datetime.now().strftime('%H:%M:%S')
     print(f"[{timestamp}][Rank {rank}] {msg}", flush=True)
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -29,13 +44,17 @@ def set_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+
 def save_checkpoint(path, algorithm, optimizer, scheduler, epoch, best_performance):
-    if hasattr(algorithm.network, 'module'):
-        network_state = algorithm.network.module.state_dict()
-    else:
-        network_state = algorithm.network.state_dict()
-    state = {'epoch': epoch, 'algorithm_state': algorithm.state_dict(), 'optimizer_state': optimizer.state_dict(), 'scheduler_state': scheduler.state_dict(), 'best_performance': best_performance}
+    state = {
+        'epoch': epoch,
+        'algorithm_state': algorithm.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'best_performance': best_performance,
+    }
     torch.save(state, path)
+
 
 def load_checkpoint(path, algorithm, optimizer, scheduler):
     print(f"Loading checkpoint from {path}...")
@@ -53,11 +72,45 @@ def load_checkpoint(path, algorithm, optimizer, scheduler):
     best_performance = checkpoint.get('best_performance', 0.0)
     return start_epoch, best_performance
 
+
+def _normalize_domain_loaders(test_loader):
+    if isinstance(test_loader, dict):
+        return test_loader
+    if isinstance(test_loader, (list, tuple)):
+        return {f'test_{idx}': loader for idx, loader in enumerate(test_loader)}
+    return {'test': test_loader}
+
+
+def _branch_candidates(algorithm):
+    if algorithm.__class__.__name__ == 'CASS_GDRNet':
+        return ['cnn', 'vit', 'fusion']
+    return ['fusion']
+
+
+def _init_diagnostic_csv(csv_path):
+    with open(csv_path, 'w', newline='') as f:
+        writer_csv = csv.writer(f)
+        writer_csv.writerow(['Epoch', 'Domain', 'Branch'] + METRIC_NAMES)
+
+
+def _append_diagnostic_row(csv_path, row):
+    with open(csv_path, 'a', newline='') as f:
+        writer_csv = csv.writer(f)
+        writer_csv.writerow(row)
+
+
+def _save_best_metric_model(algorithm, output_dir, metric_name):
+    save_path = os.path.join(output_dir, f'best_val_{metric_name}.pth')
+    torch.save(algorithm.state_dict(), save_path)
+    return save_path
+
+
 def main():
     start_time = time.time()
     args = get_args()
     if 'LOCAL_RANK' in os.environ:
         args.local_rank = int(os.environ['LOCAL_RANK'])
+
     if args.local_rank != -1:
         torch.cuda.set_device(args.local_rank)
         dist.init_process_group(backend='nccl')
@@ -66,19 +119,24 @@ def main():
     else:
         args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         is_distributed = False
+
     cfg = setup_cfg(args)
     root_output = os.path.abspath(cfg.OUT_DIR)
     log_path = os.path.join(root_output, cfg.OUTPUT_PATH)
-    if not os.path.exists(log_path):
-        os.makedirs(log_path, exist_ok=True)
+    os.makedirs(log_path, exist_ok=True)
+
     writer = None
     if args.local_rank in [-1, 0]:
         writer = init_log(args, cfg, log_path, 0, [0, 0, 0])
         logging.info(f"Distributed: {is_distributed}, Rank: {args.local_rank}")
         print(f"[INFO] Log Path: {log_path}")
+
     set_seed(cfg.SEED)
+
     latest_ckpt_path = os.path.join(log_path, 'latest_model.pth')
     final_ckpt_path = os.path.join(log_path, 'final_model.pth')
+    diagnostic_csv_path = os.path.join(log_path, 'diagnostic_metrics.csv')
+
     if os.path.exists(final_ckpt_path):
         if args.local_rank in [-1, 0]:
             print(f"✅ Found {final_ckpt_path}. Training already completed.")
@@ -86,27 +144,38 @@ def main():
             dist.barrier()
             dist.destroy_process_group()
         sys.exit(0)
+
     debug_log("Loading datasets...", args.local_rank)
     train_loader, val_loader, test_loader, dataset_size, train_sampler = get_dataset(args, cfg)
+    test_loaders = _normalize_domain_loaders(test_loader)
+
     algorithm_class = algorithms.get_algorithm_class(cfg.ALGORITHM)
     algorithm = algorithm_class(cfg.DATASET.NUM_CLASSES, cfg)
     algorithm.to(args.device)
+
     if is_distributed:
         algorithm = nn.SyncBatchNorm.convert_sync_batchnorm(algorithm)
-        algorithm.network = DDP(algorithm.network, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        algorithm.network = DDP(
+            algorithm.network,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=True,
+        )
         if hasattr(algorithm, 'projector'):
             algorithm.projector = DDP(algorithm.projector, device_ids=[args.local_rank], output_device=args.local_rank)
         if hasattr(algorithm, 'predictor'):
             algorithm.predictor = DDP(algorithm.predictor, device_ids=[args.local_rank], output_device=args.local_rank)
-        if hasattr(algorithm, 'classifier'):
-            if len(list(algorithm.classifier.parameters())) > 0:
-                algorithm.classifier = DDP(algorithm.classifier, device_ids=[args.local_rank], output_device=args.local_rank)
+        if hasattr(algorithm, 'classifier') and len(list(algorithm.classifier.parameters())) > 0:
+            algorithm.classifier = DDP(algorithm.classifier, device_ids=[args.local_rank], output_device=args.local_rank)
+
     optimizer = algorithm.optimizer
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=0.00015)
+
     start_epoch = 1
     best_performance = 0.0
-    best_performance_cnn = 0.0
-    best_performance_vit = 0.0
+    best_val_metrics = {k: 0.0 for k in BEST_MODEL_METRICS}
+    best_val_epochs = {k: 0 for k in BEST_MODEL_METRICS}
+
     if os.path.exists(latest_ckpt_path):
         debug_log(f"Found {latest_ckpt_path}. Resuming training...", args.local_rank)
         try:
@@ -114,109 +183,128 @@ def main():
             debug_log(f"Resumed from Epoch {start_epoch}.", args.local_rank)
         except Exception as e:
             debug_log(f"Error loading checkpoint: {e}. Starting from scratch.", args.local_rank)
-    iterator = tqdm(range(start_epoch - 1, cfg.EPOCHS), disable=(args.local_rank not in [-1, 0]), initial=start_epoch - 1, total=cfg.EPOCHS)
+
+    if args.local_rank in [-1, 0] and not os.path.exists(diagnostic_csv_path):
+        _init_diagnostic_csv(diagnostic_csv_path)
+
+    iterator = tqdm(
+        range(start_epoch - 1, cfg.EPOCHS),
+        disable=(args.local_rank not in [-1, 0]),
+        initial=start_epoch - 1,
+        total=cfg.EPOCHS,
+    )
+
+    branch_candidates = _branch_candidates(algorithm)
+
     for i in iterator:
         epoch = i + 1
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(i)
-        loss_avg = LossCounter()
+
+        loss_counter = MultiLossCounter()
         algorithm.train()
+
         for image, mask, label, domain, img_index in train_loader:
             image = image.to(args.device)
             mask = mask.to(args.device)
             label = label.to(args.device).long()
             domain = domain.to(args.device).long()
             minibatch = [image, mask, label, domain]
-            loss_dict_iter = algorithm.update(minibatch)
-            loss_avg.update(loss_dict_iter['loss'])
+            step_vals = algorithm.update(minibatch)
+            loss_counter.update(step_vals, image.size(0))
+
         if hasattr(algorithm, 'update_epoch'):
             algorithm.update_epoch(epoch)
+
+        epoch_losses = loss_counter.get_averages()
         if args.local_rank in [-1, 0]:
-            update_writer(writer, epoch, scheduler, loss_avg)
+            update_writer(writer, epoch, scheduler, epoch_losses)
+
         scheduler.step()
+
         if args.local_rank in [-1, 0]:
-            save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance)
+            tracked_main = epoch_losses.get('loss', 0.0)
+            save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance=max(best_performance, tracked_main))
+
         if epoch % cfg.VAL_EPOCH == 0:
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Validation...")
-            val_metrics, val_loss = algorithm_validate(algorithm, val_loader, writer, epoch, 'val')
-            is_dual_stream = ('cnn_auc' in val_metrics and 'vit_auc' in val_metrics)
-            if is_dual_stream:
-                val_auc_cnn = val_metrics['cnn_auc']
-                if args.local_rank in [-1, 0]:
-                    if val_auc_cnn > best_performance_cnn:
-                        best_performance_cnn = val_auc_cnn
-                        logging.info(f"⭐️ [CNN] New Best! Val AUC: {val_auc_cnn:.4f}")
-                        algorithm.save_model(log_path, source='cnn')
-                val_auc_vit = val_metrics['vit_auc']
-                if args.local_rank in [-1, 0]:
-                    if val_auc_vit > best_performance_vit:
-                        best_performance_vit = val_auc_vit
-                        logging.info(f"⭐️ [ViT] New Best! Val AUC: {val_auc_vit:.4f}")
-                        algorithm.save_model(log_path, source='vit')
-                best_performance = max(best_performance_cnn, best_performance_vit)
-            else:
-                val_auc = val_metrics['auc']
-                if args.local_rank in [-1, 0]:
-                    if val_auc > best_performance:
-                        best_performance = val_auc
-                        logging.info(f"⭐️ New Best Model! Val AUC: {val_auc:.4f}")
-                        algorithm.save_model(log_path)
+
+            # 1. 所有 rank 共同参与源域验证
+            current_val_metrics, _ = algorithm_validate(
+                algorithm,
+                val_loader,
+                writer,
+                epoch,
+                'val',
+                branch='fusion',
+            )
+
+            # 2. 只有 rank 0 负责判断和保存模型
+            if args.local_rank in [-1, 0]:
+                for metric_name in BEST_MODEL_METRICS:
+                    current_val = current_val_metrics.get(metric_name, 0.0)
+                    if current_val > best_val_metrics[metric_name]:
+                        best_val_metrics[metric_name] = current_val
+                        best_val_epochs[metric_name] = epoch
+                        save_path = _save_best_metric_model(algorithm, log_path, metric_name)
+                        logging.info(f"[{metric_name}] improved to {current_val:.6f}, saving model to {save_path}")
+
+                best_performance = max(best_performance, current_val_metrics.get('macro_f1', 0.0))
+
+            # 3. 【核心修复点】：诊断测试必须让所有 rank 参与，因此移出 if 块
+            for test_env_name, test_env_loader in test_loaders.items():
+                for branch in branch_candidates:
+                    # 所有卡都进 algorithm_validate 进行分布式推理和 all_gather
+                    test_metrics, _ = algorithm_validate(
+                        algorithm,
+                        test_env_loader,
+                        writer,
+                        epoch,
+                        f'test_{test_env_name}',
+                        branch=branch,
+                    )
+
+                    # 4. 推理完之后，只有 rank 0 负责把收集齐的指标写入日志和 CSV
+                    if args.local_rank in [-1, 0]:
+                        for metric_name, val in test_metrics.items():
+                            if metric_name in METRIC_NAMES:
+                                writer.add_scalar(f'Test_{test_env_name}/{branch}_{metric_name}', val, global_step=epoch)
+                        row = [epoch, test_env_name, branch] + [test_metrics.get(m, 0.0) for m in METRIC_NAMES]
+                        _append_diagnostic_row(diagnostic_csv_path, row)
+
+            if args.local_rank in [-1, 0]:
+                logging.info(f"Epoch {epoch} Diagnostic Testing Complete.")
+
             if is_distributed:
                 dist.barrier()
+
         if args.time_limit > 0:
             elapsed_time = time.time() - start_time
             if elapsed_time > (args.time_limit - 300):
                 if args.local_rank in [-1, 0]:
                     save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance)
-                    if writer: writer.close()
+                    if writer:
+                        writer.close()
                 if is_distributed:
                     dist.barrier()
                     dist.destroy_process_group()
                 sys.exit(0)
+
     debug_log("Training Finished. Starting Final Testing...", args.local_rank)
-    is_dual_stream = ('cnn_auc' in val_metrics and 'vit_auc' in val_metrics)
-    if is_dual_stream:
-        branches_to_test = ['cnn', 'vit']
-        for branch in branches_to_test:
-            if args.local_rank in [-1, 0]:
-                logging.info(f"🔄 Loading Best {branch.upper()} Model for Testing...")
-            try:
-                algorithm.renew_model(log_path, source=branch)
-            except Exception as e:
-                pass
-            if is_distributed: dist.barrier()
-            test_metrics, test_loss = algorithm_validate(algorithm, test_loader, writer, cfg.EPOCHS, 'test')
-            target_auc = test_metrics.get(f'{branch}_auc', test_metrics.get('auc', 0.0))
-            target_acc = test_metrics.get(f'{branch}_acc', test_metrics.get('acc', 0.0))
-            target_f1 = test_metrics.get(f'{branch}_f1', test_metrics.get('f1', 0.0))
-            if args.local_rank in [-1, 0]:
-                with open(os.path.join(log_path, f'done_{branch}'), 'w') as f:
-                    f.write(f'done, best_val={best_performance_cnn if branch == "cnn" else best_performance_vit:.4f}, test_auc={target_auc:.4f}, test_acc={target_acc:.4f}, test_f1={target_f1:.4f}')
-    else:
-        if args.local_rank in [-1, 0]:
-            save_checkpoint(final_ckpt_path, algorithm, optimizer, scheduler, cfg.EPOCHS, best_performance)
-        if is_distributed:
-            dist.barrier()
-        try:
-            algorithm.renew_model(log_path)
-            if args.local_rank == 0:
-                logging.info("Loaded Best Model for Testing.")
-        except Exception as e:
-            if args.local_rank == 0:
-                logging.warning(f"Could not load best model ({e}), using current model.")
-        test_metrics, test_loss = algorithm_validate(algorithm, test_loader, writer, cfg.EPOCHS, 'test')
-        test_auc = test_metrics['auc']
-        test_acc = test_metrics['acc']
-        test_f1 = test_metrics['f1']
-        if args.local_rank in [-1, 0]:
-            logging.info(f"🚀 Final Test Results - AUC: {test_auc:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}")
-            with open(os.path.join(log_path, 'done'), 'w') as f:
-                f.write(f'done, best_val={best_performance:.4f}, test_auc={test_auc:.4f}, test_acc={test_acc:.4f}, test_f1={test_f1:.4f}')
-        if writer: writer.close()
+
+    if args.local_rank in [-1, 0]:
+        save_checkpoint(final_ckpt_path, algorithm, optimizer, scheduler, cfg.EPOCHS, best_performance)
+        with open(os.path.join(log_path, 'done'), 'w') as f:
+            f.write(f'done, best_val_metrics={best_val_metrics}, best_val_epochs={best_val_epochs}')
+
+    if writer:
+        writer.close()
+
     if is_distributed:
         dist.barrier()
         dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
