@@ -1,5 +1,5 @@
 import sys, os, logging, shutil
-from torch.utils.tensorboard import SummaryWriter   
+from torch.utils.tensorboard import SummaryWriter
 import torch, random
 import numpy as np
 from collections import Counter
@@ -58,9 +58,17 @@ def get_scheduler(optimizer, max_epoch):
     return scheduler
 
 def update_writer(writer, epoch, scheduler, loss_avg):
-    logging.info('epoch: {}, total loss: {}'.format(epoch, loss_avg.mean()))
-    writer.add_scalar('info/lr', scheduler.get_last_lr()[0], epoch) 
-    writer.add_scalar('info/loss', loss_avg.mean(), epoch)
+    lr = scheduler.get_last_lr()[0]
+    writer.add_scalar('info/lr', lr, epoch)
+    if isinstance(loss_avg, dict):
+        main_loss = loss_avg.get('loss', 0.0)
+        logging.info('epoch: {}, lr: {:.8f}, total loss: {}'.format(epoch, lr, main_loss))
+        for k, v in loss_avg.items():
+            writer.add_scalar(f'Train/{k}', v, epoch)
+        writer.add_scalar('info/loss', main_loss, epoch)
+    else:
+        logging.info('epoch: {}, lr: {:.8f}, total loss: {}'.format(epoch, lr, loss_avg.mean()))
+        writer.add_scalar('info/loss', loss_avg.mean(), epoch)
 
 class MovingAverage:
     def __init__(self, ema, oneminusema_correction=True):
@@ -95,3 +103,25 @@ class LossCounter:
         self.iteration += 1
     def mean(self):
         return self.sum * 1.0 / self.iteration
+
+class MultiLossCounter:
+    def __init__(self):
+        self.metrics = {}
+        self.counts = {}
+
+    def update(self, metrics_dict, n=1):
+        for k, v in metrics_dict.items():
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            if k not in self.metrics:
+                self.metrics[k] = 0.0
+                self.counts[k] = 0
+            self.metrics[k] += float(v) * n
+            self.counts[k] += n
+
+    def get_averages(self):
+        return {k: self.metrics[k] / max(self.counts[k], 1) for k in self.metrics.keys()}
+
+    def reset(self):
+        self.metrics = {}
+        self.counts = {}

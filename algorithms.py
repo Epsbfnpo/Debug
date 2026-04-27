@@ -46,7 +46,7 @@ class Algorithm(torch.nn.Module):
     def renew_model(self, log_path, **kwargs):
         raise NotImplementedError
     
-    def predict(self, x):
+    def predict(self, x, branch=None):
         raise NotImplementedError
 
 class ERM(Algorithm):
@@ -90,7 +90,7 @@ class ERM(Algorithm):
         self.network.load_state_dict(torch.load(net_path))
         self.classifier.load_state_dict(torch.load(classifier_path))
 
-    def predict(self, x):
+    def predict(self, x, branch=None):
         return self.classifier(self.network(x))
 
 
@@ -232,7 +232,7 @@ class GREEN(Algorithm):
         net_path = os.path.join(log_path, 'best_model.pth')
         self.network.load_state_dict(torch.load(net_path))
     
-    def predict(self, x):
+    def predict(self, x, branch=None):
         return self.network(x)
     
 class CABNet(ERM):
@@ -399,7 +399,7 @@ class DRGen(Algorithm):
     def renew_model(self, log_path):
         self.algorithm.renew_model(log_path)
     
-    def predict(self, x):
+    def predict(self, x, branch=None):
         return self.swad_algorithm.predict(x)
 
 class CASS_GDRNet(Algorithm):
@@ -627,9 +627,19 @@ class CASS_GDRNet(Algorithm):
             logging.info("=" * 30)
         return val_auc_cnn, test_auc_cnn
 
-    def predict(self, x):
+    def predict(self, x, branch='fusion'):
         res = self.network(x_cnn=x, x_vit=x)
-        return res
+        if branch == 'cnn':
+            return res['logits_cnn']
+        if branch == 'vit':
+            return res['logits_vit']
+        if branch == 'fusion':
+            if 'logits_fusion' in res:
+                return res['logits_fusion']
+            if 'logits' in res:
+                return res['logits']
+            return res['logits_cnn']
+        raise ValueError(f"Unknown branch: {branch}")
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0
