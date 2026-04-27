@@ -230,6 +230,7 @@ def main():
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Validation...")
 
+            # 1. 所有 rank 共同参与源域验证
             current_val_metrics, _ = algorithm_validate(
                 algorithm,
                 val_loader,
@@ -239,6 +240,7 @@ def main():
                 branch='fusion',
             )
 
+            # 2. 只有 rank 0 负责判断和保存模型
             if args.local_rank in [-1, 0]:
                 for metric_name in BEST_MODEL_METRICS:
                     current_val = current_val_metrics.get(metric_name, 0.0)
@@ -250,22 +252,28 @@ def main():
 
                 best_performance = max(best_performance, current_val_metrics.get('macro_f1', 0.0))
 
-                for test_env_name, test_env_loader in test_loaders.items():
-                    for branch in branch_candidates:
-                        test_metrics, _ = algorithm_validate(
-                            algorithm,
-                            test_env_loader,
-                            writer,
-                            epoch,
-                            f'test_{test_env_name}',
-                            branch=branch,
-                        )
+            # 3. 【核心修复点】：诊断测试必须让所有 rank 参与，因此移出 if 块
+            for test_env_name, test_env_loader in test_loaders.items():
+                for branch in branch_candidates:
+                    # 所有卡都进 algorithm_validate 进行分布式推理和 all_gather
+                    test_metrics, _ = algorithm_validate(
+                        algorithm,
+                        test_env_loader,
+                        writer,
+                        epoch,
+                        f'test_{test_env_name}',
+                        branch=branch,
+                    )
+
+                    # 4. 推理完之后，只有 rank 0 负责把收集齐的指标写入日志和 CSV
+                    if args.local_rank in [-1, 0]:
                         for metric_name, val in test_metrics.items():
                             if metric_name in METRIC_NAMES:
                                 writer.add_scalar(f'Test_{test_env_name}/{branch}_{metric_name}', val, global_step=epoch)
                         row = [epoch, test_env_name, branch] + [test_metrics.get(m, 0.0) for m in METRIC_NAMES]
                         _append_diagnostic_row(diagnostic_csv_path, row)
 
+            if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Diagnostic Testing Complete.")
 
             if is_distributed:
