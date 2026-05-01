@@ -10,7 +10,6 @@ from tqdm import tqdm
 METRIC_NAMES = [
     'acc',
     'macro_f1',
-    'weighted_f1',
     'macro_ovr_auc',
     'macro_ovo_auc',
     'weighted_ovr_auc',
@@ -200,7 +199,7 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type, branch=N
         logging.info(
             f"{val_type}{branch_suffix} - Epoch: {epoch}, Loss: {metrics['loss']:.4f}, "
             f"Acc: {metrics['acc']:.4f}, MacroF1: {metrics['macro_f1']:.4f}, "
-            f"WeightedF1: {metrics['weighted_f1']:.4f}, MacroOVR-AUC: {metrics['macro_ovr_auc']:.4f}, "
+            f"MacroOVR-AUC: {metrics['macro_ovr_auc']:.4f}, "
             f"MacroOVO-AUC: {metrics['macro_ovo_auc']:.4f}, WeightedOVR-AUC: {metrics['weighted_ovr_auc']:.4f}, "
             f"WeightedOVO-AUC: {metrics['weighted_ovo_auc']:.4f}"
         )
