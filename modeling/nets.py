@@ -842,12 +842,11 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[3 + 1]
         feat_vit_6 = vit_outputs.hidden_states[6 + 1]
         feat_vit_9 = vit_outputs.hidden_states[9 + 1]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
         attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
         attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
+        feat_vit_3_clean, _ = self._strip_drts_and_attn(feat_vit_3, None)
+        feat_vit_6_clean, _ = self._strip_drts_and_attn(feat_vit_6, attn_6)
+        feat_vit_9_clean, _ = self._strip_drts_and_attn(feat_vit_9, attn_9)
         for l_idx in self.target_layers:
             if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
                 self.hooked_attns[l_idx].current_attn_map = None
@@ -860,6 +859,7 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
+        # earliest-stage bridge fusion intentionally removed
         x = self.cnn.layer2(x)
         x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean)
         x = self.refine2(x)
@@ -890,12 +890,11 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_3 = vit_outputs.hidden_states[4]
         feat_vit_6 = vit_outputs.hidden_states[7]
         feat_vit_9 = vit_outputs.hidden_states[10]
-        attn_3 = getattr(self.hooked_attns[3], 'current_attn_map', None)
         attn_6 = getattr(self.hooked_attns[6], 'current_attn_map', None)
         attn_9 = getattr(self.hooked_attns[9], 'current_attn_map', None)
-        feat_vit_3_clean, attn_3_clean = self._strip_drts_and_attn(feat_vit_3, attn_3)
-        feat_vit_6_clean, attn_6_clean = self._strip_drts_and_attn(feat_vit_6, attn_6)
-        feat_vit_9_clean, attn_9_clean = self._strip_drts_and_attn(feat_vit_9, attn_9)
+        feat_vit_3_clean, _ = self._strip_drts_and_attn(feat_vit_3, None)
+        feat_vit_6_clean, _ = self._strip_drts_and_attn(feat_vit_6, attn_6)
+        feat_vit_9_clean, _ = self._strip_drts_and_attn(feat_vit_9, attn_9)
         for l_idx in self.target_layers:
             if hasattr(self.hooked_attns[l_idx], 'current_attn_map'):
                 self.hooked_attns[l_idx].current_attn_map = None
@@ -904,6 +903,7 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
+        # earliest-stage bridge fusion intentionally removed
         x = self.cnn.layer2(x)
         x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean)
         x = self.refine2(x)
