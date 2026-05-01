@@ -527,6 +527,7 @@ class CASS_GDRNet(Algorithm):
             'proj_vit': res_combined['proj_vit'].float(),
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
+            'logits_fusion': res_combined['logits_fusion'].float(),
             'drts': res_combined['drts'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
         }
@@ -571,9 +572,11 @@ class CASS_GDRNet(Algorithm):
         loss_kd_total = loss_kd_cnn + loss_kd_vit
 
         loss_ortho = torch.zeros((), device=label.device)
+        loss_fusion = F.cross_entropy(res_clean_fp32['logits_fusion'], label)
 
         lambda_moco = 0.3
-        total_loss = loss_main + lambda_moco * loss_fastmoco + 1.0 * loss_kd_total
+        lambda_fusion = 1.0
+        total_loss = loss_main + lambda_fusion * loss_fusion + lambda_moco * loss_fastmoco + 1.0 * loss_kd_total
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -594,6 +597,7 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss_moco'] = loss_fastmoco.item()
         loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
         loss_dict['loss_kd_vit'] = loss_kd_vit.item()
+        loss_dict['loss_fusion'] = loss_fusion.item()
         loss_dict['loss_ortho'] = loss_ortho.item()
 
         def safe_gate_value(module):
@@ -606,6 +610,8 @@ class CASS_GDRNet(Algorithm):
         loss_dict['gate1'] = safe_gate_value(getattr(network_inner, 'bridge1', None))
         loss_dict['gate2'] = safe_gate_value(getattr(network_inner, 'bridge2', None))
         loss_dict['gate3'] = safe_gate_value(getattr(network_inner, 'bridge3', None))
+        loss_dict['rev_gate2'] = safe_gate_value(getattr(network_inner, 'reverse_bridge2', None))
+        loss_dict['rev_gate3'] = safe_gate_value(getattr(network_inner, 'reverse_bridge3', None))
         loss_dict['loss'] = total_loss.item()
 
         return loss_dict

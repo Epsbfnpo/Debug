@@ -82,7 +82,7 @@ def _normalize_domain_loaders(test_loader):
 
 def _branch_candidates(algorithm):
     if algorithm.__class__.__name__ == 'CASS_GDRNet':
-        return ['cnn', 'vit']
+        return ['cnn', 'vit', 'fusion']
     return ['fusion']
 
 
