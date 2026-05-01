@@ -23,7 +23,6 @@ from utils.validate import METRIC_NAMES, algorithm_validate
 
 BEST_MODEL_METRICS = [
     'macro_f1',
-    'weighted_f1',
     'macro_ovr_auc',
     'macro_ovo_auc',
     'weighted_ovr_auc',

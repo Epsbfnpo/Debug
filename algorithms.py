@@ -570,15 +570,10 @@ class CASS_GDRNet(Algorithm):
         loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
 
-        drts = res_clean_fp32['drts']
-        spatial_tokens = res_clean_fp32['spatial_tokens']
-        drts_norm = F.normalize(drts, dim=-1)
-        spatial_mean = F.normalize(spatial_tokens.mean(dim=1), dim=-1).unsqueeze(2)
-        cos_sim_ortho = torch.bmm(drts_norm, spatial_mean).squeeze(2)
-        loss_ortho = torch.mean(cos_sim_ortho ** 2)
+        loss_ortho = torch.zeros((), device=label.device)
 
-        lambda_ortho = 1.5
-        total_loss = loss_main + 0.1 * loss_fastmoco + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        lambda_moco = 0.3
+        total_loss = loss_main + lambda_moco * loss_fastmoco + 1.0 * loss_kd_total
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -600,9 +595,17 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
         loss_dict['loss_kd_vit'] = loss_kd_vit.item()
         loss_dict['loss_ortho'] = loss_ortho.item()
-        loss_dict['gate1'] = network_inner.bridge1.gate.item()
-        loss_dict['gate2'] = network_inner.bridge2.gate.item()
-        loss_dict['gate3'] = network_inner.bridge3.gate.item()
+
+        def safe_gate_value(module):
+            if module is None:
+                return 0.0
+            if not hasattr(module, 'gate'):
+                return 0.0
+            return float(module.gate.detach().item())
+
+        loss_dict['gate1'] = safe_gate_value(getattr(network_inner, 'bridge1', None))
+        loss_dict['gate2'] = safe_gate_value(getattr(network_inner, 'bridge2', None))
+        loss_dict['gate3'] = safe_gate_value(getattr(network_inner, 'bridge3', None))
         loss_dict['loss'] = total_loss.item()
 
         return loss_dict
