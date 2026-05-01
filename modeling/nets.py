@@ -882,6 +882,13 @@ class DualTowerGDRNet(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(fusion_in_dim // 2, cfg.DATASET.NUM_CLASSES),
         )
+        cons_proj_dim = getattr(cfg.GDRNET, 'CONS_PROJ_DIM', 1024)
+        self.projector_fusion = nn.Sequential(
+            nn.Linear(fusion_in_dim, fusion_in_dim, bias=False),
+            nn.LayerNorm(fusion_in_dim),
+            nn.GELU(),
+            nn.Linear(fusion_in_dim, cons_proj_dim, bias=True),
+        )
 
     def _strip_drts_and_attn(self, feat, attn):
         """剥离序列中的 DRTs，防止污染 CNN，同时调整 Attention Map 维度"""
@@ -960,12 +967,15 @@ class DualTowerGDRNet(nn.Module):
         proj_vit = self.projector_vit(feat_vit_final)
         fusion_feat = torch.cat([feat_cnn_final, cls_token, drt_mean], dim=1)
         logits_fusion = self.fusion_head(fusion_feat)
+        proj_fusion = self.projector_fusion(fusion_feat)
+        proj_fusion = F.normalize(proj_fusion, dim=1)
         drts_features = vit_outputs.last_hidden_state[:, 1:1 + num_drts, :]
         spatial_features = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
         res['logits_vit'] = logits_vit
         res['proj_vit'] = proj_vit
         res['logits_fusion'] = logits_fusion
         res['fusion_feat'] = fusion_feat
+        res['proj_fusion'] = proj_fusion
         res['drts'] = drts_features
         res['spatial_tokens'] = spatial_features
         return res

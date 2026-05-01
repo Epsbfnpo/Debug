@@ -112,6 +112,18 @@ class GDRNet(ERM):
         self.criterion = GDRNetLoss_Integrated(max_iteration=cfg.EPOCHS, training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA, gamma=cfg.GDRNET.GAMMA)
         self.optimizer = torch.optim.Adam([{"params": self.network.parameters()}, {"params": self.classifier.parameters()}, {"params": self.projector.parameters()}, {"params": self.predictor.parameters()}], lr=cfg.LEARNING_RATE, weight_decay=0.0001)
 
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.momentum_network.eval()
+        return self
+
+    def _get_consistency_weight(self):
+        if self.cons_warmup_epochs <= 0:
+            return self.lambda_cons_max
+        progress = min(float(self.epoch + 1) / float(self.cons_warmup_epochs), 1.0)
+        return self.lambda_cons_max * progress
+
     @torch.no_grad()
     def dequeue_and_enqueue(self, features, labels):
         batch_size = features.shape[0]
@@ -433,6 +445,20 @@ class CASS_GDRNet(Algorithm):
         self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
         self.eval_branch = 'cnn'
         self.scaler = torch.cuda.amp.GradScaler()
+        self.lambda_cons_max = getattr(cfg.GDRNET, 'LAMBDA_CONS', 0.2)
+        self.cons_warmup_epochs = getattr(cfg.GDRNET, 'CONS_WARMUP_EPOCHS', 10)
+
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.momentum_network.eval()
+        return self
+
+    def _get_consistency_weight(self):
+        if self.cons_warmup_epochs <= 0:
+            return self.lambda_cons_max
+        progress = min(float(self.epoch + 1) / float(self.cons_warmup_epochs), 1.0)
+        return self.lambda_cons_max * progress
 
     @torch.no_grad()
     def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
@@ -499,15 +525,15 @@ class CASS_GDRNet(Algorithm):
             get_sync_context = contextlib.nullcontext
             momentum_inner = self.momentum_network
 
-        img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
-        img_strong = img_strong * mask_strong
-        img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
+        img_perturb, mask_perturb = self.fundusAug['post_aug1'](image.clone(), mask.clone())
+        img_perturb = img_perturb * mask_perturb
+        img_perturb = self.fundusAug['post_aug2'](img_perturb).contiguous()
 
-        img_weak = image.clone() * mask
-        img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
+        img_clean = image.clone() * mask
+        img_clean = self.fundusAug['post_aug2'](img_clean).contiguous()
 
-        x_split_cnn = self._local_split(img_strong).contiguous()
-        x_split_vit = self._local_split(img_strong).contiguous()
+        x_split_cnn = self._local_split(img_perturb).contiguous()
+        x_split_vit = self._local_split(img_perturb).contiguous()
 
         with get_sync_context():
             with torch.amp.autocast('cuda'):
@@ -520,7 +546,7 @@ class CASS_GDRNet(Algorithm):
             feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
 
         with torch.amp.autocast('cuda'):
-            res_combined = self.network(x_cnn=img_strong, x_vit=img_strong)
+            res_combined = self.network(x_cnn=img_perturb, x_vit=img_perturb)
 
         res_clean_fp32 = {
             'proj_cnn': res_combined['proj_cnn'].float(),
@@ -528,15 +554,18 @@ class CASS_GDRNet(Algorithm):
             'logits_cnn': res_combined['logits_cnn'].float(),
             'logits_vit': res_combined['logits_vit'].float(),
             'logits_fusion': res_combined['logits_fusion'].float(),
+            'proj_fusion': res_combined['proj_fusion'].float(),
             'drts': res_combined['drts'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
         }
 
         with torch.no_grad():
+            self.momentum_network.eval()
             with torch.amp.autocast('cuda'):
-                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
+                res_momentum = momentum_inner(x_cnn=img_clean, x_vit=img_clean)
             momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
             momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+            teacher_proj_fusion = F.normalize(res_momentum['proj_fusion'].float(), dim=1)
 
         with get_sync_context():
             with torch.amp.autocast('cuda'):
@@ -571,12 +600,17 @@ class CASS_GDRNet(Algorithm):
         loss_kd_vit = (-torch.sum(mixed_target_for_vit * log_prob_vit, dim=1) * (kd_temp ** 2) * dcr_weight).mean()
         loss_kd_total = loss_kd_cnn + loss_kd_vit
 
+        student_proj_fusion = F.normalize(res_clean_fp32['proj_fusion'], dim=1)
+        cos_sim_cons = (student_proj_fusion * teacher_proj_fusion.detach()).sum(dim=1)
+        loss_consistency = (2.0 - 2.0 * cos_sim_cons).mean()
+        lambda_cons = self._get_consistency_weight()
+
         loss_ortho = torch.zeros((), device=label.device)
         loss_fusion = F.cross_entropy(res_clean_fp32['logits_fusion'], label)
 
         lambda_moco = 0.3
         lambda_fusion = 1.0
-        total_loss = loss_main + lambda_fusion * loss_fusion + lambda_moco * loss_fastmoco + 1.0 * loss_kd_total
+        total_loss = loss_main + lambda_fusion * loss_fusion + lambda_moco * loss_fastmoco + 1.0 * loss_kd_total + lambda_cons * loss_consistency
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -587,6 +621,8 @@ class CASS_GDRNet(Algorithm):
         with torch.no_grad():
             for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
                 param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+            for buffer_q, buffer_k in zip(network_inner.buffers(), momentum_inner.buffers()):
+                buffer_k.copy_(buffer_q)
 
         # ==========================================
         # 深度探测点 (Probes): 监控每一个模块的工作状态
@@ -598,6 +634,9 @@ class CASS_GDRNet(Algorithm):
         loss_dict['loss_kd_cnn'] = loss_kd_cnn.item()
         loss_dict['loss_kd_vit'] = loss_kd_vit.item()
         loss_dict['loss_fusion'] = loss_fusion.item()
+        loss_dict['loss_consistency'] = loss_consistency.item()
+        loss_dict['cons_sim'] = cos_sim_cons.mean().item()
+        loss_dict['lambda_cons'] = float(lambda_cons)
         loss_dict['loss_ortho'] = loss_ortho.item()
 
         def safe_gate_value(module):
