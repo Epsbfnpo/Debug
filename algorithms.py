@@ -437,6 +437,16 @@ class CASS_GDRNet(Algorithm):
         self.lambda_cons_max = getattr(cfg.GDRNET, 'LAMBDA_CONS', 0.2)
         self.cons_warmup_epochs = getattr(cfg.GDRNET, 'CONS_WARMUP_EPOCHS', 10)
 
+    def train(self, mode=True):
+        super().train(mode)
+        self.momentum_network.eval()
+        return self
+
+    def _get_consistency_weight(self):
+        if self.cons_warmup_epochs <= 0:
+            return self.lambda_cons_max
+        progress = min(float(self.epoch + 1) / float(self.cons_warmup_epochs), 1.0)
+        return self.lambda_cons_max * progress
 
     @torch.no_grad()
     def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
