@@ -197,18 +197,15 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type, branch=N
 
         branch_suffix = f"/{branch}" if branch else ''
         logging.info(
-            f"{val_type}{branch_suffix} - Epoch: {epoch}, Loss: {metrics['loss']:.4f}, "
-            f"Acc: {metrics['acc']:.4f}, MacroF1: {metrics['macro_f1']:.4f}, "
-            f"MacroOVR-AUC: {metrics['macro_ovr_auc']:.4f}, "
-            f"MacroOVO-AUC: {metrics['macro_ovo_auc']:.4f}, WeightedOVR-AUC: {metrics['weighted_ovr_auc']:.4f}, "
-            f"WeightedOVO-AUC: {metrics['weighted_ovo_auc']:.4f}"
+            f"{val_type}{branch_suffix} - Epoch: {epoch}, "
+            f"Loss: {metrics['loss']:.4f}, "
+            f"WeightedOVR-AUC: {metrics['weighted_ovr_auc']:.4f}"
         )
 
         if writer is not None:
             tag_prefix = f"{val_type}{branch_suffix}"
             writer.add_scalar(f'info/{tag_prefix}_loss', metrics['loss'], epoch)
-            for name in METRIC_NAMES:
-                writer.add_scalar(f'info/{tag_prefix}_{name}', metrics[name], epoch)
+            writer.add_scalar(f'info/{tag_prefix}_weighted_ovr_auc', metrics['weighted_ovr_auc'], epoch)
 
     algorithm.train()
     return metrics, metrics['loss']

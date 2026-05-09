@@ -60,7 +60,7 @@ def set_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def save_checkpoint(path, algorithm, optimizer, scheduler, epoch, best_performance,
+def save_checkpoint(path, algorithm, optimizer, scheduler, epoch,
                     best_selector_score=-float('inf'),
                     best_selector_epoch=-1,
                     best_selector_metrics=None):
@@ -69,7 +69,6 @@ def save_checkpoint(path, algorithm, optimizer, scheduler, epoch, best_performan
         'algorithm_state': algorithm.state_dict(),
         'optimizer_state': optimizer.state_dict(),
         'scheduler_state': scheduler.state_dict(),
-        'best_performance': best_performance,
         'best_selector_score': best_selector_score,
         'best_selector_epoch': best_selector_epoch,
         'best_selector_metrics': best_selector_metrics or {},
@@ -89,11 +88,10 @@ def load_checkpoint(path, algorithm, optimizer, scheduler):
     optimizer.load_state_dict(checkpoint['optimizer_state'])
     scheduler.load_state_dict(checkpoint['scheduler_state'])
     start_epoch = checkpoint['epoch'] + 1
-    best_performance = checkpoint.get('best_performance', 0.0)
     best_selector_score = checkpoint.get('best_selector_score', -float('inf'))
     best_selector_epoch = checkpoint.get('best_selector_epoch', -1)
     best_selector_metrics = checkpoint.get('best_selector_metrics', {})
-    return start_epoch, best_performance, best_selector_score, best_selector_epoch, best_selector_metrics
+    return start_epoch, best_selector_score, best_selector_epoch, best_selector_metrics
 
 def _normalize_domain_loaders(test_loader):
     if isinstance(test_loader, dict):
@@ -201,7 +199,6 @@ def main():
     optimizer = algorithm.optimizer
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=0.00015)
     start_epoch = 1
-    best_performance = 0.0
     best_selector_score = -float('inf')
     best_selector_epoch = -1
     best_selector_metrics = {}
@@ -209,7 +206,7 @@ def main():
     if os.path.exists(latest_ckpt_path):
         debug_log(f"Found {latest_ckpt_path}. Resuming training...", args.local_rank)
         try:
-            start_epoch, best_performance, best_selector_score, best_selector_epoch, best_selector_metrics = \
+            start_epoch, best_selector_score, best_selector_epoch, best_selector_metrics = \
                 load_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler)
             debug_log(f"Resumed from Epoch {start_epoch}.", args.local_rank)
         except Exception as e:
@@ -265,20 +262,16 @@ def main():
                         best_selector_metrics,
                     )
 
-                best_performance = max(best_performance, val_metrics.get('macro_f1', 0.0))
-
             if is_distributed:
                 dist.barrier()
 
         if args.local_rank in [-1, 0]:
-            tracked_main = epoch_losses.get('loss', 0.0)
             save_checkpoint(
                 latest_ckpt_path,
                 algorithm,
                 optimizer,
                 scheduler,
                 epoch,
-                best_performance=max(best_performance, tracked_main),
                 best_selector_score=best_selector_score,
                 best_selector_epoch=best_selector_epoch,
                 best_selector_metrics=best_selector_metrics,
@@ -293,7 +286,6 @@ def main():
                         optimizer,
                         scheduler,
                         epoch,
-                        best_performance,
                         best_selector_score=best_selector_score,
                         best_selector_epoch=best_selector_epoch,
                         best_selector_metrics=best_selector_metrics,
@@ -336,29 +328,25 @@ def main():
         if args.local_rank in [-1, 0]:
             logging.info(
                 f"[FINAL TEST][{test_env_name}][fusion] "
-                f"Acc={test_metrics['acc']:.6f}, "
-                f"MacroF1={test_metrics['macro_f1']:.6f}, "
                 f"WeightedOVR-AUC={test_metrics['weighted_ovr_auc']:.6f}"
             )
 
     if args.local_rank in [-1, 0]:
-        save_checkpoint(
+        torch.save(
+            {
+                'selected_epoch': selected_epoch,
+                'selector_score': selected_score,
+                'selector_metrics': selected_metrics,
+                'algorithm_state': algorithm.state_dict(),
+            },
             final_ckpt_path,
-            algorithm,
-            optimizer,
-            scheduler,
-            cfg.EPOCHS,
-            best_performance,
-            best_selector_score=best_selector_score,
-            best_selector_epoch=best_selector_epoch,
-            best_selector_metrics=best_selector_metrics,
         )
         with open(os.path.join(log_path, 'done'), 'w') as f:
             f.write(
                 f'done, '
-                f'best_selector_epoch={best_selector_epoch}, '
-                f'best_selector_score={best_selector_score}, '
-                f'best_selector_metrics={best_selector_metrics}'
+                f'selected_epoch={selected_epoch}, '
+                f'selector_score={selected_score}, '
+                f'selector_metrics={selected_metrics}'
             )
     if writer:
         writer.close()
