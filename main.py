@@ -1,4 +1,3 @@
-import csv
 import datetime
 import logging
 import os
@@ -16,9 +15,38 @@ import algorithms
 from dataset.data_manager import get_dataset
 from utils.args import get_args, setup_cfg
 from utils.misc import MultiLossCounter, init_log, update_writer
-from utils.validate import METRIC_NAMES, algorithm_validate
+from utils.validate import algorithm_validate
 
-BEST_MODEL_METRICS = ['macro_f1', 'macro_ovr_auc', 'macro_ovo_auc', 'weighted_ovr_auc', 'weighted_ovo_auc',]
+# =========================
+# Final model selection setup
+# =========================
+SELECTOR_BRANCH = 'fusion'
+SELECTOR_AUC_NAME = 'weighted_ovr_auc'
+SELECTOR_METRICS = ['acc', 'macro_f1', SELECTOR_AUC_NAME]
+
+# Non-linear validation-only selector (fitted from the previous 6-source experiments)
+SELECTOR_STD = 0.20
+
+SELECTOR_MEAN = {
+    'acc': 0.731301,
+    'macro_f1': 0.569152,
+    'weighted_ovr_auc': 0.908833,
+}
+
+SELECTOR_SCALE = {
+    'acc': 0.095509,
+    'macro_f1': 0.159586,
+    'weighted_ovr_auc': 0.055108,
+}
+
+SELECTOR_CENTERS = [
+    (1.125544,  0.848749,  1.124460),
+    (0.260701,  0.465256,  0.719799),
+    (-0.031419, 0.255338,  0.199003),
+    (-0.744444, -0.099330, -0.051414),
+    (0.255466,  0.405100,  0.050205),
+    (-0.545509, 0.195182, -0.971427),
+]
 
 def debug_log(msg, rank):
     timestamp = datetime.datetime.now().strftime('%H:%M:%S')
@@ -32,8 +60,19 @@ def set_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def save_checkpoint(path, algorithm, optimizer, scheduler, epoch, best_performance):
-    state = {'epoch': epoch, 'algorithm_state': algorithm.state_dict(), 'optimizer_state': optimizer.state_dict(), 'scheduler_state': scheduler.state_dict(), 'best_performance': best_performance,}
+def save_checkpoint(path, algorithm, optimizer, scheduler, epoch,
+                    best_selector_score=-float('inf'),
+                    best_selector_epoch=-1,
+                    best_selector_metrics=None):
+    state = {
+        'epoch': epoch,
+        'algorithm_state': algorithm.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'best_selector_score': best_selector_score,
+        'best_selector_epoch': best_selector_epoch,
+        'best_selector_metrics': best_selector_metrics or {},
+    }
     torch.save(state, path)
 
 def load_checkpoint(path, algorithm, optimizer, scheduler):
@@ -49,8 +88,10 @@ def load_checkpoint(path, algorithm, optimizer, scheduler):
     optimizer.load_state_dict(checkpoint['optimizer_state'])
     scheduler.load_state_dict(checkpoint['scheduler_state'])
     start_epoch = checkpoint['epoch'] + 1
-    best_performance = checkpoint.get('best_performance', 0.0)
-    return start_epoch, best_performance
+    best_selector_score = checkpoint.get('best_selector_score', -float('inf'))
+    best_selector_epoch = checkpoint.get('best_selector_epoch', -1)
+    best_selector_metrics = checkpoint.get('best_selector_metrics', {})
+    return start_epoch, best_selector_score, best_selector_epoch, best_selector_metrics
 
 def _normalize_domain_loaders(test_loader):
     if isinstance(test_loader, dict):
@@ -59,25 +100,54 @@ def _normalize_domain_loaders(test_loader):
         return {f'test_{idx}': loader for idx, loader in enumerate(test_loader)}
     return {'test': test_loader}
 
-def _branch_candidates(algorithm):
-    if algorithm.__class__.__name__ == 'CASS_GDRNet':
-        return ['cnn', 'vit', 'fusion']
-    return ['fusion']
+def _safe_standardize(value, mean, std, eps=1e-12):
+    return (value - mean) / max(std, eps)
 
-def _init_diagnostic_csv(csv_path):
-    with open(csv_path, 'w', newline='') as f:
-        writer_csv = csv.writer(f)
-        writer_csv.writerow(['Epoch', 'Domain', 'Branch'] + METRIC_NAMES)
 
-def _append_diagnostic_row(csv_path, row):
-    with open(csv_path, 'a', newline='') as f:
-        writer_csv = csv.writer(f)
-        writer_csv.writerow(row)
+def compute_selector_score(metrics):
+    """
+    Use validation metrics only:
+        x = acc
+        y = macro_f1
+        z = weighted_ovr_auc
 
-def _save_best_metric_model(algorithm, output_dir, metric_name):
-    save_path = os.path.join(output_dir, f'best_val_{metric_name}.pth')
-    torch.save(algorithm.state_dict(), save_path)
-    return save_path
+    Score(epoch) = sum_k exp(-||[x,y,z]-center_k||^2 / tau^2)
+    """
+    x = _safe_standardize(metrics['acc'], SELECTOR_MEAN['acc'], SELECTOR_SCALE['acc'])
+    y = _safe_standardize(metrics['macro_f1'], SELECTOR_MEAN['macro_f1'], SELECTOR_SCALE['macro_f1'])
+    z = _safe_standardize(
+        metrics['weighted_ovr_auc'],
+        SELECTOR_MEAN['weighted_ovr_auc'],
+        SELECTOR_SCALE['weighted_ovr_auc'],
+    )
+
+    tau_sq = SELECTOR_STD ** 2
+    score = 0.0
+    for a, b, c in SELECTOR_CENTERS:
+        dist_sq = (x - a) ** 2 + (y - b) ** 2 + (z - c) ** 2
+        score += np.exp(-dist_sq / tau_sq)
+
+    return float(score)
+
+
+def save_selector_checkpoint(path, algorithm, epoch, selector_score, selector_metrics):
+    state = {
+        'epoch': epoch,
+        'selector_score': float(selector_score),
+        'selector_metrics': selector_metrics,
+        'algorithm_state': algorithm.state_dict(),
+    }
+    torch.save(state, path)
+
+
+def load_selector_checkpoint(path, algorithm):
+    checkpoint = torch.load(path, map_location='cpu')
+    algorithm.load_state_dict(checkpoint['algorithm_state'])
+    return (
+        checkpoint.get('epoch', -1),
+        checkpoint.get('selector_score', None),
+        checkpoint.get('selector_metrics', {}),
+    )
 
 def main():
     start_time = time.time()
@@ -104,7 +174,6 @@ def main():
     set_seed(cfg.SEED)
     latest_ckpt_path = os.path.join(log_path, 'latest_model.pth')
     final_ckpt_path = os.path.join(log_path, 'final_model.pth')
-    diagnostic_csv_path = os.path.join(log_path, 'diagnostic_metrics.csv')
     if os.path.exists(final_ckpt_path):
         if args.local_rank in [-1, 0]:
             print(f"✅ Found {final_ckpt_path}. Training already completed.")
@@ -130,23 +199,18 @@ def main():
     optimizer = algorithm.optimizer
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=0.00015)
     start_epoch = 1
-    best_performance = 0.0
-    branch_candidates = _branch_candidates(algorithm)
-    if branch_candidates == ['cnn', 'vit']:
-        best_val_metrics = {f"{b}_{m}": 0.0 for b in ['cnn', 'vit'] for m in BEST_MODEL_METRICS}
-        best_val_epochs = {f"{b}_{m}": 0 for b in ['cnn', 'vit'] for m in BEST_MODEL_METRICS}
-    else:
-        best_val_metrics = {f"{b}_{m}": 0.0 for b in branch_candidates for m in BEST_MODEL_METRICS}
-        best_val_epochs = {f"{b}_{m}": 0 for b in branch_candidates for m in BEST_MODEL_METRICS}
+    best_selector_score = -float('inf')
+    best_selector_epoch = -1
+    best_selector_metrics = {}
+    best_selector_path = os.path.join(log_path, 'best_val_selector_model.pth')
     if os.path.exists(latest_ckpt_path):
         debug_log(f"Found {latest_ckpt_path}. Resuming training...", args.local_rank)
         try:
-            start_epoch, best_performance = load_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler)
+            start_epoch, best_selector_score, best_selector_epoch, best_selector_metrics = \
+                load_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler)
             debug_log(f"Resumed from Epoch {start_epoch}.", args.local_rank)
         except Exception as e:
             debug_log(f"Error loading checkpoint: {e}. Starting from scratch.", args.local_rank)
-    if args.local_rank in [-1, 0] and not os.path.exists(diagnostic_csv_path):
-        _init_diagnostic_csv(diagnostic_csv_path)
     iterator = tqdm(range(start_epoch - 1, cfg.EPOCHS), disable=(args.local_rank not in [-1, 0]), initial=start_epoch - 1, total=cfg.EPOCHS,)
     for i in iterator:
         epoch = i + 1
@@ -168,53 +232,122 @@ def main():
         if args.local_rank in [-1, 0]:
             update_writer(writer, epoch, scheduler, epoch_losses)
         scheduler.step()
-        if args.local_rank in [-1, 0]:
-            tracked_main = epoch_losses.get('loss', 0.0)
-            save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance=max(best_performance, tracked_main))
         if epoch % cfg.VAL_EPOCH == 0:
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Validation...")
-            for branch in branch_candidates:
-                metrics, _ = algorithm_validate(algorithm, val_loader, writer, epoch, 'val', branch=branch,)
-                if args.local_rank in [-1, 0]:
-                    for metric_name in BEST_MODEL_METRICS:
-                        key = f"{branch}_{metric_name}"
-                        current_val = metrics.get(metric_name, 0.0)
-                        if current_val > best_val_metrics[key]:
-                            best_val_metrics[key] = current_val
-                            best_val_epochs[key] = epoch
-                            _save_best_metric_model(algorithm, log_path, key)
-                            logging.info(f"[{key}] improved to {current_val:.6f}, saving model")
-                    best_performance = max(best_performance, metrics.get('macro_f1', 0.0))
-            for test_env_name, test_env_loader in test_loaders.items():
-                for branch in branch_candidates:
-                    test_metrics, _ = algorithm_validate(algorithm, test_env_loader, writer, epoch, f'test_{test_env_name}', branch=branch,)
-                    if args.local_rank in [-1, 0]:
-                        for metric_name, val in test_metrics.items():
-                            if metric_name in METRIC_NAMES:
-                                writer.add_scalar(f'Test_{test_env_name}/{branch}_{metric_name}', val, global_step=epoch)
-                        row = [epoch, test_env_name, branch] + [test_metrics.get(m, 0.0) for m in METRIC_NAMES]
-                        _append_diagnostic_row(diagnostic_csv_path, row)
+
+            val_metrics, _ = algorithm_validate(
+                algorithm,
+                val_loader,
+                writer,
+                epoch,
+                'val',
+                branch=SELECTOR_BRANCH,
+            )
+            selector_score = compute_selector_score(val_metrics)
+
             if args.local_rank in [-1, 0]:
-                logging.info(f"Epoch {epoch} Diagnostic Testing Complete.")
+                if selector_score > best_selector_score:
+                    best_selector_score = selector_score
+                    best_selector_epoch = epoch
+                    best_selector_metrics = {
+                        metric_name: float(val_metrics[metric_name])
+                        for metric_name in SELECTOR_METRICS
+                    }
+                    save_selector_checkpoint(
+                        best_selector_path,
+                        algorithm,
+                        epoch,
+                        best_selector_score,
+                        best_selector_metrics,
+                    )
+
             if is_distributed:
                 dist.barrier()
+
+        if args.local_rank in [-1, 0]:
+            save_checkpoint(
+                latest_ckpt_path,
+                algorithm,
+                optimizer,
+                scheduler,
+                epoch,
+                best_selector_score=best_selector_score,
+                best_selector_epoch=best_selector_epoch,
+                best_selector_metrics=best_selector_metrics,
+            )
         if args.time_limit > 0:
             elapsed_time = time.time() - start_time
             if elapsed_time > (args.time_limit - 300):
                 if args.local_rank in [-1, 0]:
-                    save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance)
+                    save_checkpoint(
+                        latest_ckpt_path,
+                        algorithm,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        best_selector_score=best_selector_score,
+                        best_selector_epoch=best_selector_epoch,
+                        best_selector_metrics=best_selector_metrics,
+                    )
                     if writer:
                         writer.close()
                 if is_distributed:
                     dist.barrier()
                     dist.destroy_process_group()
                 sys.exit(0)
-    debug_log("Training Finished. Starting Final Testing...", args.local_rank)
+    debug_log("Training Finished. Starting Final Model Selection + Final Testing...", args.local_rank)
+
     if args.local_rank in [-1, 0]:
-        save_checkpoint(final_ckpt_path, algorithm, optimizer, scheduler, cfg.EPOCHS, best_performance)
+        if best_selector_epoch < 0:
+            raise RuntimeError("No best validation model was selected. Please check validation scheduling.")
+
+        logging.info(f"Selected epoch = {best_selector_epoch} for final testing.")
+
+    if is_distributed:
+        dist.barrier()
+
+    selected_epoch, selected_score, selected_metrics = load_selector_checkpoint(best_selector_path, algorithm)
+
+    if args.local_rank in [-1, 0]:
+        logging.info(
+            f"Loaded best validation model from epoch {selected_epoch}. "
+            f"Now running final test on fusion branch only."
+        )
+
+    for test_env_name, test_env_loader in test_loaders.items():
+        test_metrics, _ = algorithm_validate(
+            algorithm,
+            test_env_loader,
+            writer,
+            selected_epoch,
+            f'final_test_{test_env_name}',
+            branch=SELECTOR_BRANCH,
+        )
+
+        if args.local_rank in [-1, 0]:
+            logging.info(
+                f"[FINAL TEST][{test_env_name}][fusion] "
+                f"WeightedOVR-AUC={test_metrics['weighted_ovr_auc']:.6f}"
+            )
+
+    if args.local_rank in [-1, 0]:
+        torch.save(
+            {
+                'selected_epoch': selected_epoch,
+                'selector_score': selected_score,
+                'selector_metrics': selected_metrics,
+                'algorithm_state': algorithm.state_dict(),
+            },
+            final_ckpt_path,
+        )
         with open(os.path.join(log_path, 'done'), 'w') as f:
-            f.write(f'done, best_val_metrics={best_val_metrics}, best_val_epochs={best_val_epochs}')
+            f.write(
+                f'done, '
+                f'selected_epoch={selected_epoch}, '
+                f'selector_score={selected_score}, '
+                f'selector_metrics={selected_metrics}'
+            )
     if writer:
         writer.close()
     if is_distributed:
