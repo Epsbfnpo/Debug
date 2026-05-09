@@ -22,7 +22,7 @@ from utils.validate import algorithm_validate
 # =========================
 SELECTOR_BRANCH = 'fusion'
 SELECTOR_AUC_NAME = 'weighted_ovr_auc'
-SELECTOR_METRICS = ['acc', 'macro_f1', SELECTOR_AUC_NAME]
+SELECTOR_METRICS = [SELECTOR_AUC_NAME, 'acc', 'macro_f1']
 
 # Non-linear validation-only selector (fitted from the previous 6-source experiments)
 SELECTOR_STD = 0.20
@@ -328,7 +328,9 @@ def main():
         if args.local_rank in [-1, 0]:
             logging.info(
                 f"[FINAL TEST][{test_env_name}][fusion] "
-                f"WeightedOVR-AUC={test_metrics['weighted_ovr_auc']:.6f}"
+                f"WeightedOVR-AUC={test_metrics['weighted_ovr_auc']:.6f}, "
+                f"Acc={test_metrics['acc']:.6f}, "
+                f"MacroF1={test_metrics['macro_f1']:.6f}"
             )
 
     if args.local_rank in [-1, 0]:

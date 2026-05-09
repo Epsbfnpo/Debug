@@ -8,12 +8,9 @@ from tqdm import tqdm
 
 
 METRIC_NAMES = [
+    'weighted_ovr_auc',
     'acc',
     'macro_f1',
-    'macro_ovr_auc',
-    'macro_ovo_auc',
-    'weighted_ovr_auc',
-    'weighted_ovo_auc',
 ]
 
 
@@ -37,37 +34,28 @@ def gather_tensor(tensor):
 
 
 def calculate_metrics_numpy(y_true, y_pred, y_prob, num_classes=5):
-    """计算长尾多分类任务的 7 个核心评价指标。"""
     metrics = {}
 
     metrics['acc'] = accuracy_score(y_true, y_pred)
     metrics['macro_f1'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['weighted_f1'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
 
     labels = list(range(num_classes))
     try:
-        metrics['macro_ovr_auc'] = roc_auc_score(
-            y_true, y_prob, multi_class='ovr', average='macro', labels=labels
-        )
-        metrics['macro_ovo_auc'] = roc_auc_score(
-            y_true, y_prob, multi_class='ovo', average='macro', labels=labels
-        )
         metrics['weighted_ovr_auc'] = roc_auc_score(
-            y_true, y_prob, multi_class='ovr', average='weighted', labels=labels
-        )
-        metrics['weighted_ovo_auc'] = roc_auc_score(
-            y_true, y_prob, multi_class='ovo', average='weighted', labels=labels
+            y_true,
+            y_prob,
+            multi_class='ovr',
+            average='weighted',
+            labels=labels
         )
     except ValueError as e:
-        logging.warning(f"AUC calculation failed ({e}). Setting AUC metrics to 0.")
-        metrics['macro_ovr_auc'] = 0.0
-        metrics['macro_ovo_auc'] = 0.0
+        logging.warning(f"AUC calculation failed ({e}). Setting weighted_ovr_auc to 0.")
         metrics['weighted_ovr_auc'] = 0.0
-        metrics['weighted_ovo_auc'] = 0.0
 
-    # backward compatible aliases
+    # backward-compatible aliases
+    metrics['auc'] = metrics['weighted_ovr_auc']
     metrics['f1'] = metrics['macro_f1']
-    metrics['auc'] = metrics['macro_ovo_auc']
+
     return metrics
 
 
@@ -199,13 +187,16 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type, branch=N
         logging.info(
             f"{val_type}{branch_suffix} - Epoch: {epoch}, "
             f"Loss: {metrics['loss']:.4f}, "
-            f"WeightedOVR-AUC: {metrics['weighted_ovr_auc']:.4f}"
+            f"WeightedOVR-AUC: {metrics['weighted_ovr_auc']:.4f}, "
+            f"Acc: {metrics['acc']:.4f}, "
+            f"MacroF1: {metrics['macro_f1']:.4f}"
         )
 
         if writer is not None:
             tag_prefix = f"{val_type}{branch_suffix}"
             writer.add_scalar(f'info/{tag_prefix}_loss', metrics['loss'], epoch)
-            writer.add_scalar(f'info/{tag_prefix}_weighted_ovr_auc', metrics['weighted_ovr_auc'], epoch)
+            for name in METRIC_NAMES:
+                writer.add_scalar(f'info/{tag_prefix}_{name}', metrics[name], epoch)
 
     algorithm.train()
     return metrics, metrics['loss']
