@@ -45,8 +45,8 @@ def get_dataset(args, cfg):
     return train_loader, val_loader, test_loader, dataset_size, train_sampler
 
 def get_transform(cfg):
-    size = 512
-    re_size = 512
+    size = getattr(cfg.TRANSFORM, 'INPUT_SIZE', 224)
+    re_size = getattr(cfg.TRANSFORM, 'CROP_SIZE', size)
     normalize = get_normalize()
     tra_train = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.RandomResizedCrop(re_size, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), normalize])
     tra_test = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.Resize((re_size, re_size)), transforms.ToTensor(), normalize])
@@ -58,8 +58,8 @@ def get_pre_FundusAug(cfg):
     jitter_c = getattr(cfg.TRANSFORM, 'COLORJITTER_C', 0.2)
     jitter_s = getattr(cfg.TRANSFORM, 'COLORJITTER_S', 0.2)
     jitter_h = getattr(cfg.TRANSFORM, 'COLORJITTER_H', 0.1)
-    size = 512
-    re_size = 512
+    size = getattr(cfg.TRANSFORM, 'INPUT_SIZE', 224)
+    re_size = getattr(cfg.TRANSFORM, 'CROP_SIZE', size)
     normalize = get_normalize()
     tra_train = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.ColorJitter(brightness=jitter_b, contrast=jitter_c, saturation=jitter_s, hue=jitter_h), transforms.ToTensor()])
     tra_test = transforms.Compose([SquarePad(), transforms.Resize((size, size)), transforms.CenterCrop(re_size), transforms.ToTensor(), normalize])
@@ -68,8 +68,8 @@ def get_pre_FundusAug(cfg):
 
 def get_post_FundusAug(cfg):
     aug_prob = getattr(cfg.TRANSFORM, 'AUGPROB', 0.5)
-    size = 512
-    re_size = 512
+    size = getattr(cfg.TRANSFORM, 'INPUT_SIZE', 224)
+    re_size = getattr(cfg.TRANSFORM, 'CROP_SIZE', size)
     normalize = get_normalize()
     tra_fundus_1 = FundusAug.Compose([FundusAug.Sharpness(prob=aug_prob), FundusAug.Halo(size, prob=aug_prob), FundusAug.Hole(size, prob=aug_prob), FundusAug.Spot(size, prob=aug_prob), FundusAug.Blur(prob=aug_prob)])
     tra_fundus_2 = transforms.Compose([transforms.RandomCrop(re_size), transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(), normalize])
