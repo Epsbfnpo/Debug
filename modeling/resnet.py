@@ -162,8 +162,41 @@ def init_pretrained_weights(model, model_url):
     model.load_state_dict(pretrain_dict, strict=False)
 
 def resnet18(pretrained=True, **kwargs):
-    model = ResNet(block=BasicBlock, layers=[2, 2, 2, 2])
-    if pretrained:
+    model = ResNet(block=BasicBlock, layers=[2, 2, 2, 2], **kwargs)
+    if pretrained and cfg.MODEL.PRETRAINED:
+        path = cfg.MODEL.PRETRAINED_PATH
+        print("========================================================")
+        print(f"[ResNet18] 正在从本地加载权重: {path}")
+        if not os.path.exists(path):
+            print(f"[FATAL ERROR] ❌ 本地权重文件不存在！")
+            print(f"请确认文件存在于: {path}")
+            exit(1)
+        try:
+            state_dict = torch.load(path, map_location='cpu')
+
+            # 兼容某些 checkpoint 包装格式
+            if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
+
+            # 兼容 DataParallel 保存格式
+            if isinstance(state_dict, dict):
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("module."):
+                        k = k[len("module."):]
+                    new_state_dict[k] = v
+                state_dict = new_state_dict
+
+            msg = model.load_state_dict(state_dict, strict=False)
+            print(f"[ResNet18] ✅ 权重加载成功！")
+            print(f"[ResNet18] 未加载的层 (预期内): {msg.missing_keys}")
+            print(f"[ResNet18] 多余的层: {msg.unexpected_keys}")
+            print("========================================================")
+        except Exception as e:
+            print(f"[FATAL ERROR] ❌ 加载权重失败: {e}")
+            exit(1)
+    elif pretrained:
+        print("[ResNet18] 警告: 请求了预训练但未配置本地路径，尝试原有逻辑(可能会联网报错)...")
         init_pretrained_weights(model, model_urls["resnet18"])
     return model
 
