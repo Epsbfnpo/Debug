@@ -10,9 +10,9 @@ _C.VERBOSE = True
 
 _C.MODEL = CN()
 _C.MODEL.PRETRAINED = True
-_C.MODEL.PRETRAINED_PATH = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/resnet50-19c8e357.pth"
+_C.MODEL.PRETRAINED_PATH = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/resnet18-f37072fd.pth"
 _C.ALGORITHM = "CASS_GDRNet"
-_C.BACKBONE = "resnet50"
+_C.BACKBONE = "resnet18"
 _C.DG_MODE = "ESDG"
 
 _C.DATASET = CN()
@@ -38,7 +38,7 @@ _C.GDRNET.SCALING_FACTOR = 4.0
 _C.GDRNET.GAMMA = 1.0
 _C.GDRNET.LORA_R = 8
 _C.GDRNET.LORA_ALPHA = 16.0
-_C.GDRNET.DINOV3_PATH = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16"
+_C.GDRNET.DINOV3_PATH = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vits16"
 
 _C.TRANSFORM = CN()
 _C.TRANSFORM.NAME = []
