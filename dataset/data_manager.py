@@ -32,23 +32,27 @@ def get_dataset(args, cfg):
     num_worker = cfg.num_workers
     drop_last = getattr(cfg, 'DROP_LAST', True)
     train_dataset = GDRBench(root=cfg.DATASET.ROOT, source_domains=cfg.DATASET.SOURCE_DOMAINS, target_domains=cfg.DATASET.TARGET_DOMAINS, mode='train', trans_basic=train_ts, trans_mask=tra_fundus)
-    g = torch.Generator()
-    g.manual_seed(cfg.SEED)
+    g_train = torch.Generator()
+    g_train.manual_seed(cfg.SEED)
+    g_val = torch.Generator()
+    g_val.manual_seed(cfg.SEED + 1)
+    g_test = torch.Generator()
+    g_test.manual_seed(cfg.SEED + 2)
     train_sampler = None
     shuffle = True
     if args.local_rank != -1:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=cfg.SEED)
         shuffle = False
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_worker, drop_last=drop_last, pin_memory=True, sampler=train_sampler, worker_init_fn=seed_worker, generator=g)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_worker, drop_last=drop_last, pin_memory=True, sampler=train_sampler, worker_init_fn=seed_worker, generator=g_train)
     val_dataset = GDRBench(root=cfg.DATASET.ROOT, source_domains=cfg.DATASET.SOURCE_DOMAINS, target_domains=cfg.DATASET.TARGET_DOMAINS, mode='val', trans_basic=test_ts)
     test_dataset = GDRBench(root=cfg.DATASET.ROOT, source_domains=cfg.DATASET.SOURCE_DOMAINS, target_domains=cfg.DATASET.TARGET_DOMAINS, mode='test', trans_basic=test_ts)
     val_sampler = None
     test_sampler = None
     if args.local_rank != -1:
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        test_sampler = DistributedSampler(test_dataset, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=val_sampler, pin_memory=True, worker_init_fn=seed_worker, generator=g)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=test_sampler, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=cfg.SEED)
+        test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=cfg.SEED)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=val_sampler, pin_memory=True, worker_init_fn=seed_worker, generator=g_val)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=test_sampler, pin_memory=True, worker_init_fn=seed_worker, generator=g_test)
     dataset_size = [len(train_dataset), len(val_dataset), len(test_dataset)]
     return train_loader, val_loader, test_loader, dataset_size, train_sampler
 
