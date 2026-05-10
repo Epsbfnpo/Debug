@@ -778,7 +778,7 @@ class DualTowerGDRNet(nn.Module):
         # ---------- fixed shared dims ----------
         self.bridge_dim = 512
         self.proj_out_dim = 1024
-        self.fusion_in_dim = self.cnn_out_dim + self.vit_dim
+        self.fusion_in_dim = self.cnn_out_dim + 2 * self.vit_dim
 
         if cfg.BACKBONE == "resnet18":
             self.cnn = resnet18(pretrained=True)
@@ -830,7 +830,7 @@ class DualTowerGDRNet(nn.Module):
             print("⚠️ 警告：多层 Hook 注入不完整，请检查 DINOv3 结构。")
         self.use_bridge1 = False
         self.bridge1 = None
-        self.num_special_tokens = 1
+        self.num_special_tokens = 1 + num_drts
         self.bridge2 = RoutedBridgeModule(
             cnn_dim=self.cnn_dim_s2,
             vit_dim=self.vit_dim,
@@ -878,10 +878,11 @@ class DualTowerGDRNet(nn.Module):
         self.classifier_cnn = nn.Linear(self.cnn_out_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
         self.fusion_head = nn.Sequential(
-            nn.Linear(self.fusion_in_dim, 512),
+            nn.Linear(self.fusion_in_dim, self.fusion_in_dim // 2),
+            nn.LayerNorm(self.fusion_in_dim // 2),
             nn.GELU(),
-            nn.Dropout(0.0),
-            nn.Linear(512, cfg.DATASET.NUM_CLASSES),
+            nn.Dropout(0.1),
+            nn.Linear(self.fusion_in_dim // 2, cfg.DATASET.NUM_CLASSES),
         )
 
     def _strip_drts_and_attn(self, feat, attn):
