@@ -956,7 +956,7 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_final = cls_token
         logits_vit = self.classifier_vit(feat_vit_final)
         proj_vit = self.projector_vit(feat_vit_final)
-        fusion_feat = torch.cat([feat_cnn_final, cls_token, drt_mean], dim=1)
+        fusion_feat = torch.cat([feat_cnn_final, cls_token], dim=1)
         logits_fusion = self.fusion_head(fusion_feat)
         if not hasattr(self, "_shape_debug_printed"):
             print("========================================================")
