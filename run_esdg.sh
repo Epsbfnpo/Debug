@@ -4,6 +4,9 @@ BASE_OUTPUT_DIR="./output_esdg_h100"
 DOMAINS=("APTOS" "DEEPDR" "FGADR" "IDRID" "MESSIDOR" "RLDR")
 NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 TIME_LIMIT=360000
+
+export PYTHONHASHSEED=${PYTHONHASHSEED:-42}
+export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 echo "========================================================"
 echo "🚀 启动 ESDG 批量实验 (Bash 循环模式)"
 echo "GPU 数量: $NUM_GPUS"

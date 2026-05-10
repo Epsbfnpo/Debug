@@ -18,9 +18,11 @@ echo "Job $SLURM_JOB_ID started at $(date)"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONHASHSEED=${PYTHONHASHSEED:-42}
+export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 export NCCL_SOCKET_IFNAME=^docker0,lo
-export TORCH_ALLOW_TF32=1
-export CUBLAS_ALLOW_TF32=1
+export TORCH_ALLOW_TF32=0
+export CUBLAS_ALLOW_TF32=0
 
 source /datasets/work/hb-nhmrc-dhcp/work/liu275/miniconda3/bin/activate
 conda activate brainseg

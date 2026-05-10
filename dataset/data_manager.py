@@ -5,7 +5,13 @@ import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import torch
 import numpy as np
+import random
 from PIL import Image
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 class SquarePad:
     def __call__(self, image):
@@ -26,12 +32,14 @@ def get_dataset(args, cfg):
     num_worker = cfg.num_workers
     drop_last = getattr(cfg, 'DROP_LAST', True)
     train_dataset = GDRBench(root=cfg.DATASET.ROOT, source_domains=cfg.DATASET.SOURCE_DOMAINS, target_domains=cfg.DATASET.TARGET_DOMAINS, mode='train', trans_basic=train_ts, trans_mask=tra_fundus)
+    g = torch.Generator()
+    g.manual_seed(cfg.SEED)
     train_sampler = None
     shuffle = True
     if args.local_rank != -1:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
         shuffle = False
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_worker, drop_last=drop_last, pin_memory=True, sampler=train_sampler)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_worker, drop_last=drop_last, pin_memory=True, sampler=train_sampler, worker_init_fn=seed_worker, generator=g)
     val_dataset = GDRBench(root=cfg.DATASET.ROOT, source_domains=cfg.DATASET.SOURCE_DOMAINS, target_domains=cfg.DATASET.TARGET_DOMAINS, mode='val', trans_basic=test_ts)
     test_dataset = GDRBench(root=cfg.DATASET.ROOT, source_domains=cfg.DATASET.SOURCE_DOMAINS, target_domains=cfg.DATASET.TARGET_DOMAINS, mode='test', trans_basic=test_ts)
     val_sampler = None
@@ -39,8 +47,8 @@ def get_dataset(args, cfg):
     if args.local_rank != -1:
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
         test_sampler = DistributedSampler(test_dataset, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=val_sampler, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=test_sampler, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=val_sampler, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_worker, sampler=test_sampler, pin_memory=True, worker_init_fn=seed_worker, generator=g)
     dataset_size = [len(train_dataset), len(val_dataset), len(test_dataset)]
     return train_loader, val_loader, test_loader, dataset_size, train_sampler
 
