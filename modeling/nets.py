@@ -1,4 +1,4 @@
-from .resnet import resnet18, resnet50, resnet101
+from .resnet import resnet18, resnet34, resnet50, resnet101, resnet152
 import torch
 import math
 import random
@@ -740,15 +740,60 @@ class DINOv3Wrapper(nn.Module):
     def out_features(self):
         return self._out_features
 
+def get_resnet_stage_dims(backbone_name: str):
+    if backbone_name in ["resnet18", "resnet34"]:
+        expansion = 1
+    elif backbone_name in ["resnet50", "resnet101", "resnet152"]:
+        expansion = 4
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone_name}")
+
+    return {
+        "stage2": 128 * expansion,
+        "stage3": 256 * expansion,
+        "stage4": 512 * expansion,
+        "final": 512 * expansion,
+    }
+
 class DualTowerGDRNet(nn.Module):
     def __init__(self, cfg):
         super(DualTowerGDRNet, self).__init__()
-        self.cnn = resnet50(pretrained=True)
-        if hasattr(self.cnn, 'out_features'):
-            self.cnn_dim = self.cnn.out_features()
+        self.cfg = cfg
+
+        # ---------- CNN dims ----------
+        cnn_dims = get_resnet_stage_dims(cfg.BACKBONE)
+        self.cnn_dim_s2 = cnn_dims["stage2"]
+        self.cnn_dim_s3 = cnn_dims["stage3"]
+        self.cnn_dim_s4 = cnn_dims["stage4"]
+        self.cnn_out_dim = cnn_dims["final"]
+        self.cnn_dim = self.cnn_out_dim
+
+        # ---------- ViT dims ----------
+        vit_cfg = AutoConfig.from_pretrained(cfg.GDRNET.DINOV3_PATH)
+        self.vit_dim = vit_cfg.hidden_size
+        self.vit_num_heads = vit_cfg.num_attention_heads
+        self.vit_num_layers = vit_cfg.num_hidden_layers
+        self.num_register_tokens = getattr(vit_cfg, "num_register_tokens", 0)
+
+        # ---------- fixed shared dims ----------
+        self.bridge_dim = 512
+        self.proj_out_dim = 1024
+        self.fusion_in_dim = self.cnn_out_dim + 2 * self.vit_dim
+
+        if cfg.BACKBONE == "resnet18":
+            self.cnn = resnet18(pretrained=True)
+        elif cfg.BACKBONE == "resnet34":
+            self.cnn = resnet34(pretrained=True)
+        elif cfg.BACKBONE == "resnet50":
+            self.cnn = resnet50(pretrained=True)
+        elif cfg.BACKBONE == "resnet101":
+            self.cnn = resnet101(pretrained=True)
+        elif cfg.BACKBONE == "resnet152":
+            self.cnn = resnet152(pretrained=True)
         else:
-            self.cnn_dim = 2048
-        default_dinov3_path = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16"
+            raise ValueError(f"Unsupported backbone: {cfg.BACKBONE}")
+
+        default_dinov3_path = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vits16"
         dinov3_path = getattr(cfg.GDRNET, 'DINOV3_PATH', default_dinov3_path)
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
         lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
@@ -756,9 +801,9 @@ class DualTowerGDRNet(nn.Module):
         num_drts = getattr(cfg.GDRNET, 'NUM_DRTS', 4)
         use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
         self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, num_drts=num_drts, use_grad_checkpointing=use_grad_checkpointing)
-        self.vit_dim = self.vit.out_features
         self.target_layers = [3, 6, 9]
         self.hooked_attns = {}
+
         def make_hook(layer_idx):
             def new_forward(attn_self, *args, **kwargs):
                 kwargs['output_attentions'] = True
@@ -767,6 +812,7 @@ class DualTowerGDRNet(nn.Module):
                     attn_self.current_attn_map = outputs[1]
                 return outputs
             return new_forward
+
         hook_count = 0
         for name, module in self.vit.model.named_modules():
             if isinstance(module, nn.ModuleList) and len(module) >= 12:
@@ -785,19 +831,59 @@ class DualTowerGDRNet(nn.Module):
         self.use_bridge1 = False
         self.bridge1 = None
         self.num_special_tokens = 1 + num_drts
-        self.bridge2 = RoutedBridgeModule(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, num_heads=8, topk_ratio=0.25, num_special_tokens=self.num_special_tokens)
-        self.bridge3 = RoutedBridgeModule(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, num_heads=8, topk_ratio=0.25, num_special_tokens=self.num_special_tokens)
-        self.refine2 = RefineBlock(channels=512)
-        self.refine3 = RefineBlock(channels=1024)
-        self.reverse_bridge2 = ReverseTokenBridge(cnn_dim=512, vit_dim=self.vit_dim, project_dim=512, num_heads=8, num_special_tokens=self.num_special_tokens)
-        self.reverse_bridge3 = ReverseTokenBridge(cnn_dim=1024, vit_dim=self.vit_dim, project_dim=512, num_heads=8, num_special_tokens=self.num_special_tokens)
-        proj_dim = 1024
-        self.projector_cnn = nn.Sequential(nn.Linear(self.cnn_dim, self.cnn_dim), nn.BatchNorm1d(self.cnn_dim), nn.ReLU(inplace=True), nn.Linear(self.cnn_dim, proj_dim))
-        self.projector_vit = nn.Sequential(nn.Linear(self.vit_dim, self.vit_dim), nn.BatchNorm1d(self.vit_dim), nn.ReLU(inplace=True), nn.Linear(self.vit_dim, proj_dim))
-        self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
+        self.bridge2 = RoutedBridgeModule(
+            cnn_dim=self.cnn_dim_s2,
+            vit_dim=self.vit_dim,
+            project_dim=self.bridge_dim,
+            num_heads=8,
+            topk_ratio=0.25,
+            num_special_tokens=self.num_special_tokens,
+        )
+        self.bridge3 = RoutedBridgeModule(
+            cnn_dim=self.cnn_dim_s3,
+            vit_dim=self.vit_dim,
+            project_dim=self.bridge_dim,
+            num_heads=8,
+            topk_ratio=0.25,
+            num_special_tokens=self.num_special_tokens,
+        )
+        self.refine2 = RefineBlock(channels=self.cnn_dim_s2)
+        self.refine3 = RefineBlock(channels=self.cnn_dim_s3)
+        self.reverse_bridge2 = ReverseTokenBridge(
+            cnn_dim=self.cnn_dim_s2,
+            vit_dim=self.vit_dim,
+            project_dim=self.bridge_dim,
+            num_heads=8,
+            num_special_tokens=self.num_special_tokens,
+        )
+        self.reverse_bridge3 = ReverseTokenBridge(
+            cnn_dim=self.cnn_dim_s3,
+            vit_dim=self.vit_dim,
+            project_dim=self.bridge_dim,
+            num_heads=8,
+            num_special_tokens=self.num_special_tokens,
+        )
+        self.projector_cnn = nn.Sequential(
+            nn.Linear(self.cnn_out_dim, self.proj_out_dim),
+            nn.BatchNorm1d(self.proj_out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.proj_out_dim, self.proj_out_dim),
+        )
+        self.projector_vit = nn.Sequential(
+            nn.Linear(self.vit_dim, self.proj_out_dim),
+            nn.BatchNorm1d(self.proj_out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.proj_out_dim, self.proj_out_dim),
+        )
+        self.classifier_cnn = nn.Linear(self.cnn_out_dim, cfg.DATASET.NUM_CLASSES)
         self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
-        fusion_in_dim = self.cnn_dim + 2 * self.vit_dim
-        self.fusion_head = nn.Sequential(nn.Linear(fusion_in_dim, fusion_in_dim // 2), nn.LayerNorm(fusion_in_dim // 2), nn.GELU(), nn.Dropout(0.1), nn.Linear(fusion_in_dim // 2, cfg.DATASET.NUM_CLASSES),)
+        self.fusion_head = nn.Sequential(
+            nn.Linear(self.fusion_in_dim, self.fusion_in_dim // 2),
+            nn.LayerNorm(self.fusion_in_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.fusion_in_dim // 2, cfg.DATASET.NUM_CLASSES),
+        )
 
     def _strip_drts_and_attn(self, feat, attn):
         num_drts = self.vit.num_drts
@@ -850,15 +936,17 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.maxpool(x)
         x = self.cnn.layer1(x)
         x = self.cnn.layer2(x)
-        x = self.bridge2(feat_cnn=x, feat_vit=feat_vit_6_clean)
+        feat_cnn_s2 = x
+        x = self.bridge2(feat_cnn=feat_cnn_s2, feat_vit=feat_vit_6_clean)
         x = self.refine2(x)
         feat_vit_6_clean = self.reverse_bridge2(x, feat_vit_6_clean)
         x = self.cnn.layer3(x)
-        x = self.bridge3(feat_cnn=x, feat_vit=feat_vit_9_clean)
+        feat_cnn_s3 = x
+        x = self.bridge3(feat_cnn=feat_cnn_s3, feat_vit=feat_vit_9_clean)
         x = self.refine3(x)
         feat_vit_9_clean = self.reverse_bridge3(x, feat_vit_9_clean)
-        x = self.cnn.layer4(x)
-        x = self.cnn.global_avgpool(x)
+        feat_cnn_s4 = self.cnn.layer4(x)
+        x = self.cnn.global_avgpool(feat_cnn_s4)
         feat_cnn_final = torch.flatten(x, 1)
         logits_cnn = self.classifier_cnn(feat_cnn_final)
         proj_cnn = self.projector_cnn(feat_cnn_final)
@@ -870,6 +958,24 @@ class DualTowerGDRNet(nn.Module):
         proj_vit = self.projector_vit(feat_vit_final)
         fusion_feat = torch.cat([feat_cnn_final, cls_token, drt_mean], dim=1)
         logits_fusion = self.fusion_head(fusion_feat)
+        if not hasattr(self, "_shape_debug_printed"):
+            print("========================================================")
+            print(f"cnn_dim_s2      = {self.cnn_dim_s2}")
+            print(f"cnn_dim_s3      = {self.cnn_dim_s3}")
+            print(f"cnn_out_dim     = {self.cnn_out_dim}")
+            print(f"vit_dim         = {self.vit_dim}")
+            print(f"fusion_in_dim   = {self.fusion_in_dim}")
+            print("feat_cnn_s2:", feat_cnn_s2.shape)
+            print("feat_cnn_s3:", feat_cnn_s3.shape)
+            print("feat_cnn_final:", feat_cnn_final.shape)
+            print("vit_tokens:", feat_vit_9_clean.shape)
+            print("cnn_global:", feat_cnn_final.shape)
+            print("drt_token:", cls_token.shape)
+            print("fusion_feat:", fusion_feat.shape)
+            print("proj_cnn:", proj_cnn.shape)
+            print("proj_vit:", proj_vit.shape)
+            print("========================================================")
+            self._shape_debug_printed = True
         drts_features = vit_outputs.last_hidden_state[:, 1:1 + num_drts, :]
         spatial_features = vit_outputs.last_hidden_state[:, 1 + num_drts:, :]
         res['logits_vit'] = logits_vit
