@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=gdr-esdg
+#SBATCH --job-name=gdr-msst-512
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -27,13 +27,13 @@ export CUBLAS_ALLOW_TF32=0
 source /datasets/work/hb-nhmrc-dhcp/work/liu275/miniconda3/bin/activate
 conda activate brainseg
 
-chmod +x ./run_esdg.sh
+chmod +x ./run_msst.sh
 
-export OUTPUT_DIR="./output_esdg_h100"
+export OUTPUT_DIR="./output_msst_512_h100"
 
 set +e
 
-./run_esdg.sh
+./run_msst.sh
 
 set -e
 
