@@ -68,8 +68,6 @@ def _normalize_domain_loaders(test_loader):
     return {'test': test_loader}
 
 def _branch_candidates(algorithm):
-    if algorithm.__class__.__name__ == 'CASS_GDRNet':
-        return ['cnn', 'vit', 'fusion']
     return ['fusion']
 
 def _init_diagnostic_csv(csv_path):
