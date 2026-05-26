@@ -910,12 +910,9 @@ class DualTowerGDRNet(nn.Module):
         res = {}
         if x_vit is None:
             img_for_vit = x_cnn
-            img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
+            img_for_cnn = x_cnn
         else:
-            if x_cnn.shape[-1] != 224:
-                img_for_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
-            else:
-                img_for_cnn = x_cnn
+            img_for_cnn = x_cnn
             img_for_vit = x_vit
         vit_outputs = self.vit(img_for_vit)
         feat_vit_3 = vit_outputs.hidden_states[3 + 1]
@@ -956,7 +953,12 @@ class DualTowerGDRNet(nn.Module):
         feat_vit_final = cls_token
         logits_vit = self.classifier_vit(feat_vit_final)
         proj_vit = self.projector_vit(feat_vit_final)
-        fusion_feat = torch.cat([feat_cnn_final, cls_token], dim=1)
+        # Fusion uses CNN global feature + ViT CLS token + DRT mean.
+        # Dimensions:
+        #   feat_cnn_final: [B, cnn_out_dim]
+        #   cls_token:      [B, vit_dim]
+        #   drt_mean:       [B, vit_dim]
+        fusion_feat = torch.cat([feat_cnn_final, cls_token, drt_mean], dim=1)
         logits_fusion = self.fusion_head(fusion_feat)
         if not hasattr(self, "_shape_debug_printed"):
             print("========================================================")
@@ -989,8 +991,6 @@ class DualTowerGDRNet(nn.Module):
     def extract_cnn_feature(self, x_cnn, x_vit=None):
         if x_vit is None:
             x_vit = x_cnn
-        if x_cnn.shape[-1] != 224:
-            x_cnn = F.interpolate(x_cnn, size=(224, 224), mode='bilinear', align_corners=False)
         vit_outputs = self.vit(x_vit)
         feat_vit_3 = vit_outputs.hidden_states[4]
         feat_vit_6 = vit_outputs.hidden_states[7]
