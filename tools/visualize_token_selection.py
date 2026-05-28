@@ -183,36 +183,62 @@ def attach_router_cache(bridge, name: str):
     bridge._select_tokens = types.MethodType(_select_tokens_logged, bridge)
 
 
-def read_split(data_root, domain, split, max_samples=None, grade_min=None):
-    split_path = Path(data_root) / "splits" / f"{domain}_{split}.txt"
+def split_files_for_protocol(data_root, domain, split):
+    split_dir = Path(data_root) / "splits"
+    if split == "protocol_test":
+        # Match GDRBench(mode="test"), which evaluates target domains using
+        # the union of train and crossval split files rather than *_test.txt.
+        return [
+            split_dir / f"{domain}_train.txt",
+            split_dir / f"{domain}_crossval.txt",
+        ]
+
+    return [split_dir / f"{domain}_{split}.txt"]
+
+
+def read_split(
+    data_root,
+    domain,
+    split,
+    max_samples=None,
+    grade_min=None,
+    image_rel_path=None,
+):
+    split_paths = split_files_for_protocol(data_root, domain, split)
     image_root = Path(data_root) / "images"
 
-    if not split_path.exists():
-        raise FileNotFoundError(f"Cannot find split file: {split_path}")
+    missing_paths = [path for path in split_paths if not path.exists()]
+    if missing_paths:
+        missing_str = ", ".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"Cannot find split file(s): {missing_str}")
 
     samples = []
-    with open(split_path) as file_obj:
-        for line in file_obj:
-            line = line.strip()
-            if not line:
-                continue
+    for split_path in split_paths:
+        with open(split_path) as file_obj:
+            for line in file_obj:
+                line = line.strip()
+                if not line:
+                    continue
 
-            parts = line.split()
-            if len(parts) < 2:
-                continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
 
-            rel_path = parts[0]
-            label = int(parts[1])
+                rel_path = parts[0]
+                label = int(parts[1])
 
-            if grade_min is not None and label < grade_min:
-                continue
+                if image_rel_path is not None and rel_path != image_rel_path:
+                    continue
 
-            img_path = image_root / rel_path
-            if img_path.exists():
-                samples.append((img_path, rel_path, label))
+                if grade_min is not None and label < grade_min:
+                    continue
 
-            if max_samples is not None and len(samples) >= max_samples:
-                break
+                img_path = image_root / rel_path
+                if img_path.exists():
+                    samples.append((img_path, rel_path, label))
+
+                if max_samples is not None and len(samples) >= max_samples:
+                    return samples
 
     return samples
 
@@ -385,6 +411,7 @@ def run_visualization(args):
         split=args.split,
         max_samples=args.num_samples,
         grade_min=args.grade_min,
+        image_rel_path=args.image_rel_path,
     )
 
     if len(samples) == 0:
@@ -472,7 +499,14 @@ def parse_args():
     parser.add_argument("--source-domain", type=str, default="IDRID", choices=ALL_DOMAINS)
     parser.add_argument("--vis-domain", type=str, default="IDRID", choices=ALL_DOMAINS)
     parser.add_argument(
-        "--split", type=str, default="crossval", choices=["train", "crossval", "test"]
+        "--split",
+        type=str,
+        default="crossval",
+        choices=["train", "crossval", "test", "protocol_test"],
+        help=(
+            "Split to read. Use protocol_test to match GDRBench(mode=\"test\"), "
+            "which reads train+crossval for target domains."
+        ),
     )
 
     parser.add_argument("--input-size", type=int, default=512)
@@ -480,6 +514,15 @@ def parse_args():
 
     parser.add_argument("--num-samples", type=int, default=6)
     parser.add_argument("--grade-min", type=int, default=None)
+    parser.add_argument(
+        "--image-rel-path",
+        type=str,
+        default=None,
+        help=(
+            "Relative image path exactly as written in the split file. "
+            "If provided, visualize this single image."
+        ),
+    )
 
     parser.add_argument("--lesion-mask-root", type=str, default=None)
     parser.add_argument("--out-dir", type=str, default="./visualizations/token_selection")
