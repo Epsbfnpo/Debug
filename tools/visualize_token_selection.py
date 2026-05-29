@@ -1026,11 +1026,12 @@ def run_visualization(args):
     use_lesion_col = (
         args.lesion_mask_root is not None or args.idrid_lesion_root is not None
     )
-    show_token_grid = not args.hide_dino_token_grid
+    show_token_grid = not getattr(args, "hide_dino_token_grid", False)
+    show_topk_panel = not getattr(args, "hide_topk_panel", False)
 
     # Columns: Original, optional lesion overlay, optional DINO token grid,
-    # Top-K/simulated Top-K, and router/simulated score map.
-    n_cols = 1 + int(use_lesion_col) + int(show_token_grid) + 2
+    # optional Top-K/simulated Top-K, and router/simulated score map.
+    n_cols = 1 + int(use_lesion_col) + int(show_token_grid) + int(show_topk_panel) + 1
     n_rows = len(samples)
 
     fig, axes = plt.subplots(
@@ -1131,17 +1132,6 @@ def run_visualization(args):
             axes[row_idx, col].set_title(f"DINO token grid\n{grid}×{grid}")
             col += 1
 
-        selected_col = col
-        score_col = col + 1
-
-        draw_selected_boxes(
-            axes[row_idx, selected_col],
-            display_np,
-            selected_map,
-            patches,
-            lesion_mask=selected_panel_lesion_mask,
-            lesion_token_map=selected_panel_lesion_token_map,
-        )
         selected_title = "CNN-guided Top-K"
         score_title = "Router score map"
 
@@ -1149,19 +1139,29 @@ def run_visualization(args):
             selected_title = "Simulated plausible Top-K"
             score_title = "Plausible score map"
 
-        axes[row_idx, selected_col].set_title(
-            f"{selected_title}\n{int(selected_map.sum())} tokens"
-        )
+        if show_topk_panel:
+            draw_selected_boxes(
+                axes[row_idx, col],
+                display_np,
+                selected_map,
+                patches,
+                lesion_mask=selected_panel_lesion_mask,
+                lesion_token_map=selected_panel_lesion_token_map,
+            )
+            axes[row_idx, col].set_title(
+                f"{selected_title}\n{int(selected_map.sum())} tokens"
+            )
+            col += 1
 
         draw_score_overlay(
-            axes[row_idx, score_col],
+            axes[row_idx, col],
             display_np,
             score_map,
             lesion_mask=score_panel_lesion_mask,
             lesion_token_map=score_panel_lesion_token_map,
             patches=patches,
         )
-        axes[row_idx, score_col].set_title(score_title)
+        axes[row_idx, col].set_title(score_title)
 
         sample_name = Path(rel_path).stem
         if lesion_mask is not None:
@@ -1223,30 +1223,29 @@ def run_visualization(args):
                 sample_axes[sample_col].set_title(f"DINO token grid\n{grid}×{grid}")
                 sample_col += 1
 
-            sample_selected_col = sample_col
-            sample_score_col = sample_col + 1
-
-            draw_selected_boxes(
-                sample_axes[sample_selected_col],
-                display_np,
-                selected_map,
-                patches,
-                lesion_mask=selected_panel_lesion_mask,
-                lesion_token_map=selected_panel_lesion_token_map,
-            )
-            sample_axes[sample_selected_col].set_title(
-                f"{selected_title}\n{int(selected_map.sum())} tokens"
-            )
+            if show_topk_panel:
+                draw_selected_boxes(
+                    sample_axes[sample_col],
+                    display_np,
+                    selected_map,
+                    patches,
+                    lesion_mask=selected_panel_lesion_mask,
+                    lesion_token_map=selected_panel_lesion_token_map,
+                )
+                sample_axes[sample_col].set_title(
+                    f"{selected_title}\n{int(selected_map.sum())} tokens"
+                )
+                sample_col += 1
 
             draw_score_overlay(
-                sample_axes[sample_score_col],
+                sample_axes[sample_col],
                 display_np,
                 score_map,
                 lesion_mask=score_panel_lesion_mask,
                 lesion_token_map=score_panel_lesion_token_map,
                 patches=patches,
             )
-            sample_axes[sample_score_col].set_title(score_title)
+            sample_axes[sample_col].set_title(score_title)
 
             sample_fig.tight_layout()
             sample_fig.savefig(
@@ -1368,6 +1367,11 @@ def parse_args():
         "--hide-dino-token-grid",
         action="store_true",
         help="Hide the DINO token-grid panel from the visualization figure.",
+    )
+    parser.add_argument(
+        "--hide-topk-panel",
+        action="store_true",
+        help="Hide the CNN-guided Top-K / simulated Top-K panel from the visualization figure.",
     )
     parser.add_argument(
         "--simulated-topk-scale",
