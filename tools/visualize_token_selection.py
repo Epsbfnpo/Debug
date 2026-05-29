@@ -96,7 +96,10 @@ def _load_state_flexibly(algorithm, state):
     """Load either an Algorithm state dict or a bare network state dict."""
     state = normalize_state_dict_keys(state)
 
-    if any(key.startswith("network.") or key.startswith("momentum_network.") for key in state):
+    if any(
+        key.startswith("network.") or key.startswith("momentum_network.")
+        for key in state
+    ):
         missing, unexpected = algorithm.load_state_dict(state, strict=False)
         return "algorithm", missing, unexpected
 
@@ -517,6 +520,353 @@ def lesion_token_map_from_mask(mask_np, grid, threshold=0.0):
     return token_map
 
 
+def estimate_fov_mask(image, threshold=0.03):
+    """Estimate fundus field-of-view from RGB image in [0, 1].
+
+    Black background/padding has very low intensity.
+    """
+    gray = image.mean(axis=2)
+    return (gray > threshold).astype(np.float32)
+
+
+def token_map_from_binary_mask(mask_np, grid, threshold=0.20):
+    """Convert a binary pixel mask into a token-level binary map.
+
+    A token is marked positive if the ratio of positive pixels inside the cell
+    is >= threshold.
+    """
+    if mask_np is None:
+        return None
+
+    height, width = mask_np.shape[:2]
+    cell_h = height / grid
+    cell_w = width / grid
+
+    token_map = np.zeros((grid, grid), dtype=np.float32)
+
+    for y_pos in range(grid):
+        y0 = int(round(y_pos * cell_h))
+        y1 = int(round((y_pos + 1) * cell_h))
+
+        for x_pos in range(grid):
+            x0 = int(round(x_pos * cell_w))
+            x1 = int(round((x_pos + 1) * cell_w))
+
+            cell = mask_np[y0:y1, x0:x1]
+            if cell.size == 0:
+                continue
+
+            ratio = float((cell > 0).sum()) / float(cell.size)
+            token_map[y_pos, x_pos] = 1.0 if ratio >= threshold else 0.0
+
+    return token_map
+
+
+def compute_fov_edge_confidence(fov_token_map, margin=4.0):
+    """Compute token-level confidence from distance to the fundus FOV boundary.
+
+    Values close to 0 indicate near-edge/peripheral fundus tokens, while values
+    close to 1 indicate tokens safely inside the fundus field. This avoids an
+    unrealistically perfect simulated router around peripheral lesions.
+    """
+    if fov_token_map is None:
+        return None
+
+    fov = fov_token_map.astype(bool)
+    grid_h, grid_w = fov.shape
+
+    outside_coords = np.argwhere(~fov)
+    yy, xx = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing="ij")
+
+    if len(outside_coords) == 0:
+        dist_to_border = np.minimum.reduce(
+            [yy, xx, grid_h - 1 - yy, grid_w - 1 - xx]
+        ).astype(np.float32)
+        edge_conf = np.clip(dist_to_border / float(margin), 0.0, 1.0)
+        return edge_conf.astype(np.float32)
+
+    coords = np.stack([yy.reshape(-1), xx.reshape(-1)], axis=1)
+
+    # The token grid is typically only 32x32 for 512 input with ViT-S/16, so
+    # this O(N^2) distance computation is cheap and dependency-free.
+    dists = []
+    for outside_y, outside_x in outside_coords:
+        dist = (coords[:, 0] - outside_y) ** 2 + (coords[:, 1] - outside_x) ** 2
+        dists.append(dist)
+
+    min_dist = np.sqrt(np.min(np.stack(dists, axis=0), axis=0))
+    min_dist = min_dist.reshape(grid_h, grid_w).astype(np.float32)
+
+    edge_conf = np.clip(min_dist / float(margin), 0.0, 1.0)
+    edge_conf[~fov] = 0.0
+
+    return edge_conf.astype(np.float32)
+
+
+def dilate_token_map(token_map, radius=2):
+    """Simple square-neighborhood dilation on token grid."""
+    if token_map is None:
+        return None
+
+    grid_h, grid_w = token_map.shape
+    out = np.zeros_like(token_map, dtype=np.float32)
+    ys, xs = np.where(token_map > 0)
+
+    for y_pos, x_pos in zip(ys, xs):
+        y0 = max(0, y_pos - radius)
+        y1 = min(grid_h, y_pos + radius + 1)
+        x0 = max(0, x_pos - radius)
+        x1 = min(grid_w, x_pos + radius + 1)
+        out[y0:y1, x0:x1] = 1.0
+
+    return out
+
+
+def distance_score_from_seed(seed_map, sigma=2.0):
+    """Generate a smooth score map from seed cells.
+
+    Scores are higher near seed cells and lower far away.
+    """
+    grid_h, grid_w = seed_map.shape
+    seed_coords = np.argwhere(seed_map > 0)
+
+    if len(seed_coords) == 0:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+
+    yy, xx = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing="ij")
+    coords = np.stack([yy, xx], axis=-1).reshape(-1, 2)
+
+    dists = []
+    for seed_y, seed_x in seed_coords:
+        dist = (coords[:, 0] - seed_y) ** 2 + (coords[:, 1] - seed_x) ** 2
+        dists.append(dist)
+
+    min_dist = np.min(np.stack(dists, axis=0), axis=0)
+    score = np.exp(-min_dist / (2.0 * sigma * sigma))
+    return score.reshape(grid_h, grid_w).astype(np.float32)
+
+
+def center_prior_score(grid):
+    """Weak prior that avoids selecting mostly border/background regions.
+
+    This is not lesion-specific; it simply makes the simulated score look less
+    random.
+    """
+    yy, xx = np.meshgrid(np.arange(grid), np.arange(grid), indexing="ij")
+    cy = (grid - 1) / 2.0
+    cx = (grid - 1) / 2.0
+    dist2 = (yy - cy) ** 2 + (xx - cx) ** 2
+    sigma = grid / 2.5
+    return np.exp(-dist2 / (2.0 * sigma * sigma)).astype(np.float32)
+
+
+def take_top_from_allowed(score, allowed_mask, n):
+    """Return flattened token indices of the top-n cells within allowed_mask."""
+    if n <= 0:
+        return np.array([], dtype=np.int64)
+
+    allowed_idx = np.flatnonzero(allowed_mask.reshape(-1) > 0)
+    if len(allowed_idx) == 0:
+        return np.array([], dtype=np.int64)
+
+    n = min(n, len(allowed_idx))
+    flat_score = score.reshape(-1)
+    order = allowed_idx[np.argsort(flat_score[allowed_idx])[::-1]]
+    return order[:n].astype(np.int64)
+
+
+def simulate_ideal_selection_and_score(
+    image,
+    lesion_mask,
+    lesion_token_map,
+    actual_selected_count,
+    grid,
+    args,
+):
+    """Generate a plausible good-case token-selection pattern.
+
+    This is not an oracle lesion selector. It is biased toward lesion and
+    lesion-context regions, but peripheral lesions near the fundus boundary can
+    be missed, which better reflects realistic model behavior.
+    """
+    del lesion_mask
+
+    rng = np.random.default_rng(args.ideal_seed)
+
+    # 1. Estimate fundus field-of-view and token-level FOV.
+    fov_mask = estimate_fov_mask(image, threshold=args.ideal_fov_threshold)
+    fov_token_map = token_map_from_binary_mask(
+        fov_mask,
+        grid,
+        threshold=args.ideal_fov_token_threshold,
+    )
+
+    if fov_token_map is None or fov_token_map.sum() == 0:
+        fov_token_map = np.ones((grid, grid), dtype=np.float32)
+
+    fov_allowed = fov_token_map > 0
+
+    # 2. Compute edge confidence: low near fundus edge, high inside fundus.
+    edge_confidence = compute_fov_edge_confidence(
+        fov_token_map,
+        margin=args.ideal_edge_margin,
+    )
+    if edge_confidence is None:
+        edge_confidence = np.ones((grid, grid), dtype=np.float32)
+
+    # Prevent complete collapse at the edge; edge tokens are weaker, not impossible.
+    edge_score_weight = (
+        args.ideal_edge_score_weight
+        + (1.0 - args.ideal_edge_score_weight) * edge_confidence
+    ).astype(np.float32)
+
+    # 3. Lesion and lesion-context token maps.
+    if lesion_token_map is None:
+        lesion_token_map = np.zeros((grid, grid), dtype=np.float32)
+
+    lesion_allowed = (lesion_token_map > 0) & fov_allowed
+
+    context_map = dilate_token_map(lesion_token_map, radius=args.ideal_context_radius)
+    if context_map is None:
+        context_map = np.zeros((grid, grid), dtype=np.float32)
+
+    context_allowed = (context_map > 0) & fov_allowed & (~lesion_allowed)
+
+    # 4. Simulate peripheral lesion omission: lesion tokens close to the FOV
+    # boundary are not always selected.
+    peripheral_lesions = lesion_allowed & (edge_confidence < args.ideal_edge_threshold)
+    lesion_select_allowed = lesion_allowed.copy()
+
+    if peripheral_lesions.any():
+        drop_mask = (
+            rng.random(size=lesion_select_allowed.shape)
+            < args.ideal_edge_lesion_miss_prob
+        )
+        lesion_select_allowed[peripheral_lesions & drop_mask] = False
+
+    # 5. Keep Top-K count comparable to actual router.
+    k_total = int(actual_selected_count)
+    k_total = max(1, min(k_total, int(fov_allowed.sum())))
+
+    # 6. Build plausible preference scores. Lesions matter, but edge lesions are
+    # attenuated.
+    lesion_score = distance_score_from_seed(lesion_token_map, sigma=2.0)
+    context_score = distance_score_from_seed(context_map, sigma=3.0)
+    center_score = center_prior_score(grid)
+
+    noise = rng.normal(
+        0.0,
+        args.ideal_score_noise,
+        size=(grid, grid),
+    ).astype(np.float32)
+
+    base_score = (
+        0.50 * lesion_score + 0.25 * context_score + 0.15 * center_score + noise
+    ).astype(np.float32)
+
+    base_score = base_score * edge_score_weight
+    base_score[~fov_allowed] = -1.0
+
+    # 7. Select a capped number of lesion-overlapping tokens. This avoids a
+    # perfect lesion-token selector.
+    max_lesion_tokens = int(round(k_total * args.ideal_lesion_budget))
+    lesion_idx = take_top_from_allowed(
+        base_score,
+        lesion_select_allowed,
+        max_lesion_tokens,
+    )
+
+    selected_flat = set(lesion_idx.tolist())
+
+    # 8. Select lesion-context tokens, with the same edge attenuation.
+    remaining = k_total - len(selected_flat)
+
+    context_mask = context_allowed.reshape(-1).copy()
+    if selected_flat:
+        context_mask[list(selected_flat)] = False
+    context_mask = context_mask.reshape(grid, grid)
+
+    context_budget = int(round(k_total * 0.35))
+    context_idx = take_top_from_allowed(
+        base_score,
+        context_mask,
+        min(remaining, context_budget),
+    )
+    selected_flat.update(context_idx.tolist())
+
+    # 9. Fill remaining tokens from valid FOV regions. These are not necessarily
+    # lesion tokens; they represent plausible retinal context.
+    remaining = k_total - len(selected_flat)
+
+    fov_mask_flat = fov_allowed.reshape(-1).copy()
+    if selected_flat:
+        fov_mask_flat[list(selected_flat)] = False
+    fov_mask_remaining = fov_mask_flat.reshape(grid, grid)
+
+    rest_idx = take_top_from_allowed(base_score, fov_mask_remaining, remaining)
+    selected_flat.update(rest_idx.tolist())
+
+    # 10. Construct simulated selected-token map.
+    ideal_selected_map = np.zeros((grid * grid,), dtype=np.float32)
+    selected_idx = np.array(sorted(selected_flat), dtype=np.int64)
+    ideal_selected_map[selected_idx] = 1.0
+    ideal_selected_map = ideal_selected_map.reshape(grid, grid)
+
+    # 11. Generate a plausible score map.
+    selected_smooth = distance_score_from_seed(ideal_selected_map, sigma=1.6)
+    lesion_context_smooth = distance_score_from_seed(
+        np.maximum(lesion_token_map, context_map),
+        sigma=2.5,
+    )
+
+    ideal_score_map = (
+        0.55 * selected_smooth
+        + 0.25 * lesion_context_smooth
+        + 0.10 * center_score
+        + rng.normal(
+            0.0,
+            args.ideal_score_noise,
+            size=(grid, grid),
+        ).astype(np.float32)
+    )
+
+    # Selected tokens should be relatively high, but not uniformly perfect.
+    selected_boost = 0.12 + 0.08 * edge_confidence
+    ideal_score_map[ideal_selected_map > 0] += selected_boost[ideal_selected_map > 0]
+
+    # Edge attenuation also affects the score map.
+    ideal_score_map = ideal_score_map * edge_score_weight
+
+    # Suppress black background.
+    if fov_allowed.any():
+        ideal_score_map[~fov_allowed] = np.nanmin(ideal_score_map[fov_allowed]) - 0.10
+    else:
+        ideal_score_map[~fov_allowed] = -1.0
+
+    # Optional debug statistics.
+    edge_selected = float(
+        (ideal_selected_map * (edge_confidence < args.ideal_edge_threshold)).sum()
+    )
+    lesion_selected = float((ideal_selected_map * lesion_token_map).sum())
+    peripheral_lesion_total = float(peripheral_lesions.sum())
+    peripheral_lesion_selected = float((ideal_selected_map * peripheral_lesions).sum())
+
+    print(
+        f"[PlausibleSim] selected={float(ideal_selected_map.sum()):.0f}, "
+        f"selected∩lesion={lesion_selected:.0f}, "
+        f"edge_selected={edge_selected:.0f}, "
+        f"peripheral_lesions={peripheral_lesion_total:.0f}, "
+        f"selected∩peripheral_lesions={peripheral_lesion_selected:.0f}"
+    )
+
+    return (
+        ideal_score_map.astype(np.float32),
+        ideal_selected_map,
+        selected_idx,
+        fov_token_map,
+    )
+
+
 def draw_green_token_boxes(ax, token_map, image_shape, patches, linewidth=1.0):
     """Draw green token-cell boxes for lesion-overlapping DINO tokens."""
     if token_map is None:
@@ -548,7 +898,9 @@ def draw_token_grid(ax, image, grid, lesion_token_map=None, patches=None):
         ax.axvline(idx * width / grid, linewidth=0.25, alpha=0.35)
 
     if lesion_token_map is not None and patches is not None:
-        draw_green_token_boxes(ax, lesion_token_map, image.shape, patches, linewidth=1.0)
+        draw_green_token_boxes(
+            ax, lesion_token_map, image.shape, patches, linewidth=1.0
+        )
 
     ax.axis("off")
 
@@ -568,7 +920,9 @@ def draw_selected_boxes(
     cell_w = width / grid
 
     if lesion_token_map is not None:
-        draw_green_token_boxes(ax, lesion_token_map, image.shape, patches, linewidth=1.0)
+        draw_green_token_boxes(
+            ax, lesion_token_map, image.shape, patches, linewidth=1.0
+        )
 
     if lesion_mask is not None:
         ax.contour(lesion_mask, levels=[0.5], linewidths=0.8, colors="lime")
@@ -606,7 +960,9 @@ def draw_score_overlay(
     )
 
     if lesion_token_map is not None and patches is not None:
-        draw_green_token_boxes(ax, lesion_token_map, image.shape, patches, linewidth=1.0)
+        draw_green_token_boxes(
+            ax, lesion_token_map, image.shape, patches, linewidth=1.0
+        )
 
     if lesion_mask is not None:
         ax.contour(lesion_mask, levels=[0.5], linewidths=0.8, colors="lime")
@@ -620,7 +976,11 @@ def run_visualization(args):
     set_seed(args.seed)
 
     requested_device = torch.device(args.device)
-    device = requested_device if requested_device.type != "cuda" or torch.cuda.is_available() else torch.device("cpu")
+    device = (
+        requested_device
+        if requested_device.type != "cuda" or torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     cfg = build_cfg(args)
     algorithm = load_algorithm(cfg, args.checkpoint, device)
 
@@ -646,12 +1006,16 @@ def run_visualization(args):
         )
 
     if len(samples) == 0:
-        raise RuntimeError("No samples found. Check domain/split/grade_min/idrid-case-id.")
+        raise RuntimeError(
+            "No samples found. Check domain/split/grade_min/idrid-case-id."
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    use_lesion_col = args.lesion_mask_root is not None or args.idrid_lesion_root is not None
+    use_lesion_col = (
+        args.lesion_mask_root is not None or args.idrid_lesion_root is not None
+    )
     n_cols = 5 if use_lesion_col else 4
     n_rows = len(samples)
 
@@ -688,13 +1052,34 @@ def run_visualization(args):
             )
 
         if lesion_mask is None and args.lesion_mask_root is not None:
-            lesion_mask = maybe_load_mask(args.lesion_mask_root, rel_path, args.input_size)
+            lesion_mask = maybe_load_mask(
+                args.lesion_mask_root, rel_path, args.input_size
+            )
 
         lesion_token_map = lesion_token_map_from_mask(
             lesion_mask,
             grid,
             threshold=args.lesion_token_threshold,
         )
+
+        is_simulated = False
+        fov_token_map = None
+
+        if args.simulate_ideal_routing:
+            actual_selected_count = int(selected_map.sum())
+
+            score_map, selected_map, selected_idx, fov_token_map = (
+                simulate_ideal_selection_and_score(
+                    image=display_np,
+                    lesion_mask=lesion_mask,
+                    lesion_token_map=lesion_token_map,
+                    actual_selected_count=actual_selected_count,
+                    grid=grid,
+                    args=args,
+                )
+            )
+
+            is_simulated = True
 
         axes[row_idx, 0].imshow(display_np)
         axes[row_idx, 0].set_title(f"Original\nlabel={label}")
@@ -728,8 +1113,15 @@ def run_visualization(args):
             lesion_mask=lesion_mask,
             lesion_token_map=lesion_token_map,
         )
+        selected_title = "CNN-guided Top-K"
+        score_title = "Router score map"
+
+        if is_simulated:
+            selected_title = "Simulated plausible Top-K"
+            score_title = "Plausible score map"
+
         axes[row_idx, selected_col].set_title(
-            f"CNN-guided Top-K\n{int(selected_map.sum())} tokens"
+            f"{selected_title}\n{int(selected_map.sum())} tokens"
         )
 
         draw_score_overlay(
@@ -740,7 +1132,7 @@ def run_visualization(args):
             lesion_token_map=lesion_token_map,
             patches=patches,
         )
-        axes[row_idx, score_col].set_title("Router score map")
+        axes[row_idx, score_col].set_title(score_title)
 
         sample_name = Path(rel_path).stem
         if lesion_mask is not None:
@@ -770,10 +1162,14 @@ def run_visualization(args):
                 lesion_token_map if lesion_token_map is not None else np.array([])
             ),
             lesion_sources=np.array([str(lesion_sources)], dtype=object),
+            is_simulated=is_simulated,
+            fov_token_map=fov_token_map if fov_token_map is not None else np.array([]),
         )
 
         if args.save_single_sample_panels:
-            sample_fig, sample_axes = plt.subplots(1, n_cols, figsize=(4.0 * n_cols, 3.8))
+            sample_fig, sample_axes = plt.subplots(
+                1, n_cols, figsize=(4.0 * n_cols, 3.8)
+            )
             sample_axes = np.atleast_1d(sample_axes)
 
             sample_axes[0].imshow(display_np)
@@ -809,7 +1205,7 @@ def run_visualization(args):
                 lesion_token_map=lesion_token_map,
             )
             sample_axes[sample_selected_col].set_title(
-                f"CNN-guided Top-K\n{int(selected_map.sum())} tokens"
+                f"{selected_title}\n{int(selected_map.sum())} tokens"
             )
 
             draw_score_overlay(
@@ -820,7 +1216,7 @@ def run_visualization(args):
                 lesion_token_map=lesion_token_map,
                 patches=patches,
             )
-            sample_axes[sample_score_col].set_title("Router score map")
+            sample_axes[sample_score_col].set_title(score_title)
 
             sample_fig.tight_layout()
             sample_fig.savefig(
@@ -831,7 +1227,10 @@ def run_visualization(args):
             plt.close(sample_fig)
 
     plt.tight_layout()
-    save_path = out_dir / f"token_selection_{args.source_domain}_{args.vis_domain}_{split_tag}_{args.bridge}.png"
+    save_path = (
+        out_dir
+        / f"token_selection_{args.source_domain}_{args.vis_domain}_{split_tag}_{args.bridge}.png"
+    )
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -850,7 +1249,9 @@ def parse_args():
         default="/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/GDR_Formatted_Data",
     )
 
-    parser.add_argument("--source-domain", type=str, default="IDRID", choices=ALL_DOMAINS)
+    parser.add_argument(
+        "--source-domain", type=str, default="IDRID", choices=ALL_DOMAINS
+    )
     parser.add_argument("--vis-domain", type=str, default="IDRID", choices=ALL_DOMAINS)
     parser.add_argument(
         "--split",
@@ -858,13 +1259,15 @@ def parse_args():
         default="crossval",
         choices=["train", "crossval", "test", "protocol_test"],
         help=(
-            "Split to read. Use protocol_test to match GDRBench(mode=\"test\"), "
+            'Split to read. Use protocol_test to match GDRBench(mode="test"), '
             "which reads train+crossval for target domains."
         ),
     )
 
     parser.add_argument("--input-size", type=int, default=512)
-    parser.add_argument("--bridge", type=str, default="bridge3", choices=["bridge2", "bridge3"])
+    parser.add_argument(
+        "--bridge", type=str, default="bridge3", choices=["bridge2", "bridge3"]
+    )
 
     parser.add_argument("--num-samples", type=int, default=6)
     parser.add_argument("--grade-min", type=int, default=None)
@@ -931,7 +1334,106 @@ def parse_args():
         action="store_true",
         help="Save per-sample visualization panels in addition to the combined figure.",
     )
-    parser.add_argument("--out-dir", type=str, default="./visualizations/token_selection")
+    parser.add_argument(
+        "--simulate-ideal-routing",
+        action="store_true",
+        help=(
+            "Replace the actual CNN-guided Top-K selection and router score map "
+            "with a plausible simulated routing pattern. This is for illustrative "
+            "visualization only, not for reporting actual model behavior."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-seed",
+        type=int,
+        default=123,
+        help="Random seed for plausible simulated token selection.",
+    )
+    parser.add_argument(
+        "--ideal-fov-threshold",
+        type=float,
+        default=0.03,
+        help=(
+            "Pixel-intensity threshold for estimating the fundus field-of-view. "
+            "Pixels darker than this are treated as black background."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-fov-token-threshold",
+        type=float,
+        default=0.20,
+        help=(
+            "Minimum within-token FOV ratio for a token cell to be considered "
+            "inside fundus. This prevents simulated selected tokens from falling "
+            "on black background."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-context-radius",
+        type=int,
+        default=2,
+        help=(
+            "Token-grid radius around lesion-overlapping cells used as clinically "
+            "plausible context."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-lesion-budget",
+        type=float,
+        default=0.45,
+        help=(
+            "Maximum fraction of plausible simulated selected tokens assigned "
+            "directly to lesion-overlapping cells. The rest are sampled from "
+            "lesion context and valid fundus regions."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-score-noise",
+        type=float,
+        default=0.03,
+        help="Small noise added to simulated score map to avoid an unrealistically smooth pattern.",
+    )
+    parser.add_argument(
+        "--ideal-edge-margin",
+        type=float,
+        default=4.0,
+        help=(
+            "Token-level margin used to define the peripheral fundus region. "
+            "Tokens close to the fundus boundary receive lower simulated "
+            "routing confidence."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-edge-lesion-miss-prob",
+        type=float,
+        default=0.55,
+        help=(
+            "Probability of suppressing lesion-overlapping tokens near the "
+            "fundus boundary in the simulated routing. This makes peripheral "
+            "lesions more likely to be missed."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-edge-score-weight",
+        type=float,
+        default=0.45,
+        help=(
+            "Minimum score multiplier for tokens close to the fundus boundary. "
+            "Smaller values make peripheral tokens less likely to be selected."
+        ),
+    )
+    parser.add_argument(
+        "--ideal-edge-threshold",
+        type=float,
+        default=0.45,
+        help=(
+            "Tokens with edge confidence below this threshold are treated as "
+            "peripheral tokens."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir", type=str, default="./visualizations/token_selection"
+    )
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
