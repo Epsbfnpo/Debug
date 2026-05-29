@@ -1081,6 +1081,20 @@ def run_visualization(args):
 
             is_simulated = True
 
+        # In simulated mode, do not overlay green lesion boxes/contours on the
+        # simulated Top-K panel or simulated score map. The lesion reference is
+        # already shown in the lesion overlay and DINO grid panels.
+        if is_simulated:
+            selected_panel_lesion_mask = None
+            selected_panel_lesion_token_map = None
+            score_panel_lesion_mask = None
+            score_panel_lesion_token_map = None
+        else:
+            selected_panel_lesion_mask = lesion_mask
+            selected_panel_lesion_token_map = lesion_token_map
+            score_panel_lesion_mask = lesion_mask
+            score_panel_lesion_token_map = lesion_token_map
+
         axes[row_idx, 0].imshow(display_np)
         axes[row_idx, 0].set_title(f"Original\nlabel={label}")
         axes[row_idx, 0].axis("off")
@@ -1110,8 +1124,8 @@ def run_visualization(args):
             display_np,
             selected_map,
             patches,
-            lesion_mask=lesion_mask,
-            lesion_token_map=lesion_token_map,
+            lesion_mask=selected_panel_lesion_mask,
+            lesion_token_map=selected_panel_lesion_token_map,
         )
         selected_title = "CNN-guided Top-K"
         score_title = "Router score map"
@@ -1128,8 +1142,8 @@ def run_visualization(args):
             axes[row_idx, score_col],
             display_np,
             score_map,
-            lesion_mask=lesion_mask,
-            lesion_token_map=lesion_token_map,
+            lesion_mask=score_panel_lesion_mask,
+            lesion_token_map=score_panel_lesion_token_map,
             patches=patches,
         )
         axes[row_idx, score_col].set_title(score_title)
@@ -1201,8 +1215,8 @@ def run_visualization(args):
                 display_np,
                 selected_map,
                 patches,
-                lesion_mask=lesion_mask,
-                lesion_token_map=lesion_token_map,
+                lesion_mask=selected_panel_lesion_mask,
+                lesion_token_map=selected_panel_lesion_token_map,
             )
             sample_axes[sample_selected_col].set_title(
                 f"{selected_title}\n{int(selected_map.sum())} tokens"
@@ -1212,8 +1226,8 @@ def run_visualization(args):
                 sample_axes[sample_score_col],
                 display_np,
                 score_map,
-                lesion_mask=lesion_mask,
-                lesion_token_map=lesion_token_map,
+                lesion_mask=score_panel_lesion_mask,
+                lesion_token_map=score_panel_lesion_token_map,
                 patches=patches,
             )
             sample_axes[sample_score_col].set_title(score_title)
