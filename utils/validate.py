@@ -7,6 +7,25 @@ from tqdm import tqdm
 
 METRIC_NAMES = ['acc', 'macro_f1', 'macro_ovr_auc', 'macro_ovo_auc', 'weighted_ovr_auc', 'weighted_ovo_auc',]
 
+CLASS_NAMES = {
+    0: "healthy",
+    1: "mild_DR",
+    2: "moderate_DR",
+    3: "severe_DR",
+    4: "proliferative_DR",
+}
+
+CLASSWISE_METRIC_NAMES = [
+    "class_id",
+    "class_name",
+    "support",
+    "pred_count",
+    "class_acc",
+    "class_f1",
+    "class_ovo_auc",
+    "ovo_pair_count",
+]
+
 def gather_tensor(tensor):
     world_size = dist.get_world_size()
     device = tensor.device
@@ -46,6 +65,111 @@ def calculate_metrics_numpy(y_true, y_pred, y_prob, num_classes=5):
     metrics['auc'] = metrics['macro_ovo_auc']
     return metrics
 
+def _safe_float(x):
+    if x is None:
+        return np.nan
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+
+def calculate_classwise_metrics_numpy(y_true, y_pred, y_prob, num_classes=5):
+    """
+    Compute class-wise metrics for DR grades.
+
+    class_acc:
+        recall-like per-class accuracy:
+        #(y=c and pred=c) / #(y=c)
+
+    class_f1:
+        one-vs-rest F1 for class c.
+
+    class_ovo_auc:
+        one-vs-one AUC averaged over pairs (c vs k), k != c.
+        This is a class-wise OVO-style AUC, not the global macro_ovo_auc.
+    """
+    labels = list(range(num_classes))
+    rows = []
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    y_prob = np.asarray(y_prob)
+
+    for c in labels:
+        true_c = (y_true == c)
+        pred_c = (y_pred == c)
+
+        support = int(true_c.sum())
+        pred_count = int(pred_c.sum())
+
+        if support > 0:
+            class_acc = float(((y_true == c) & (y_pred == c)).sum() / support)
+        else:
+            class_acc = np.nan
+
+        # One-vs-rest F1. If both true and predicted positives are absent, F1 is undefined.
+        if support > 0 or pred_count > 0:
+            class_f1 = float(
+                f1_score(
+                    true_c.astype(int),
+                    pred_c.astype(int),
+                    zero_division=0,
+                )
+            )
+        else:
+            class_f1 = np.nan
+
+        # Class-wise OVO-style AUC: average pairwise AUC(c vs k).
+        pair_aucs = []
+        if y_prob.ndim == 2 and y_prob.shape[1] >= num_classes:
+            for k in labels:
+                if k == c:
+                    continue
+
+                pair_mask = (y_true == c) | (y_true == k)
+                if pair_mask.sum() == 0:
+                    continue
+
+                pair_true_raw = y_true[pair_mask]
+                if len(np.unique(pair_true_raw)) < 2:
+                    continue
+
+                pair_true = (pair_true_raw == c).astype(int)
+
+                # Use normalized pair probability to avoid unrelated classes affecting pair score.
+                pc = y_prob[pair_mask, c]
+                pk = y_prob[pair_mask, k]
+                pair_score = pc / (pc + pk + 1e-12)
+
+                try:
+                    pair_auc = roc_auc_score(pair_true, pair_score)
+                    pair_aucs.append(float(pair_auc))
+                except ValueError:
+                    continue
+
+        if len(pair_aucs) > 0:
+            class_ovo_auc = float(np.mean(pair_aucs))
+            ovo_pair_count = int(len(pair_aucs))
+        else:
+            class_ovo_auc = np.nan
+            ovo_pair_count = 0
+
+        rows.append(
+            {
+                "class_id": c,
+                "class_name": CLASS_NAMES.get(c, f"class_{c}"),
+                "support": support,
+                "pred_count": pred_count,
+                "class_acc": class_acc,
+                "class_f1": class_f1,
+                "class_ovo_auc": class_ovo_auc,
+                "ovo_pair_count": ovo_pair_count,
+            }
+        )
+
+    return rows
+
 def _safe_predict(algorithm, image, branch=None):
     if branch is None:
         return algorithm.predict(image)
@@ -70,7 +194,15 @@ def _extract_logits(output, branch):
             return output[k]
     raise KeyError('Cannot find logits in model output dict.')
 
-def algorithm_validate(algorithm, data_loader, writer, epoch, val_type, branch=None):
+def algorithm_validate(
+    algorithm,
+    data_loader,
+    writer,
+    epoch,
+    val_type,
+    branch=None,
+    return_classwise=False,
+):
     algorithm.eval()
     criterion = torch.nn.CrossEntropyLoss()
     device = next(algorithm.network.parameters()).device
@@ -133,6 +265,7 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type, branch=N
         all_preds, all_labels, all_outputs, all_indices = local_preds, local_labels, local_outputs, local_indices
         final_loss = total_loss / max(total_samples, 1)
     metrics = {name: 0.0 for name in METRIC_NAMES}
+    classwise_metrics = []
     metrics['loss'] = final_loss
     metrics['auc'] = 0.0
     metrics['f1'] = 0.0
@@ -148,16 +281,60 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type, branch=N
             else:
                 num_classes = getattr(getattr(algorithm, 'cfg', None), 'DATASET', None)
                 num_classes = getattr(num_classes, 'NUM_CLASSES', 5)
-            metrics = calculate_metrics_numpy(real_labels, real_preds, real_outputs, num_classes=num_classes)
-            metrics['loss'] = final_loss
+            metrics = calculate_metrics_numpy(
+                real_labels,
+                real_preds,
+                real_outputs,
+                num_classes=num_classes,
+            )
+            metrics["loss"] = final_loss
+            if return_classwise:
+                classwise_metrics = calculate_classwise_metrics_numpy(
+                    real_labels,
+                    real_preds,
+                    real_outputs,
+                    num_classes=num_classes,
+                )
         else:
             metrics['loss'] = final_loss
         branch_suffix = f"/{branch}" if branch else ''
         logging.info(f"{val_type}{branch_suffix} - Epoch: {epoch}, Loss: {metrics['loss']:.4f}, Acc: {metrics['acc']:.4f}, MacroF1: {metrics['macro_f1']:.4f}, MacroOVR-AUC: {metrics['macro_ovr_auc']:.4f}, MacroOVO-AUC: {metrics['macro_ovo_auc']:.4f}, WeightedOVR-AUC: {metrics['weighted_ovr_auc']:.4f}, WeightedOVO-AUC: {metrics['weighted_ovo_auc']:.4f}")
+        if return_classwise and len(classwise_metrics) > 0:
+            for row in classwise_metrics:
+                cid = row["class_id"]
+                cname = row["class_name"]
+                support = row["support"]
+                acc = row["class_acc"]
+                f1 = row["class_f1"]
+                auc = row["class_ovo_auc"]
+                pair_count = row["ovo_pair_count"]
+
+                acc_str = "NA" if np.isnan(acc) else f"{acc:.4f}"
+                f1_str = "NA" if np.isnan(f1) else f"{f1:.4f}"
+                auc_str = "NA" if np.isnan(auc) else f"{auc:.4f}"
+
+                if pair_count > 0 and not np.isnan(f1):
+                    logging.info(
+                        f"{val_type}{branch_suffix} - Epoch: {epoch}, "
+                        f"Class {cid} ({cname}), Support: {support}, "
+                        f"ClassAcc: {acc_str}, ClassF1: {f1_str}, "
+                        f"ClassOVO-AUC: {auc_str}, OVOPairs: {pair_count}"
+                    )
+                else:
+                    logging.info(
+                        f"{val_type}{branch_suffix} - Epoch: {epoch}, "
+                        f"Class {cid} ({cname}), Support: {support}, "
+                        f"ClassAcc: {acc_str}, ClassF1: {f1_str}, "
+                        f"ClassOVO-AUC: NA"
+                    )
         if writer is not None:
             tag_prefix = f"{val_type}{branch_suffix}"
             writer.add_scalar(f'info/{tag_prefix}_loss', metrics['loss'], epoch)
             for name in METRIC_NAMES:
                 writer.add_scalar(f'info/{tag_prefix}_{name}', metrics[name], epoch)
     algorithm.train()
-    return metrics, metrics['loss']
+
+    if return_classwise:
+        return metrics, metrics["loss"], classwise_metrics
+
+    return metrics, metrics["loss"]
