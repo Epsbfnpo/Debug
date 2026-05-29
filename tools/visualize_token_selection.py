@@ -309,16 +309,81 @@ def maybe_load_mask(mask_root, rel_path, input_size):
     return load_single_mask(mask_path, input_size)
 
 
+def normalize_idrid_case_id(case_id_or_path):
+    """Normalize IDRID case IDs, paths, filenames, or numeric IDs to ``IDRiD_XX``."""
+    text = Path(str(case_id_or_path)).stem
+
+    match = re.search(r"IDRiD[_-]?0*(\d+)", text, flags=re.IGNORECASE)
+    if match is not None:
+        number = int(match.group(1))
+        return f"IDRiD_{number:02d}"
+
+    if str(case_id_or_path).isdigit():
+        number = int(case_id_or_path)
+        return f"IDRiD_{number:02d}"
+
+    return None
+
+
 def extract_idrid_case_id(rel_path):
     """Extract an IDRID case ID such as ``IDRiD_01`` from an image path."""
-    stem = Path(rel_path).stem
-    match = re.search(r"(IDRiD_\d+)", stem, flags=re.IGNORECASE)
-    if match is None:
+    return normalize_idrid_case_id(rel_path)
+
+
+def find_idrid_original_image(idrid_original_image_root, case_id):
+    """Find an original IDRID segmentation image by normalized case ID."""
+    if idrid_original_image_root is None:
         return None
 
-    case_id = match.group(1)
-    _, number = case_id.split("_")
-    return f"IDRiD_{int(number):02d}"
+    normalized_case_id = normalize_idrid_case_id(case_id)
+    if normalized_case_id is None:
+        return None
+
+    root = Path(idrid_original_image_root)
+    candidates = [
+        root / f"{normalized_case_id}.jpg",
+        root / f"{normalized_case_id}.jpeg",
+        root / f"{normalized_case_id}.png",
+        root / f"{normalized_case_id}.tif",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    matches = list(root.rglob(f"{normalized_case_id}.*"))
+    if matches:
+        return matches[0]
+
+    return None
+
+
+def build_direct_idrid_sample(args):
+    """Build one sample directly from the IDRID segmentation image directory."""
+    if args.idrid_original_image_root is None:
+        raise ValueError(
+            "--idrid-original-image-root must be provided when --idrid-case-id is used."
+        )
+
+    case_id = normalize_idrid_case_id(args.idrid_case_id)
+    if case_id is None:
+        raise ValueError(f"Cannot parse IDRID case id from: {args.idrid_case_id}")
+
+    img_path = find_idrid_original_image(args.idrid_original_image_root, case_id)
+    if img_path is None:
+        raise FileNotFoundError(
+            f"Cannot find original IDRID image for {case_id} under "
+            f"{args.idrid_original_image_root}"
+        )
+
+    rel_path = f"{case_id}.jpg"
+    label = args.direct_idrid_label
+
+    print(f"[Direct IDRID] case_id = {case_id}")
+    print(f"[Direct IDRID] original image = {img_path}")
+    print(f"[Direct IDRID] display label = {label}")
+
+    return [(img_path, rel_path, label)], case_id
 
 
 def load_idrid_merged_lesion_mask(idrid_lesion_root, rel_path, input_size):
@@ -565,17 +630,23 @@ def run_visualization(args):
     attach_router_cache(network.bridge2, "bridge2")
     attach_router_cache(network.bridge3, "bridge3")
 
-    samples = read_split(
-        data_root=args.data_root,
-        domain=args.vis_domain,
-        split=args.split,
-        max_samples=args.num_samples,
-        grade_min=args.grade_min,
-        image_rel_path=args.image_rel_path,
-    )
+    split_tag = args.split
+
+    if args.idrid_case_id is not None:
+        samples, _direct_case_id = build_direct_idrid_sample(args)
+        split_tag = "idrid_direct"
+    else:
+        samples = read_split(
+            data_root=args.data_root,
+            domain=args.vis_domain,
+            split=args.split,
+            max_samples=args.num_samples,
+            grade_min=args.grade_min,
+            image_rel_path=args.image_rel_path,
+        )
 
     if len(samples) == 0:
-        raise RuntimeError("No samples found. Check domain/split/grade_min.")
+        raise RuntimeError("No samples found. Check domain/split/grade_min/idrid-case-id.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -692,6 +763,7 @@ def run_visualization(args):
             grid=grid,
             label=label,
             rel_path=str(rel_path),
+            input_image_path=str(img_path),
             bridge=args.bridge,
             lesion_mask=lesion_mask if lesion_mask is not None else np.array([]),
             lesion_token_map=(
@@ -759,7 +831,7 @@ def run_visualization(args):
             plt.close(sample_fig)
 
     plt.tight_layout()
-    save_path = out_dir / f"token_selection_{args.source_domain}_{args.vis_domain}_{args.split}_{args.bridge}.png"
+    save_path = out_dir / f"token_selection_{args.source_domain}_{args.vis_domain}_{split_tag}_{args.bridge}.png"
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -807,6 +879,34 @@ def parse_args():
     )
 
     parser.add_argument("--lesion-mask-root", type=str, default=None)
+    parser.add_argument(
+        "--idrid-original-image-root",
+        type=str,
+        default=None,
+        help=(
+            "Root directory of IDRID segmentation original images, e.g. "
+            "'.../IDRID_Seg/A. Segmentation/1. Original Images/a. Training Set'."
+        ),
+    )
+    parser.add_argument(
+        "--idrid-case-id",
+        type=str,
+        default=None,
+        help=(
+            "Directly visualize one IDRID segmentation case, e.g. IDRiD_01, "
+            "IDRiD_001, or 1. When provided, bypass split files and "
+            "GDR_Formatted_Data/images."
+        ),
+    )
+    parser.add_argument(
+        "--direct-idrid-label",
+        type=int,
+        default=-1,
+        help=(
+            "Optional displayed DR grade label for direct IDRID mode. Use -1 if "
+            "unknown. This does not affect model inference."
+        ),
+    )
     parser.add_argument(
         "--idrid-lesion-root",
         type=str,
