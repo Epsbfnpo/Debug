@@ -1,6 +1,12 @@
 #!/bin/bash
 
-BASE_OUTPUT_DIR="./output_esdg_512_h100"
+BASE_OUTPUT_DIR=${OUTPUT_DIR:-"./output_esdg_512_h100_profile"}
+PROFILE_COMPUTE=${PROFILE_COMPUTE:-1}
+
+PROFILE_ARGS=()
+if [ "$PROFILE_COMPUTE" = "1" ]; then
+    PROFILE_ARGS+=("--profile-compute")
+fi
 SOURCES=("APTOS" "DEEPDR" "FGADR" "IDRID" "MESSIDOR" "RLDR")
 NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 TIME_LIMIT=360000
@@ -13,6 +19,7 @@ echo "🚀 启动 SSMT / ESDG 批量实验"
 echo "GPU 数量: $NUM_GPUS"
 echo "待运行源域: ${SOURCES[*]}"
 echo "基础输出目录: $BASE_OUTPUT_DIR"
+echo "Compute profiling: $PROFILE_COMPUTE"
 echo "========================================================"
 
 for SOURCE in "${SOURCES[@]}"
@@ -24,8 +31,9 @@ do
 
     torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 main.py \
         --time-limit $TIME_LIMIT \
-        --source-domain $SOURCE \
-        --output $BASE_OUTPUT_DIR
+        --source-domain "$SOURCE" \
+        --output "$BASE_OUTPUT_DIR" \
+        "${PROFILE_ARGS[@]}"
 
     if [ $? -ne 0 ]; then
         echo "❌ [错误] 源域 $SOURCE 训练失败！"

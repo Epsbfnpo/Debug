@@ -29,7 +29,8 @@ conda activate brainseg
 
 chmod +x ./run_esdg.sh
 
-export OUTPUT_DIR="./output_esdg_512_h100"
+export OUTPUT_DIR="./output_esdg_512_h100_profile"
+export PROFILE_COMPUTE=1
 
 set +e
 

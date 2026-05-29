@@ -2,7 +2,7 @@ from yacs.config import CfgNode as CN
 
 _C = CN()
 
-_C.OUT_DIR = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/Fusion_modified_version2_224/output_msst_h100"
+_C.OUT_DIR = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/Fusion_modified_version2_512/output_esdg_h100"
 _C.USE_CUDA = True
 _C.SEED = 42
 _C.num_workers = 8
@@ -13,7 +13,7 @@ _C.MODEL.PRETRAINED = True
 _C.MODEL.PRETRAINED_PATH = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/resnet18-f37072fd.pth"
 _C.ALGORITHM = "CASS_GDRNet"
 _C.BACKBONE = "resnet18"
-_C.DG_MODE = "MSST"
+_C.DG_MODE = "ESDG"
 
 _C.DATASET = CN()
 _C.DATASET.ROOT = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/GDR_Formatted_Data"
