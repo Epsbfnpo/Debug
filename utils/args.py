@@ -9,12 +9,18 @@ def get_args():
     parser.add_argument('--output', type=str, default=None, help='base output directory')
     parser.add_argument('--source-domain', type=str, default=None, help='Specify the single source domain (e.g., APTOS). Others will be targets.')
     parser.add_argument('--target-domain', type=str, default=None, help='Specify the single target domain for MSST. All other domains will be sources.')
+    parser.add_argument(
+        "--profile-compute",
+        action="store_true",
+        help="Profile computation cost once and save compute_cost.json.",
+    )
     args = parser.parse_args()
     return args
 
 def setup_cfg(args):
     cfg = cfg_default.clone()
     cfg.defrost()
+    cfg.PROFILE_COMPUTE = args.profile_compute
 
     if args.output is not None:
         cfg.OUT_DIR = args.output

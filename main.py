@@ -1,5 +1,6 @@
 import csv
 import datetime
+import json
 import logging
 import os
 import random
@@ -15,6 +16,13 @@ from tqdm import tqdm
 import algorithms
 from dataset.data_manager import get_dataset
 from utils.args import get_args, setup_cfg
+from utils.compute_cost import (
+    count_parameters,
+    profile_eval_forward,
+    profile_train_update,
+    save_compute_cost_json,
+    unwrap_network,
+)
 from utils.misc import MultiLossCounter, init_log, update_writer
 from utils.validate import METRIC_NAMES, algorithm_validate
 
@@ -80,6 +88,58 @@ def _append_diagnostic_row(csv_path, row):
         writer_csv = csv.writer(f)
         writer_csv.writerow(row)
 
+
+def _init_classwise_csv(csv_path):
+    with open(csv_path, "w", newline="") as f:
+        writer_csv = csv.writer(f)
+        writer_csv.writerow(
+            [
+                "Epoch",
+                "Domain",
+                "Branch",
+                "ClassID",
+                "ClassName",
+                "Support",
+                "PredCount",
+                "ClassACC",
+                "ClassF1",
+                "ClassOVO_AUC",
+                "OVOPairCount",
+            ]
+        )
+
+
+def _append_classwise_rows(csv_path, epoch, domain, branch, classwise_rows):
+    def fmt(x):
+        if x is None:
+            return ""
+        try:
+            if np.isnan(x):
+                return ""
+        except TypeError:
+            pass
+        return x
+
+    with open(csv_path, "a", newline="") as f:
+        writer_csv = csv.writer(f)
+        for row in classwise_rows:
+            writer_csv.writerow(
+                [
+                    epoch,
+                    domain,
+                    branch,
+                    row.get("class_id"),
+                    row.get("class_name"),
+                    row.get("support"),
+                    row.get("pred_count"),
+                    fmt(row.get("class_acc")),
+                    fmt(row.get("class_f1")),
+                    fmt(row.get("class_ovo_auc")),
+                    row.get("ovo_pair_count"),
+                ]
+            )
+
+
 def _save_best_metric_model(algorithm, output_dir, metric_name):
     save_path = os.path.join(output_dir, f'best_val_{metric_name}.pth')
     torch.save(algorithm.state_dict(), save_path)
@@ -111,6 +171,9 @@ def main():
     latest_ckpt_path = os.path.join(log_path, 'latest_model.pth')
     final_ckpt_path = os.path.join(log_path, 'final_model.pth')
     diagnostic_csv_path = os.path.join(log_path, 'diagnostic_metrics.csv')
+    classwise_csv_path = os.path.join(log_path, "classwise_test_metrics.csv")
+    compute_cost_path = os.path.join(log_path, "compute_cost.json")
+    compute_cost_payload = {}
     if os.path.exists(final_ckpt_path):
         if args.local_rank in [-1, 0]:
             print(f"✅ Found {final_ckpt_path}. Training already completed.")
@@ -124,6 +187,36 @@ def main():
     algorithm_class = algorithms.get_algorithm_class(cfg.ALGORITHM)
     algorithm = algorithm_class(cfg.DATASET.NUM_CLASSES, cfg)
     algorithm.to(args.device)
+    if getattr(cfg, "PROFILE_COMPUTE", False):
+        param_info = count_parameters(unwrap_network(algorithm))
+
+        eval_forward_cost = profile_eval_forward(
+            algorithm=algorithm,
+            input_size=cfg.TRANSFORM.INPUT_SIZE,
+            device=args.device,
+            branch="fusion",
+            batch_size=1,
+            amp=True,
+        )
+
+        compute_cost_payload = {
+            "input_size": int(cfg.TRANSFORM.INPUT_SIZE),
+            "algorithm": cfg.ALGORITHM,
+            "backbone": cfg.BACKBONE,
+            "dg_mode": cfg.DG_MODE,
+            "source_domains": list(cfg.DATASET.SOURCE_DOMAINS),
+            "target_domains": list(cfg.DATASET.TARGET_DOMAINS),
+            "params": param_info,
+            "eval_or_test_forward": eval_forward_cost,
+        }
+
+        if args.local_rank in [-1, 0]:
+            save_compute_cost_json(compute_cost_path, compute_cost_payload)
+            logging.info(f"[ComputeCost] Saved initial compute cost to {compute_cost_path}")
+
+        if is_distributed:
+            dist.barrier()
+
     if is_distributed:
         algorithm = nn.SyncBatchNorm.convert_sync_batchnorm(algorithm)
         algorithm.network = DDP(algorithm.network, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True,)
@@ -153,6 +246,8 @@ def main():
             debug_log(f"Error loading checkpoint: {e}. Starting from scratch.", args.local_rank)
     if args.local_rank in [-1, 0] and not os.path.exists(diagnostic_csv_path):
         _init_diagnostic_csv(diagnostic_csv_path)
+    if args.local_rank in [-1, 0] and not os.path.exists(classwise_csv_path):
+        _init_classwise_csv(classwise_csv_path)
     iterator = tqdm(range(start_epoch - 1, cfg.EPOCHS), disable=(args.local_rank not in [-1, 0]), initial=start_epoch - 1, total=cfg.EPOCHS,)
     for i in iterator:
         epoch = i + 1
@@ -160,13 +255,54 @@ def main():
             train_sampler.set_epoch(i)
         loss_counter = MultiLossCounter()
         algorithm.train()
-        for image, mask, label, domain, img_index in train_loader:
+        for batch_idx, (image, mask, label, domain, img_index) in enumerate(train_loader):
             image = image.to(args.device)
             mask = mask.to(args.device)
             label = label.to(args.device).long()
             domain = domain.to(args.device).long()
             minibatch = [image, mask, label, domain]
-            step_vals = algorithm.update(minibatch)
+
+            profile_this_step = (
+                getattr(cfg, "PROFILE_COMPUTE", False)
+                and epoch == start_epoch
+                and batch_idx == 0
+            )
+
+            if profile_this_step:
+                step_vals, train_update_cost = profile_train_update(
+                    algorithm=algorithm,
+                    minibatch=minibatch,
+                    device=args.device,
+                )
+
+                if args.local_rank in [-1, 0]:
+                    # Update existing compute-cost payload if available.
+                    if os.path.exists(compute_cost_path):
+                        with open(compute_cost_path, "r") as f:
+                            compute_cost_payload = json.load(f)
+
+                    compute_cost_payload["train_update"] = train_update_cost
+
+                    # Add epoch-level rough estimates.
+                    train_samples = len(train_loader.dataset)
+                    val_samples = len(val_loader.dataset)
+                    compute_cost_payload["estimated_epoch_cost"] = {
+                        "train_samples": int(train_samples),
+                        "val_samples": int(val_samples),
+                        "train_epoch_gflops_est": (
+                            train_update_cost["gflops_per_sample"] * train_samples
+                        ),
+                        "val_epoch_gflops_est": (
+                            compute_cost_payload["eval_or_test_forward"]["gflops_per_sample"]
+                            * val_samples
+                        ),
+                    }
+
+                    save_compute_cost_json(compute_cost_path, compute_cost_payload)
+                    logging.info(f"[ComputeCost] Added train update cost to {compute_cost_path}")
+            else:
+                step_vals = algorithm.update(minibatch)
+
             loss_counter.update(step_vals, image.size(0))
         if hasattr(algorithm, 'update_epoch'):
             algorithm.update_epoch(epoch)
@@ -194,13 +330,51 @@ def main():
                     best_performance = max(best_performance, metrics.get('macro_f1', 0.0))
             for test_env_name, test_env_loader in test_loaders.items():
                 for branch in branch_candidates:
-                    test_metrics, _ = algorithm_validate(algorithm, test_env_loader, writer, epoch, f'test_{test_env_name}', branch=branch,)
+                    test_metrics, _, classwise_rows = algorithm_validate(
+                        algorithm,
+                        test_env_loader,
+                        writer,
+                        epoch,
+                        f"test_{test_env_name}",
+                        branch=branch,
+                        return_classwise=True,
+                    )
                     if args.local_rank in [-1, 0]:
                         for metric_name, val in test_metrics.items():
                             if metric_name in METRIC_NAMES:
                                 writer.add_scalar(f'Test_{test_env_name}/{branch}_{metric_name}', val, global_step=epoch)
                         row = [epoch, test_env_name, branch] + [test_metrics.get(m, 0.0) for m in METRIC_NAMES]
                         _append_diagnostic_row(diagnostic_csv_path, row)
+                        _append_classwise_rows(
+                            classwise_csv_path,
+                            epoch,
+                            test_env_name,
+                            branch,
+                            classwise_rows,
+                        )
+                if (
+                    getattr(cfg, "PROFILE_COMPUTE", False)
+                    and args.local_rank in [-1, 0]
+                    and epoch == start_epoch
+                ):
+                    if os.path.exists(compute_cost_path):
+                        with open(compute_cost_path, "r") as f:
+                            compute_cost_payload = json.load(f)
+
+                    if "test_domains_estimated_cost" not in compute_cost_payload:
+                        compute_cost_payload["test_domains_estimated_cost"] = {}
+
+                    test_samples = len(test_env_loader.dataset)
+                    eval_gflops_per_sample = compute_cost_payload["eval_or_test_forward"][
+                        "gflops_per_sample"
+                    ]
+
+                    compute_cost_payload["test_domains_estimated_cost"][test_env_name] = {
+                        "test_samples": int(test_samples),
+                        "test_epoch_gflops_est": float(eval_gflops_per_sample * test_samples),
+                    }
+
+                    save_compute_cost_json(compute_cost_path, compute_cost_payload)
             if args.local_rank in [-1, 0]:
                 logging.info(f"Epoch {epoch} Diagnostic Testing Complete.")
             if is_distributed:
