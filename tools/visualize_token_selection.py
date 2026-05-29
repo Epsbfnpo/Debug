@@ -351,7 +351,13 @@ def load_idrid_merged_lesion_mask(idrid_lesion_root, rel_path, input_size):
 
 
 def make_maps_from_cache(cache):
-    """Convert cached router outputs into grid score and selection maps."""
+    """Convert cached router outputs into grid score and selection maps.
+
+    The routed bridge selects visual tokens from ``feat_vit[:, num_special:, :]``.
+    Therefore the visualization grid must use the same special-token prefix
+    instead of assuming the sequence is always ``CLS + visual patches``. This is
+    required for DINO variants that expose native register/special tokens.
+    """
     scores = cache["scores"]
     topk_idx = cache["topk_idx"]
     num_special = int(cache["num_special"])
@@ -360,24 +366,26 @@ def make_maps_from_cache(cache):
     if scores is None or topk_idx is None:
         raise RuntimeError("No router scores were cached.")
 
-    # feat_vit_clean = CLS + visual patches after DRT tokens are stripped.
-    num_visual_tokens = num_tokens - 1
+    visual_start = num_special
+    num_visual_tokens = num_tokens - visual_start
     grid = int(round(math.sqrt(num_visual_tokens)))
 
     if grid * grid != num_visual_tokens:
         raise RuntimeError(
-            f"Cannot reshape {num_visual_tokens} visual tokens into a square grid. "
-            f"N={num_tokens}, grid={grid}."
+            f"Cannot reshape {num_visual_tokens} routed visual tokens into a square grid. "
+            f"N={num_tokens}, num_special={num_special}, "
+            f"visual_start={visual_start}, grid={grid}. "
+            "This usually means the non-visual token prefix was parsed incorrectly."
         )
 
     scores_1d = scores[0].numpy()
-    visual_scores = scores_1d[1 : 1 + num_visual_tokens]
+
+    # Scores corresponding exactly to the visual tokens used by the router.
+    visual_scores = scores_1d[visual_start : visual_start + num_visual_tokens]
     score_map = visual_scores.reshape(grid, grid)
 
-    # The trained bridge treats the first `num_special` positions as special,
-    # even though the clean sequence contains CLS + visual patches. Convert the
-    # Top-K indices back from patch_tokens-relative indices to visual-grid IDs.
-    selected_visual_idx = topk_idx[0].numpy() + num_special - 1
+    # topk_idx is already relative to patch_tokens = feat_vit[:, num_special:, :].
+    selected_visual_idx = topk_idx[0].numpy()
 
     selected_map = np.zeros(num_visual_tokens, dtype=np.float32)
     selected_map[selected_visual_idx] = 1.0
