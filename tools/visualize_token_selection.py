@@ -744,8 +744,18 @@ def simulate_ideal_selection_and_score(
         )
         lesion_select_allowed[peripheral_lesions & drop_mask] = False
 
-    # 5. Keep Top-K count comparable to actual router.
-    k_total = int(actual_selected_count)
+    # 5. Use a reduced Top-K count for simulated visualization.
+    # The actual router may keep ~25% of all DINO visual tokens, which can be
+    # too dense for an illustrative figure. We therefore scale and optionally
+    # cap it.
+    k_total = int(round(float(actual_selected_count) * args.simulated_topk_scale))
+
+    if args.simulated_topk_max is not None and args.simulated_topk_max > 0:
+        k_total = min(k_total, args.simulated_topk_max)
+
+    if args.simulated_topk_min is not None and args.simulated_topk_min > 0:
+        k_total = max(k_total, args.simulated_topk_min)
+
     k_total = max(1, min(k_total, int(fov_allowed.sum())))
 
     # 6. Build plausible preference scores. Lesions matter, but edge lesions are
@@ -1016,7 +1026,11 @@ def run_visualization(args):
     use_lesion_col = (
         args.lesion_mask_root is not None or args.idrid_lesion_root is not None
     )
-    n_cols = 5 if use_lesion_col else 4
+    show_token_grid = not args.hide_dino_token_grid
+
+    # Columns: Original, optional lesion overlay, optional DINO token grid,
+    # Top-K/simulated Top-K, and router/simulated score map.
+    n_cols = 1 + int(use_lesion_col) + int(show_token_grid) + 2
     n_rows = len(samples)
 
     fig, axes = plt.subplots(
@@ -1099,25 +1113,26 @@ def run_visualization(args):
         axes[row_idx, 0].set_title(f"Original\nlabel={label}")
         axes[row_idx, 0].axis("off")
 
-        if use_lesion_col:
-            draw_lesion_overlay(axes[row_idx, 1], display_np, lesion_mask)
-            axes[row_idx, 1].set_title("Lesion label overlay\nMA+HE+EX+SE")
-            grid_col = 2
-            selected_col = 3
-            score_col = 4
-        else:
-            grid_col = 1
-            selected_col = 2
-            score_col = 3
+        col = 1
 
-        draw_token_grid(
-            axes[row_idx, grid_col],
-            display_np,
-            grid,
-            lesion_token_map=lesion_token_map,
-            patches=patches,
-        )
-        axes[row_idx, grid_col].set_title(f"DINO token grid\n{grid}×{grid}")
+        if use_lesion_col:
+            draw_lesion_overlay(axes[row_idx, col], display_np, lesion_mask)
+            axes[row_idx, col].set_title("Lesion label overlay\nMA+HE+EX+SE")
+            col += 1
+
+        if show_token_grid:
+            draw_token_grid(
+                axes[row_idx, col],
+                display_np,
+                grid,
+                lesion_token_map=lesion_token_map,
+                patches=patches,
+            )
+            axes[row_idx, col].set_title(f"DINO token grid\n{grid}×{grid}")
+            col += 1
+
+        selected_col = col
+        score_col = col + 1
 
         draw_selected_boxes(
             axes[row_idx, selected_col],
@@ -1190,25 +1205,26 @@ def run_visualization(args):
             sample_axes[0].set_title(f"Original\nlabel={label}")
             sample_axes[0].axis("off")
 
-            if use_lesion_col:
-                draw_lesion_overlay(sample_axes[1], display_np, lesion_mask)
-                sample_axes[1].set_title("Lesion label overlay\nMA+HE+EX+SE")
-                sample_grid_col = 2
-                sample_selected_col = 3
-                sample_score_col = 4
-            else:
-                sample_grid_col = 1
-                sample_selected_col = 2
-                sample_score_col = 3
+            sample_col = 1
 
-            draw_token_grid(
-                sample_axes[sample_grid_col],
-                display_np,
-                grid,
-                lesion_token_map=lesion_token_map,
-                patches=patches,
-            )
-            sample_axes[sample_grid_col].set_title(f"DINO token grid\n{grid}×{grid}")
+            if use_lesion_col:
+                draw_lesion_overlay(sample_axes[sample_col], display_np, lesion_mask)
+                sample_axes[sample_col].set_title("Lesion label overlay\nMA+HE+EX+SE")
+                sample_col += 1
+
+            if show_token_grid:
+                draw_token_grid(
+                    sample_axes[sample_col],
+                    display_np,
+                    grid,
+                    lesion_token_map=lesion_token_map,
+                    patches=patches,
+                )
+                sample_axes[sample_col].set_title(f"DINO token grid\n{grid}×{grid}")
+                sample_col += 1
+
+            sample_selected_col = sample_col
+            sample_score_col = sample_col + 1
 
             draw_selected_boxes(
                 sample_axes[sample_selected_col],
@@ -1347,6 +1363,32 @@ def parse_args():
         "--save-single-sample-panels",
         action="store_true",
         help="Save per-sample visualization panels in addition to the combined figure.",
+    )
+    parser.add_argument(
+        "--hide-dino-token-grid",
+        action="store_true",
+        help="Hide the DINO token-grid panel from the visualization figure.",
+    )
+    parser.add_argument(
+        "--simulated-topk-scale",
+        type=float,
+        default=0.60,
+        help=(
+            "Scale factor for reducing the number of simulated selected tokens. "
+            "For example, 0.60 keeps 60% of the actual router Top-K count."
+        ),
+    )
+    parser.add_argument(
+        "--simulated-topk-min",
+        type=int,
+        default=64,
+        help="Minimum number of simulated selected tokens.",
+    )
+    parser.add_argument(
+        "--simulated-topk-max",
+        type=int,
+        default=160,
+        help="Maximum number of simulated selected tokens. Use <=0 to disable.",
     )
     parser.add_argument(
         "--simulate-ideal-routing",
