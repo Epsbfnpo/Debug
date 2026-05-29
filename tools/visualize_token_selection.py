@@ -8,6 +8,7 @@ modify training code or require retraining.
 import argparse
 import math
 import random
+import re
 import sys
 import types
 from pathlib import Path
@@ -47,6 +48,14 @@ ALL_DOMAINS = [
     "RLDR",
     "EYEPACS",
 ]
+
+IDRID_LESION_FOLDERS = {
+    "MA": "1. Microaneurysms",
+    "HE": "2. Haemorrhages",
+    "EX": "3. Hard Exudates",
+    "SE": "4. Soft Exudates",
+    # Optic disc is intentionally excluded because it is anatomy, not lesion.
+}
 
 
 def set_seed(seed: int = 42):
@@ -262,6 +271,23 @@ def preprocess_image(img_path, input_size):
     return display_np, tensor
 
 
+def load_single_mask(mask_path, input_size):
+    mask = Image.open(mask_path).convert("L")
+    mask_transform = transforms.Compose(
+        [
+            SquarePad(),
+            transforms.Resize(
+                (input_size, input_size),
+                interpolation=transforms.InterpolationMode.NEAREST,
+            ),
+            transforms.CenterCrop(input_size),
+        ]
+    )
+    mask = mask_transform(mask)
+    mask_np = np.array(mask)
+    return (mask_np > 0).astype(np.float32)
+
+
 def maybe_load_mask(mask_root, rel_path, input_size):
     if mask_root is None:
         return None
@@ -280,20 +306,48 @@ def maybe_load_mask(mask_root, rel_path, input_size):
     if mask_path is None:
         return None
 
-    mask = Image.open(mask_path).convert("L")
-    mask_transform = transforms.Compose(
-        [
-            SquarePad(),
-            transforms.Resize(
-                (input_size, input_size),
-                interpolation=transforms.InterpolationMode.NEAREST,
-            ),
-            transforms.CenterCrop(input_size),
-        ]
-    )
-    mask = mask_transform(mask)
-    mask_np = np.array(mask)
-    return (mask_np > 0).astype(np.float32)
+    return load_single_mask(mask_path, input_size)
+
+
+def extract_idrid_case_id(rel_path):
+    """Extract an IDRID case ID such as ``IDRiD_01`` from an image path."""
+    stem = Path(rel_path).stem
+    match = re.search(r"(IDRiD_\d+)", stem, flags=re.IGNORECASE)
+    if match is None:
+        return None
+
+    case_id = match.group(1)
+    _, number = case_id.split("_")
+    return f"IDRiD_{int(number):02d}"
+
+
+def load_idrid_merged_lesion_mask(idrid_lesion_root, rel_path, input_size):
+    """Load and merge IDRID MA/HE/EX/SE masks, explicitly excluding optic disc."""
+    if idrid_lesion_root is None:
+        return None, {}
+
+    case_id = extract_idrid_case_id(rel_path)
+    if case_id is None:
+        return None, {}
+
+    idrid_lesion_root = Path(idrid_lesion_root)
+    merged = None
+    found = {}
+
+    for suffix, folder in IDRID_LESION_FOLDERS.items():
+        mask_path = idrid_lesion_root / folder / f"{case_id}_{suffix}.tif"
+        if not mask_path.exists():
+            found[suffix] = None
+            continue
+
+        mask_np = load_single_mask(mask_path, input_size)
+        merged = mask_np.copy() if merged is None else np.maximum(merged, mask_np)
+        found[suffix] = str(mask_path)
+
+    if merged is None:
+        return None, found
+
+    return (merged > 0).astype(np.float32), found
 
 
 def make_maps_from_cache(cache):
@@ -339,21 +393,112 @@ def normalize_map(values):
     return values / denom
 
 
-def draw_token_grid(ax, image, grid):
+def make_green_overlay(image, mask_np, alpha=0.45):
+    """Return an RGB image with the binary lesion mask overlaid in green."""
+    if mask_np is None:
+        return image
+
+    out = image.copy()
+    green = np.zeros_like(out)
+    green[..., 1] = 1.0
+
+    mask = mask_np.astype(bool)
+    out[mask] = (1.0 - alpha) * out[mask] + alpha * green[mask]
+    return out
+
+
+def draw_lesion_overlay(ax, image, mask_np):
+    overlay = make_green_overlay(image, mask_np, alpha=0.45)
+    ax.imshow(overlay)
+    if mask_np is not None:
+        ax.contour(mask_np, levels=[0.5], linewidths=1.0, colors="lime")
+    ax.axis("off")
+
+
+def lesion_token_map_from_mask(mask_np, grid, threshold=0.0):
+    """Convert a pixel-level lesion mask into lesion-overlapping DINO cells."""
+    if mask_np is None:
+        return None
+
+    height, width = mask_np.shape[:2]
+    cell_h = height / grid
+    cell_w = width / grid
+    token_map = np.zeros((grid, grid), dtype=np.float32)
+
+    for y_pos in range(grid):
+        y0 = int(round(y_pos * cell_h))
+        y1 = int(round((y_pos + 1) * cell_h))
+        for x_pos in range(grid):
+            x0 = int(round(x_pos * cell_w))
+            x1 = int(round((x_pos + 1) * cell_w))
+            cell = mask_np[y0:y1, x0:x1]
+            if cell.size == 0:
+                continue
+
+            ratio = float((cell > 0).sum()) / float(cell.size)
+            if threshold <= 0.0:
+                token_map[y_pos, x_pos] = 1.0 if ratio > 0.0 else 0.0
+            else:
+                token_map[y_pos, x_pos] = 1.0 if ratio >= threshold else 0.0
+
+    return token_map
+
+
+def draw_green_token_boxes(ax, token_map, image_shape, patches, linewidth=1.0):
+    """Draw green token-cell boxes for lesion-overlapping DINO tokens."""
+    if token_map is None:
+        return
+
+    grid = token_map.shape[0]
+    height, width = image_shape[:2]
+    cell_h = height / grid
+    cell_w = width / grid
+    ys, xs = np.where(token_map > 0)
+
+    for y_pos, x_pos in zip(ys, xs):
+        rect = patches.Rectangle(
+            (x_pos * cell_w, y_pos * cell_h),
+            cell_w,
+            cell_h,
+            linewidth=linewidth,
+            edgecolor="lime",
+            facecolor="none",
+        )
+        ax.add_patch(rect)
+
+
+def draw_token_grid(ax, image, grid, lesion_token_map=None, patches=None):
     ax.imshow(image)
     height, width = image.shape[:2]
     for idx in range(1, grid):
         ax.axhline(idx * height / grid, linewidth=0.25, alpha=0.35)
         ax.axvline(idx * width / grid, linewidth=0.25, alpha=0.35)
+
+    if lesion_token_map is not None and patches is not None:
+        draw_green_token_boxes(ax, lesion_token_map, image.shape, patches, linewidth=1.0)
+
     ax.axis("off")
 
 
-def draw_selected_boxes(ax, image, selected_map, patches):
+def draw_selected_boxes(
+    ax,
+    image,
+    selected_map,
+    patches,
+    lesion_mask=None,
+    lesion_token_map=None,
+):
     ax.imshow(image)
     grid = selected_map.shape[0]
     height, width = image.shape[:2]
     cell_h = height / grid
     cell_w = width / grid
+
+    if lesion_token_map is not None:
+        draw_green_token_boxes(ax, lesion_token_map, image.shape, patches, linewidth=1.0)
+
+    if lesion_mask is not None:
+        ax.contour(lesion_mask, levels=[0.5], linewidths=0.8, colors="lime")
 
     ys, xs = np.where(selected_map > 0)
     for y_pos, x_pos in zip(ys, xs):
@@ -370,7 +515,14 @@ def draw_selected_boxes(ax, image, selected_map, patches):
     ax.axis("off")
 
 
-def draw_score_overlay(ax, image, score_map):
+def draw_score_overlay(
+    ax,
+    image,
+    score_map,
+    lesion_mask=None,
+    lesion_token_map=None,
+    patches=None,
+):
     ax.imshow(image)
     score_norm = normalize_map(score_map)
     ax.imshow(
@@ -379,13 +531,13 @@ def draw_score_overlay(ax, image, score_map):
         alpha=0.45,
         extent=(0, image.shape[1], image.shape[0], 0),
     )
-    ax.axis("off")
 
+    if lesion_token_map is not None and patches is not None:
+        draw_green_token_boxes(ax, lesion_token_map, image.shape, patches, linewidth=1.0)
 
-def draw_mask_contour(ax, image, mask_np):
-    ax.imshow(image)
-    if mask_np is not None:
-        ax.contour(mask_np, levels=[0.5], linewidths=1.0, colors="lime")
+    if lesion_mask is not None:
+        ax.contour(lesion_mask, levels=[0.5], linewidths=0.8, colors="lime")
+
     ax.axis("off")
 
 
@@ -420,8 +572,8 @@ def run_visualization(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    use_mask_col = args.lesion_mask_root is not None
-    n_cols = 5 if use_mask_col else 4
+    use_lesion_col = args.lesion_mask_root is not None or args.idrid_lesion_root is not None
+    n_cols = 5 if use_lesion_col else 4
     n_rows = len(samples)
 
     fig, axes = plt.subplots(
@@ -446,25 +598,84 @@ def run_visualization(args):
         cache = bridge.vis_cache
         score_map, selected_map, selected_idx, grid = make_maps_from_cache(cache)
 
+        lesion_mask = None
+        lesion_sources = {}
+
+        if args.idrid_lesion_root is not None and args.vis_domain == "IDRID":
+            lesion_mask, lesion_sources = load_idrid_merged_lesion_mask(
+                args.idrid_lesion_root,
+                rel_path,
+                args.input_size,
+            )
+
+        if lesion_mask is None and args.lesion_mask_root is not None:
+            lesion_mask = maybe_load_mask(args.lesion_mask_root, rel_path, args.input_size)
+
+        lesion_token_map = lesion_token_map_from_mask(
+            lesion_mask,
+            grid,
+            threshold=args.lesion_token_threshold,
+        )
+
         axes[row_idx, 0].imshow(display_np)
         axes[row_idx, 0].set_title(f"Original\nlabel={label}")
         axes[row_idx, 0].axis("off")
 
-        draw_token_grid(axes[row_idx, 1], display_np, grid)
-        axes[row_idx, 1].set_title(f"DINO token grid\n{grid}×{grid}")
+        if use_lesion_col:
+            draw_lesion_overlay(axes[row_idx, 1], display_np, lesion_mask)
+            axes[row_idx, 1].set_title("Lesion label overlay\nMA+HE+EX+SE")
+            grid_col = 2
+            selected_col = 3
+            score_col = 4
+        else:
+            grid_col = 1
+            selected_col = 2
+            score_col = 3
 
-        draw_selected_boxes(axes[row_idx, 2], display_np, selected_map, patches)
-        axes[row_idx, 2].set_title(f"CNN-guided Top-K\n{int(selected_map.sum())} tokens")
+        draw_token_grid(
+            axes[row_idx, grid_col],
+            display_np,
+            grid,
+            lesion_token_map=lesion_token_map,
+            patches=patches,
+        )
+        axes[row_idx, grid_col].set_title(f"DINO token grid\n{grid}×{grid}")
 
-        draw_score_overlay(axes[row_idx, 3], display_np, score_map)
-        axes[row_idx, 3].set_title("Router score map")
+        draw_selected_boxes(
+            axes[row_idx, selected_col],
+            display_np,
+            selected_map,
+            patches,
+            lesion_mask=lesion_mask,
+            lesion_token_map=lesion_token_map,
+        )
+        axes[row_idx, selected_col].set_title(
+            f"CNN-guided Top-K\n{int(selected_map.sum())} tokens"
+        )
 
-        if use_mask_col:
-            mask_np = maybe_load_mask(args.lesion_mask_root, rel_path, args.input_size)
-            draw_mask_contour(axes[row_idx, 4], display_np, mask_np)
-            axes[row_idx, 4].set_title("Optional mask / contour")
+        draw_score_overlay(
+            axes[row_idx, score_col],
+            display_np,
+            score_map,
+            lesion_mask=lesion_mask,
+            lesion_token_map=lesion_token_map,
+            patches=patches,
+        )
+        axes[row_idx, score_col].set_title("Router score map")
 
         sample_name = Path(rel_path).stem
+        if lesion_mask is not None:
+            lesion_overlay = make_green_overlay(display_np, lesion_mask, alpha=0.45)
+            overlay_uint8 = (np.clip(lesion_overlay, 0.0, 1.0) * 255).astype(np.uint8)
+            Image.fromarray(overlay_uint8).save(
+                out_dir / f"{sample_name}_lesion_overlay_green.png"
+            )
+
+            lesion_uint8 = (lesion_mask * 255).astype(np.uint8)
+            Image.fromarray(lesion_uint8).save(
+                out_dir / f"{sample_name}_merged_lesion_mask.png"
+            )
+
         np.savez(
             out_dir / f"{sample_name}_{args.bridge}_routing.npz",
             score_map=score_map,
@@ -474,7 +685,70 @@ def run_visualization(args):
             label=label,
             rel_path=str(rel_path),
             bridge=args.bridge,
+            lesion_mask=lesion_mask if lesion_mask is not None else np.array([]),
+            lesion_token_map=(
+                lesion_token_map if lesion_token_map is not None else np.array([])
+            ),
+            lesion_sources=np.array([str(lesion_sources)], dtype=object),
         )
+
+        if args.save_single_sample_panels:
+            sample_fig, sample_axes = plt.subplots(1, n_cols, figsize=(4.0 * n_cols, 3.8))
+            sample_axes = np.atleast_1d(sample_axes)
+
+            sample_axes[0].imshow(display_np)
+            sample_axes[0].set_title(f"Original\nlabel={label}")
+            sample_axes[0].axis("off")
+
+            if use_lesion_col:
+                draw_lesion_overlay(sample_axes[1], display_np, lesion_mask)
+                sample_axes[1].set_title("Lesion label overlay\nMA+HE+EX+SE")
+                sample_grid_col = 2
+                sample_selected_col = 3
+                sample_score_col = 4
+            else:
+                sample_grid_col = 1
+                sample_selected_col = 2
+                sample_score_col = 3
+
+            draw_token_grid(
+                sample_axes[sample_grid_col],
+                display_np,
+                grid,
+                lesion_token_map=lesion_token_map,
+                patches=patches,
+            )
+            sample_axes[sample_grid_col].set_title(f"DINO token grid\n{grid}×{grid}")
+
+            draw_selected_boxes(
+                sample_axes[sample_selected_col],
+                display_np,
+                selected_map,
+                patches,
+                lesion_mask=lesion_mask,
+                lesion_token_map=lesion_token_map,
+            )
+            sample_axes[sample_selected_col].set_title(
+                f"CNN-guided Top-K\n{int(selected_map.sum())} tokens"
+            )
+
+            draw_score_overlay(
+                sample_axes[sample_score_col],
+                display_np,
+                score_map,
+                lesion_mask=lesion_mask,
+                lesion_token_map=lesion_token_map,
+                patches=patches,
+            )
+            sample_axes[sample_score_col].set_title("Router score map")
+
+            sample_fig.tight_layout()
+            sample_fig.savefig(
+                out_dir / f"{sample_name}_{args.bridge}_single_sample_panel.png",
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(sample_fig)
 
     plt.tight_layout()
     save_path = out_dir / f"token_selection_{args.source_domain}_{args.vis_domain}_{args.split}_{args.bridge}.png"
@@ -525,6 +799,30 @@ def parse_args():
     )
 
     parser.add_argument("--lesion-mask-root", type=str, default=None)
+    parser.add_argument(
+        "--idrid-lesion-root",
+        type=str,
+        default=None,
+        help=(
+            "Root directory of IDRID pixel-level lesion masks. Expected subfolders: "
+            "1. Microaneurysms, 2. Haemorrhages, 3. Hard Exudates, "
+            "4. Soft Exudates. Optic Disc is excluded."
+        ),
+    )
+    parser.add_argument(
+        "--lesion-token-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum lesion-pixel ratio for marking a DINO token cell as "
+            "lesion-overlapping. Use 0.0 to mark any cell with lesion pixels."
+        ),
+    )
+    parser.add_argument(
+        "--save-single-sample-panels",
+        action="store_true",
+        help="Save per-sample visualization panels in addition to the combined figure.",
+    )
     parser.add_argument("--out-dir", type=str, default="./visualizations/token_selection")
 
     parser.add_argument("--device", type=str, default="cuda")
