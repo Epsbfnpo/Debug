@@ -183,7 +183,10 @@ def main():
         sys.exit(0)
     debug_log("Loading datasets...", args.local_rank)
     train_loader, val_loader, test_loader, dataset_size, train_sampler = get_dataset(args, cfg)
-    test_loaders = _normalize_domain_loaders(test_loader)
+    if not isinstance(test_loader, dict) and len(cfg.DATASET.TARGET_DOMAINS) == 1:
+        test_loaders = {cfg.DATASET.TARGET_DOMAINS[0]: test_loader}
+    else:
+        test_loaders = _normalize_domain_loaders(test_loader)
     algorithm_class = algorithms.get_algorithm_class(cfg.ALGORITHM)
     algorithm = algorithm_class(cfg.DATASET.NUM_CLASSES, cfg)
     algorithm.to(args.device)
