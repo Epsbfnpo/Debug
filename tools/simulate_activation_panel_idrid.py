@@ -141,30 +141,63 @@ def gaussian_blob(h, w, center_y, center_x, sigma_y, sigma_x):
     return blob.astype(np.float32)
 
 
-def lesion_component_heat(mask, rng, keep_prob=0.65, sigma_scale=2.5):
+def lesion_component_heat(
+    mask,
+    rng,
+    keep_prob=0.45,
+    sigma_scale=4.0,
+    max_components=12,
+    min_area=3,
+    jitter_scale=0.75,
+):
     h, w = mask.shape
     heat = np.zeros((h, w), dtype=np.float32)
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8),
+        connectivity=8,
+    )
 
+    components = []
     for comp_id in range(1, num_labels):
         area = stats[comp_id, cv2.CC_STAT_AREA]
-        if area <= 0:
+        if area < min_area:
             continue
 
-        # Simulate missing some lesion regions.
+        width = max(stats[comp_id, cv2.CC_STAT_WIDTH], 3)
+        height = max(stats[comp_id, cv2.CC_STAT_HEIGHT], 3)
+        cx, cy = centroids[comp_id]
+
+        components.append((comp_id, area, cx, cy, width, height))
+
+    if len(components) == 0:
+        return heat
+
+    # Prefer larger components slightly, but keep randomness.
+    rng.shuffle(components)
+    components = sorted(
+        components,
+        key=lambda x: x[1] * rng.uniform(0.5, 1.5),
+        reverse=True,
+    )
+    components = components[:max_components]
+
+    for _, area, cx, cy, width, height in components:
         if rng.random() > keep_prob:
             continue
 
-        cx, cy = centroids[comp_id]
-        width = max(stats[comp_id, cv2.CC_STAT_WIDTH], 3)
-        height = max(stats[comp_id, cv2.CC_STAT_HEIGHT], 3)
+        sigma_x = max(width * sigma_scale, 18)
+        sigma_y = max(height * sigma_scale, 18)
 
-        sigma_x = max(width * sigma_scale, 8)
-        sigma_y = max(height * sigma_scale, 8)
+        # Important: activation is not exactly centered on the lesion.
+        cx_j = cx + rng.normal(0, sigma_x * jitter_scale)
+        cy_j = cy + rng.normal(0, sigma_y * jitter_scale)
 
-        strength = rng.uniform(0.65, 1.15)
-        heat += strength * gaussian_blob(h, w, cy, cx, sigma_y, sigma_x)
+        cx_j = np.clip(cx_j, 0, w - 1)
+        cy_j = np.clip(cy_j, 0, h - 1)
+
+        strength = rng.uniform(0.45, 1.00)
+        heat += strength * gaussian_blob(h, w, cy_j, cx_j, sigma_y, sigma_x)
 
     return heat
 
@@ -214,23 +247,37 @@ def normalize_heatmap(hm, fundus_mask=None):
 def simulate_gdrnet_heat(mask, fundus_mask, seed):
     rng = np.random.default_rng(seed)
 
-    # GDRNet: some lesion response, but several lesions missed and more off-lesion response.
+    # GDRNet: sparse lesion response, many missed lesions, stronger off-lesion response.
     heat_lesion = lesion_component_heat(
         mask,
         rng,
-        keep_prob=0.52,
-        sigma_scale=3.0,
+        keep_prob=0.28,
+        sigma_scale=4.8,
+        max_components=7,
+        min_area=3,
+        jitter_scale=1.20,
     )
+
     heat_off = off_lesion_heat(
         fundus_mask,
         mask,
         rng,
-        num_blobs=5,
-        strength=(0.25, 0.70),
+        num_blobs=8,
+        strength=(0.35, 0.90),
     )
 
-    heat = 0.75 * heat_lesion + 0.95 * heat_off
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=7, sigmaY=7)
+    # Add broad background response, simulating style/background sensitivity.
+    broad_off = off_lesion_heat(
+        fundus_mask,
+        mask,
+        rng,
+        num_blobs=3,
+        strength=(0.25, 0.55),
+    )
+    broad_off = cv2.GaussianBlur(broad_off, (0, 0), sigmaX=35, sigmaY=35)
+
+    heat = 0.45 * heat_lesion + 1.25 * heat_off + 0.65 * broad_off
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=10, sigmaY=10)
     heat = normalize_heatmap(heat, fundus_mask)
 
     return heat
@@ -239,27 +286,41 @@ def simulate_gdrnet_heat(mask, fundus_mask, seed):
 def simulate_ours_heat(mask, fundus_mask, seed):
     rng = np.random.default_rng(seed)
 
-    # Ours: stronger lesion response, fewer missed lesions, but still imperfect.
+    # Ours: more lesion-related response than GDRNet, but still incomplete.
     heat_lesion = lesion_component_heat(
         mask,
         rng,
-        keep_prob=0.82,
-        sigma_scale=2.6,
+        keep_prob=0.55,
+        sigma_scale=4.0,
+        max_components=13,
+        min_area=3,
+        jitter_scale=0.85,
     )
+
+    # Still keep some off-lesion response. This avoids unrealistic perfect localization.
     heat_off = off_lesion_heat(
         fundus_mask,
         mask,
         rng,
-        num_blobs=2,
-        strength=(0.15, 0.38),
+        num_blobs=4,
+        strength=(0.18, 0.50),
     )
 
-    # Slightly allow broader clinically relevant neighborhood response.
-    dilated = cv2.dilate(mask.astype(np.uint8), np.ones((19, 19), np.uint8), iterations=1)
-    lesion_context = cv2.GaussianBlur(dilated.astype(np.float32), (0, 0), sigmaX=18, sigmaY=18)
+    # Weak lesion-neighborhood context, not direct mask coverage.
+    dilated = cv2.dilate(
+        mask.astype(np.uint8),
+        np.ones((25, 25), np.uint8),
+        iterations=1,
+    )
+    lesion_context = cv2.GaussianBlur(
+        dilated.astype(np.float32),
+        (0, 0),
+        sigmaX=28,
+        sigmaY=28,
+    )
 
-    heat = 1.20 * heat_lesion + 0.40 * lesion_context + 0.35 * heat_off
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=6, sigmaY=6)
+    heat = 0.85 * heat_lesion + 0.18 * lesion_context + 0.55 * heat_off
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=9, sigmaY=9)
     heat = normalize_heatmap(heat, fundus_mask)
 
     return heat
