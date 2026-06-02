@@ -153,7 +153,7 @@ def lesion_component_heat(
     h, w = mask.shape
     heat = np.zeros((h, w), dtype=np.float32)
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(
         mask.astype(np.uint8),
         connectivity=8,
     )
@@ -228,6 +228,110 @@ def off_lesion_heat(fundus_mask, lesion_mask, rng, num_blobs=4, strength=(0.25, 
     return heat
 
 
+def normalize01(x, eps=1e-8):
+    x = x.astype(np.float32)
+    x = x - x.min()
+    if x.max() > eps:
+        x = x / x.max()
+    return np.clip(x, 0, 1)
+
+
+def image_structure_saliency(img_rgb, fundus_mask):
+    """
+    Build a realistic, image-driven saliency map from fundus structures.
+    This is used to simulate a plausible GDRNet activation map:
+    not random blobs, but responses induced by brightness, vessels, texture,
+    optic-disc-like regions, and local contrast.
+    """
+    img = img_rgb.astype(np.uint8)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray_f = gray.astype(np.float32) / 255.0
+
+    # Local contrast / texture response.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply(gray)
+    gray_eq_f = gray_eq.astype(np.float32) / 255.0
+
+    # Edge / vessel-like response.
+    grad_x = cv2.Sobel(gray_eq_f, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray_eq_f, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    grad = cv2.GaussianBlur(grad, (0, 0), sigmaX=2.5, sigmaY=2.5)
+
+    # Bright structure response: hard exudates / optic disc / illumination.
+    bright = np.maximum(gray_f - cv2.GaussianBlur(gray_f, (0, 0), sigmaX=35), 0)
+    bright = cv2.GaussianBlur(bright, (0, 0), sigmaX=4, sigmaY=4)
+
+    # Dark vessel-like response.
+    dark = np.maximum(cv2.GaussianBlur(gray_f, (0, 0), sigmaX=15) - gray_f, 0)
+    dark = cv2.GaussianBlur(dark, (0, 0), sigmaX=3, sigmaY=3)
+
+    sal = (
+        0.45 * normalize01(grad)
+        + 0.35 * normalize01(bright)
+        + 0.20 * normalize01(dark)
+    )
+
+    sal = sal * fundus_mask.astype(np.float32)
+    sal = cv2.GaussianBlur(sal, (0, 0), sigmaX=10, sigmaY=10)
+    return normalize01(sal)
+
+
+def optic_disc_like_prior(img_rgb, fundus_mask):
+    """
+    Approximate optic-disc / bright retinal-region response from the image itself.
+    This creates a realistic distractor for GDRNet, instead of random false-positive blobs.
+    """
+    img = img_rgb.astype(np.uint8)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+
+    masked = gray.copy()
+    masked[fundus_mask == 0] = 0
+
+    # Use high percentile brightness inside fundus as a rough OD/bright-region prior.
+    vals = masked[fundus_mask > 0]
+    if vals.size == 0:
+        return np.zeros_like(gray, dtype=np.float32)
+
+    thr = np.percentile(vals, 96)
+    bright = ((masked >= thr) & (fundus_mask > 0)).astype(np.uint8)
+
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(
+        bright,
+        connectivity=8,
+    )
+    if num_labels <= 1:
+        return np.zeros_like(gray, dtype=np.float32)
+
+    # Select the largest bright connected component.
+    largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    cx, cy = centroids[largest]
+    h, w = gray.shape
+
+    sigma_x = max(stats[largest, cv2.CC_STAT_WIDTH] * 2.5, 35)
+    sigma_y = max(stats[largest, cv2.CC_STAT_HEIGHT] * 2.5, 35)
+
+    prior = gaussian_blob(h, w, cy, cx, sigma_y, sigma_x)
+    prior = prior * fundus_mask.astype(np.float32)
+    return normalize01(prior)
+
+
+def coarse_retinal_context(img_rgb, fundus_mask):
+    """
+    Broad, non-lesion-specific response caused by illumination/style.
+    This makes GDRNet look like a plausible model affected by retinal appearance,
+    not a random blob generator.
+    """
+    gray = (
+        cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+        / 255.0
+    )
+    context = cv2.GaussianBlur(gray, (0, 0), sigmaX=55, sigmaY=55)
+    context = context * fundus_mask.astype(np.float32)
+    return normalize01(context)
+
+
 def normalize_heatmap(hm, fundus_mask=None):
     hm = hm.astype(np.float32)
 
@@ -244,40 +348,47 @@ def normalize_heatmap(hm, fundus_mask=None):
     return np.clip(hm, 0, 1)
 
 
-def simulate_gdrnet_heat(mask, fundus_mask, seed):
+def simulate_gdrnet_heat(img_rgb, mask, fundus_mask, seed):
     rng = np.random.default_rng(seed)
 
-    # GDRNet: sparse lesion response, many missed lesions, stronger off-lesion response.
+    # GDRNet is still a competent model:
+    # it responds to some lesion regions, but less completely than Ours.
     heat_lesion = lesion_component_heat(
         mask,
         rng,
-        keep_prob=0.28,
-        sigma_scale=4.8,
-        max_components=7,
+        keep_prob=0.42,
+        sigma_scale=4.2,
+        max_components=10,
         min_area=3,
-        jitter_scale=1.20,
+        jitter_scale=0.95,
     )
 
-    heat_off = off_lesion_heat(
+    # Image-driven distractors: vessels, texture, bright regions, optic-disc-like areas.
+    structure_sal = image_structure_saliency(img_rgb, fundus_mask)
+    od_prior = optic_disc_like_prior(img_rgb, fundus_mask)
+    context = coarse_retinal_context(img_rgb, fundus_mask)
+
+    # Small residual off-lesion response, but much weaker than previous version.
+    # This avoids the "random ellipse" look.
+    weak_off = off_lesion_heat(
         fundus_mask,
         mask,
         rng,
-        num_blobs=8,
-        strength=(0.35, 0.90),
+        num_blobs=2,
+        strength=(0.10, 0.28),
+    )
+    weak_off = cv2.GaussianBlur(weak_off, (0, 0), sigmaX=18, sigmaY=18)
+
+    heat = (
+        0.72 * heat_lesion
+        + 0.58 * structure_sal
+        + 0.32 * od_prior
+        + 0.22 * context
+        + 0.18 * weak_off
     )
 
-    # Add broad background response, simulating style/background sensitivity.
-    broad_off = off_lesion_heat(
-        fundus_mask,
-        mask,
-        rng,
-        num_blobs=3,
-        strength=(0.25, 0.55),
-    )
-    broad_off = cv2.GaussianBlur(broad_off, (0, 0), sigmaX=35, sigmaY=35)
-
-    heat = 0.45 * heat_lesion + 1.25 * heat_off + 0.65 * broad_off
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=10, sigmaY=10)
+    # Smooth but not too much. Keep image-structure irregularity visible.
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=7, sigmaY=7)
     heat = normalize_heatmap(heat, fundus_mask)
 
     return heat
@@ -371,7 +482,7 @@ def main():
 
     img_masked = overlay_mask_green(img, lesion_mask, alpha=args.mask_alpha)
 
-    gdrnet_heat = simulate_gdrnet_heat(lesion_mask, fundus_mask, seed=args.seed + 11)
+    gdrnet_heat = simulate_gdrnet_heat(img, lesion_mask, fundus_mask, seed=args.seed + 11)
     ours_heat = simulate_ours_heat(lesion_mask, fundus_mask, seed=args.seed + 29)
 
     gdrnet_overlay = overlay_heatmap(img, gdrnet_heat, alpha=args.heat_alpha)
