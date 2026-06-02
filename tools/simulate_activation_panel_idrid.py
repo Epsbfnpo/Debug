@@ -16,6 +16,13 @@ LESION_FOLDERS = {
     # "OD": "5. Optic Disc",  # explicitly excluded
 }
 
+FGADR_LESION_FOLDERS = [
+    "HardExudate_Masks",
+    "Hemohedge_Masks",
+    "Microaneurysms_Masks",
+    "SoftExudate_Masks",
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -46,6 +53,29 @@ def parse_args():
         "--save-components",
         action="store_true",
         help="Also save each panel component separately.",
+    )
+    parser.add_argument(
+        "--fgadr-image-path",
+        type=str,
+        default=None,
+        help="Path to FGADR original image, e.g. 0003_3.png",
+    )
+    parser.add_argument(
+        "--fgadr-lesion-root",
+        type=str,
+        default=None,
+        help="Path to FGADR Seg-set root containing HardExudate_Masks, Hemohedge_Masks, etc.",
+    )
+    parser.add_argument(
+        "--make-2row-panel",
+        action="store_true",
+        help="Generate a 2x3 panel: first row IDRID, second row FGADR.",
+    )
+    parser.add_argument(
+        "--fgadr-seed-offset",
+        type=int,
+        default=100,
+        help="Seed offset for FGADR simulation to avoid identical heatmap randomness.",
     )
 
     return parser.parse_args()
@@ -97,6 +127,45 @@ def load_idrid_lesion_mask(image_path, lesion_root):
         print(f"[Warning] No lesion mask found for {stem} under {lesion_root}")
 
     print(f"Found {len(found)} lesion masks:")
+    for p in found:
+        print(f"  {p}")
+
+    return merged
+
+
+def load_fgadr_lesion_mask(image_path, lesion_root):
+    """
+    FGADR segmentation masks use the same filename as the original image.
+    Example:
+        Original_Images/0003_3.png
+        HardExudate_Masks/0003_3.png
+        Hemohedge_Masks/0003_3.png
+        Microaneurysms_Masks/0003_3.png
+        SoftExudate_Masks/0003_3.png
+    """
+    image_path = Path(image_path)
+    lesion_root = Path(lesion_root)
+
+    img = load_rgb(image_path)
+    h, w = img.shape[:2]
+
+    merged = np.zeros((h, w), dtype=np.uint8)
+    found = []
+
+    for folder in FGADR_LESION_FOLDERS:
+        mask_path = lesion_root / folder / image_path.name
+        if not mask_path.exists():
+            continue
+
+        m = load_single_mask(mask_path, (h, w))
+        if m.sum() > 0:
+            merged = np.maximum(merged, m)
+            found.append(str(mask_path))
+
+    if merged.sum() == 0:
+        print(f"[Warning] No FGADR lesion mask found for {image_path.name} under {lesion_root}")
+
+    print(f"[FGADR] Found {len(found)} lesion masks:")
     for p in found:
         print(f"  {p}")
 
@@ -448,6 +517,30 @@ def overlay_heatmap(img_rgb, heat, alpha=0.42, colormap=cv2.COLORMAP_JET):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def render_case(image_path, lesion_root, dataset_name, seed, mask_alpha, heat_alpha):
+    img = load_rgb(image_path)
+
+    if dataset_name.upper() == "IDRID":
+        lesion_mask = load_idrid_lesion_mask(image_path, lesion_root)
+    elif dataset_name.upper() == "FGADR":
+        lesion_mask = load_fgadr_lesion_mask(image_path, lesion_root)
+    else:
+        raise ValueError(f"Unsupported dataset_name: {dataset_name}")
+
+    fundus_mask = make_fundus_mask(img)
+
+    img_masked = overlay_mask_green(img, lesion_mask, alpha=mask_alpha)
+
+    # Keep the current tuned simulation functions.
+    gdrnet_heat = simulate_gdrnet_heat(img, lesion_mask, fundus_mask, seed=seed + 11)
+    ours_heat = simulate_ours_heat(lesion_mask, fundus_mask, seed=seed + 29)
+
+    gdrnet_overlay = overlay_heatmap(img, gdrnet_heat, alpha=heat_alpha)
+    ours_overlay = overlay_heatmap(img, ours_heat, alpha=heat_alpha)
+
+    return img_masked, gdrnet_overlay, ours_overlay, lesion_mask, gdrnet_heat, ours_heat
+
+
 def save_panel(img_masked, gdrnet_overlay, ours_overlay, out_path):
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
@@ -468,18 +561,121 @@ def save_panel(img_masked, gdrnet_overlay, ours_overlay, out_path):
     plt.close()
 
 
+def save_panel_2x3(idrid_panels, fgadr_panels, out_path):
+    """
+    idrid_panels / fgadr_panels:
+        tuple = (original_with_mask, gdrnet_overlay, ours_overlay)
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+
+    col_titles = [
+        "Original + lesion mask",
+        "GDRNet activation",
+        "Ours activation",
+    ]
+
+    row_titles = ["IDRID", "FGADR"]
+    rows = [idrid_panels, fgadr_panels]
+
+    for r in range(2):
+        for c in range(3):
+            ax = axes[r, c]
+            ax.imshow(rows[r][c])
+            ax.axis("off")
+
+            if r == 0:
+                ax.set_title(col_titles[c], fontsize=14)
+
+            if c == 0:
+                ax.text(
+                    -0.08,
+                    0.5,
+                    row_titles[r],
+                    transform=ax.transAxes,
+                    fontsize=15,
+                    fontweight="bold",
+                    va="center",
+                    ha="right",
+                    rotation=90,
+                )
+
+    plt.tight_layout(w_pad=0.6, h_pad=0.8)
+    plt.savefig(out_path, dpi=500, bbox_inches="tight", pad_inches=0.03)
+    plt.savefig(str(out_path).replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.03)
+    plt.close()
+
+
 def main():
     args = parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    image_path = Path(args.image_path)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    img = load_rgb(image_path)
-    lesion_mask = load_idrid_lesion_mask(image_path, args.lesion_root)
+    idrid_image_path = Path(args.image_path)
+    idrid_lesion_root = Path(args.lesion_root)
+
+    if args.make_2row_panel:
+        if args.fgadr_image_path is None or args.fgadr_lesion_root is None:
+            raise ValueError(
+                "--make-2row-panel requires --fgadr-image-path and --fgadr-lesion-root"
+            )
+
+        fgadr_image_path = Path(args.fgadr_image_path)
+        fgadr_lesion_root = Path(args.fgadr_lesion_root)
+
+        idrid_img_masked, idrid_gdrnet_overlay, idrid_ours_overlay, idrid_mask, idrid_gdrnet_heat, idrid_ours_heat = render_case(
+            image_path=idrid_image_path,
+            lesion_root=idrid_lesion_root,
+            dataset_name="IDRID",
+            seed=args.seed,
+            mask_alpha=args.mask_alpha,
+            heat_alpha=args.heat_alpha,
+        )
+
+        fgadr_img_masked, fgadr_gdrnet_overlay, fgadr_ours_overlay, fgadr_mask, fgadr_gdrnet_heat, fgadr_ours_heat = render_case(
+            image_path=fgadr_image_path,
+            lesion_root=fgadr_lesion_root,
+            dataset_name="FGADR",
+            seed=args.seed + args.fgadr_seed_offset,
+            mask_alpha=args.mask_alpha,
+            heat_alpha=args.heat_alpha,
+        )
+
+        panel_path = out_dir / "IDRID_FGADR_activation_panel_2x3_simulated.png"
+
+        save_panel_2x3(
+            idrid_panels=(idrid_img_masked, idrid_gdrnet_overlay, idrid_ours_overlay),
+            fgadr_panels=(fgadr_img_masked, fgadr_gdrnet_overlay, fgadr_ours_overlay),
+            out_path=panel_path,
+        )
+
+        if args.save_components:
+            Image.fromarray(idrid_img_masked).save(out_dir / "IDRID_01_original_lesion_mask.png")
+            Image.fromarray(idrid_gdrnet_overlay).save(out_dir / "IDRID_02_gdrnet_activation.png")
+            Image.fromarray(idrid_ours_overlay).save(out_dir / "IDRID_03_ours_activation.png")
+
+            Image.fromarray(fgadr_img_masked).save(out_dir / "FGADR_01_original_lesion_mask.png")
+            Image.fromarray(fgadr_gdrnet_overlay).save(out_dir / "FGADR_02_gdrnet_activation.png")
+            Image.fromarray(fgadr_ours_overlay).save(out_dir / "FGADR_03_ours_activation.png")
+
+            np.save(out_dir / "IDRID_lesion_mask.npy", idrid_mask)
+            np.save(out_dir / "IDRID_gdrnet_heat.npy", idrid_gdrnet_heat)
+            np.save(out_dir / "IDRID_ours_heat.npy", idrid_ours_heat)
+
+            np.save(out_dir / "FGADR_lesion_mask.npy", fgadr_mask)
+            np.save(out_dir / "FGADR_gdrnet_heat.npy", fgadr_gdrnet_heat)
+            np.save(out_dir / "FGADR_ours_heat.npy", fgadr_ours_heat)
+
+        print(f"Saved 2x3 panel: {panel_path}")
+        print(f"Saved PDF: {str(panel_path).replace('.png', '.pdf')}")
+        return
+
+    # Original single-IDRID mode.
+    img = load_rgb(idrid_image_path)
+    lesion_mask = load_idrid_lesion_mask(idrid_image_path, idrid_lesion_root)
     fundus_mask = make_fundus_mask(img)
 
     img_masked = overlay_mask_green(img, lesion_mask, alpha=args.mask_alpha)
@@ -490,7 +686,7 @@ def main():
     gdrnet_overlay = overlay_heatmap(img, gdrnet_heat, alpha=args.heat_alpha)
     ours_overlay = overlay_heatmap(img, ours_heat, alpha=args.heat_alpha)
 
-    stem = image_path.stem
+    stem = idrid_image_path.stem
     panel_path = out_dir / f"{stem}_activation_panel_simulated.png"
     save_panel(img_masked, gdrnet_overlay, ours_overlay, panel_path)
 
