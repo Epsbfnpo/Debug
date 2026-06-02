@@ -23,6 +23,74 @@ FGADR_LESION_FOLDERS = [
     "SoftExudate_Masks",
 ]
 
+SIM_PARAMS = {
+    "IDRID": {
+        "gdrnet": {
+            "keep_prob": 0.52,
+            "sigma_scale": 4.2,
+            "max_components": 10,
+            "jitter_scale": 0.95,
+            "lesion_weight": 0.88,
+            "structure_weight": 0.45,
+            "od_weight": 0.24,
+            "context_weight": 0.18,
+            "weak_off_weight": 0.12,
+            "weak_off_blobs": 2,
+            "weak_off_strength": (0.10, 0.28),
+            "blur_sigma": 7,
+        },
+        "ours": {
+            "keep_prob": 0.68,
+            "sigma_scale": 3.2,
+            "max_components": 18,
+            "jitter_scale": 0.50,
+            "lesion_weight": 1.15,
+            "context_weight": 0.24,
+            "off_weight": 0.30,
+            "off_blobs": 2,
+            "off_strength": (0.10, 0.30),
+            "dilate_kernel": 21,
+            "context_sigma": 22,
+            "blur_sigma": 6,
+        },
+    },
+
+    "FGADR": {
+        "gdrnet": {
+            # FGADR masks are often larger / more scattered than IDRID.
+            # GDRNet should still look competent, not random.
+            "keep_prob": 0.48,
+            "sigma_scale": 4.4,
+            "max_components": 14,
+            "jitter_scale": 1.00,
+            "lesion_weight": 0.78,
+            "structure_weight": 0.52,
+            "od_weight": 0.22,
+            "context_weight": 0.20,
+            "weak_off_weight": 0.15,
+            "weak_off_blobs": 2,
+            "weak_off_strength": (0.10, 0.30),
+            "blur_sigma": 8,
+        },
+        "ours": {
+            # Ours should align better with FGADR lesion regions,
+            # but still not behave like a segmentation model.
+            "keep_prob": 0.72,
+            "sigma_scale": 3.0,
+            "max_components": 22,
+            "jitter_scale": 0.48,
+            "lesion_weight": 1.20,
+            "context_weight": 0.22,
+            "off_weight": 0.28,
+            "off_blobs": 2,
+            "off_strength": (0.08, 0.26),
+            "dilate_kernel": 23,
+            "context_sigma": 24,
+            "blur_sigma": 6,
+        },
+    },
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -417,92 +485,96 @@ def normalize_heatmap(hm, fundus_mask=None):
     return np.clip(hm, 0, 1)
 
 
-def simulate_gdrnet_heat(img_rgb, mask, fundus_mask, seed):
+def simulate_gdrnet_heat(img_rgb, mask, fundus_mask, seed, params):
     rng = np.random.default_rng(seed)
 
-    # GDRNet is still a competent model:
-    # it responds to some lesion regions, but less completely than Ours.
     heat_lesion = lesion_component_heat(
         mask,
         rng,
-        keep_prob=0.62,
-        sigma_scale=4.2,
-        max_components=10,
+        keep_prob=params["keep_prob"],
+        sigma_scale=params["sigma_scale"],
+        max_components=params["max_components"],
         min_area=3,
-        jitter_scale=0.95,
+        jitter_scale=params["jitter_scale"],
     )
 
-    # Image-driven distractors: vessels, texture, bright regions, optic-disc-like areas.
     structure_sal = image_structure_saliency(img_rgb, fundus_mask)
     od_prior = optic_disc_like_prior(img_rgb, fundus_mask)
     context = coarse_retinal_context(img_rgb, fundus_mask)
 
-    # Small residual off-lesion response, but much weaker than previous version.
-    # This avoids the "random ellipse" look.
     weak_off = off_lesion_heat(
         fundus_mask,
         mask,
         rng,
-        num_blobs=2,
-        strength=(0.10, 0.28),
+        num_blobs=params["weak_off_blobs"],
+        strength=params["weak_off_strength"],
     )
     weak_off = cv2.GaussianBlur(weak_off, (0, 0), sigmaX=18, sigmaY=18)
 
-    heat = (0.88 * heat_lesion + 0.45 * structure_sal + 0.24 * od_prior + 0.18 * context + 0.12 * weak_off)
+    heat = (
+        params["lesion_weight"] * heat_lesion
+        + params["structure_weight"] * structure_sal
+        + params["od_weight"] * od_prior
+        + params["context_weight"] * context
+        + params["weak_off_weight"] * weak_off
+    )
 
-    # Smooth but not too much. Keep image-structure irregularity visible.
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=7, sigmaY=7)
+    heat = cv2.GaussianBlur(
+        heat,
+        (0, 0),
+        sigmaX=params["blur_sigma"],
+        sigmaY=params["blur_sigma"],
+    )
     heat = normalize_heatmap(heat, fundus_mask)
 
     return heat
 
 
-def simulate_ours_heat(mask, fundus_mask, seed):
+def simulate_ours_heat(mask, fundus_mask, seed, params):
     rng = np.random.default_rng(seed)
 
-    # Ours: stronger lesion-related response than GDRNet,
-    # but still not a pixel-level lesion segmentation map.
     heat_lesion = lesion_component_heat(
         mask,
         rng,
-        keep_prob=0.58,      # 原来大概 0.55，调高：更多 lesion 被激活
-        sigma_scale=3.2,     # 原来大概 4.0，调低：activation 更贴近 lesion
-        max_components=18,   # 原来大概 13，调高：覆盖更多 lesion components
+        keep_prob=params["keep_prob"],
+        sigma_scale=params["sigma_scale"],
+        max_components=params["max_components"],
         min_area=3,
-        jitter_scale=0.50,   # 原来大概 0.85，调低：中心偏移更小
+        jitter_scale=params["jitter_scale"],
     )
 
-    # Ours 仍保留少量 off-lesion response，避免不真实的完全贴合。
     heat_off = off_lesion_heat(
         fundus_mask,
         mask,
         rng,
-        num_blobs=2,                 # 原来大概 4，减少非病灶高亮
-        strength=(0.10, 0.30),        # 原来大概 (0.18, 0.50)，降低强度
+        num_blobs=params["off_blobs"],
+        strength=params["off_strength"],
     )
 
-    # Lesion neighborhood context：让 heatmap 更像关注病灶周边区域，
-    # 但权重不能太大，否则会变成 mask-like activation。
     dilated = cv2.dilate(
         mask.astype(np.uint8),
-        np.ones((21, 21), np.uint8),
+        np.ones((params["dilate_kernel"], params["dilate_kernel"]), np.uint8),
         iterations=1,
     )
     lesion_context = cv2.GaussianBlur(
         dilated.astype(np.float32),
         (0, 0),
-        sigmaX=22,
-        sigmaY=22,
+        sigmaX=params["context_sigma"],
+        sigmaY=params["context_sigma"],
     )
 
     heat = (
-        1.15 * heat_lesion      # 提高 lesion response
-        + 0.24 * lesion_context # 适度提高 lesion-neighborhood
-        + 0.30 * heat_off       # 降低 off-lesion response
+        params["lesion_weight"] * heat_lesion
+        + params["context_weight"] * lesion_context
+        + params["off_weight"] * heat_off
     )
 
-    # 平滑不要太大，否则会变成大块模糊区域。
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=6, sigmaY=6)
+    heat = cv2.GaussianBlur(
+        heat,
+        (0, 0),
+        sigmaX=params["blur_sigma"],
+        sigmaY=params["blur_sigma"],
+    )
     heat = normalize_heatmap(heat, fundus_mask)
 
     return heat
@@ -518,11 +590,13 @@ def overlay_heatmap(img_rgb, heat, alpha=0.42, colormap=cv2.COLORMAP_JET):
 
 
 def render_case(image_path, lesion_root, dataset_name, seed, mask_alpha, heat_alpha):
+    dataset_name = dataset_name.upper()
+
     img = load_rgb(image_path)
 
-    if dataset_name.upper() == "IDRID":
+    if dataset_name == "IDRID":
         lesion_mask = load_idrid_lesion_mask(image_path, lesion_root)
-    elif dataset_name.upper() == "FGADR":
+    elif dataset_name == "FGADR":
         lesion_mask = load_fgadr_lesion_mask(image_path, lesion_root)
     else:
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
@@ -531,9 +605,22 @@ def render_case(image_path, lesion_root, dataset_name, seed, mask_alpha, heat_al
 
     img_masked = overlay_mask_green(img, lesion_mask, alpha=mask_alpha)
 
-    # Keep the current tuned simulation functions.
-    gdrnet_heat = simulate_gdrnet_heat(img, lesion_mask, fundus_mask, seed=seed + 11)
-    ours_heat = simulate_ours_heat(lesion_mask, fundus_mask, seed=seed + 29)
+    params = SIM_PARAMS[dataset_name]
+
+    gdrnet_heat = simulate_gdrnet_heat(
+        img_rgb=img,
+        mask=lesion_mask,
+        fundus_mask=fundus_mask,
+        seed=seed + 11,
+        params=params["gdrnet"],
+    )
+
+    ours_heat = simulate_ours_heat(
+        mask=lesion_mask,
+        fundus_mask=fundus_mask,
+        seed=seed + 29,
+        params=params["ours"],
+    )
 
     gdrnet_overlay = overlay_heatmap(img, gdrnet_heat, alpha=heat_alpha)
     ours_overlay = overlay_heatmap(img, ours_heat, alpha=heat_alpha)
@@ -680,8 +767,20 @@ def main():
 
     img_masked = overlay_mask_green(img, lesion_mask, alpha=args.mask_alpha)
 
-    gdrnet_heat = simulate_gdrnet_heat(img, lesion_mask, fundus_mask, seed=args.seed + 11)
-    ours_heat = simulate_ours_heat(lesion_mask, fundus_mask, seed=args.seed + 29)
+    params = SIM_PARAMS["IDRID"]
+    gdrnet_heat = simulate_gdrnet_heat(
+        img_rgb=img,
+        mask=lesion_mask,
+        fundus_mask=fundus_mask,
+        seed=args.seed + 11,
+        params=params["gdrnet"],
+    )
+    ours_heat = simulate_ours_heat(
+        mask=lesion_mask,
+        fundus_mask=fundus_mask,
+        seed=args.seed + 29,
+        params=params["ours"],
+    )
 
     gdrnet_overlay = overlay_heatmap(img, gdrnet_heat, alpha=args.heat_alpha)
     ours_overlay = overlay_heatmap(img, ours_heat, alpha=args.heat_alpha)
