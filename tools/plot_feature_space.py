@@ -8,6 +8,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
@@ -21,6 +22,15 @@ GRADE_NAMES = {
     3: "Severe DR",
     4: "PDR",
 }
+
+GRADE_MARKERS = {
+    0: "x",
+    1: "o",
+    2: "s",
+    3: "^",
+    4: "D",
+}
+UNFILLED_MARKERS = {"x", "+", "1", "2", "3", "4"}
 
 
 def parse_args():
@@ -38,6 +48,16 @@ def parse_args():
     parser.add_argument("--umap-neighbors", type=int, default=30)
     parser.add_argument("--umap-min-dist", type=float, default=0.15)
 
+    parser.add_argument(
+        "--layout",
+        type=str,
+        default="separate",
+        choices=["separate", "combined"],
+        help=(
+            "separate: two rows for domain/grade coloring; combined: "
+            "color=domain and marker=grade in one panel."
+        ),
+    )
     parser.add_argument("--point-size", type=float, default=5.0)
     parser.add_argument("--alpha", type=float, default=0.75)
     return parser.parse_args()
@@ -135,6 +155,86 @@ def scatter_by_grade(ax, embedding, labels, point_size, alpha):
         )
 
 
+def scatter_by_domain_and_grade(
+    ax,
+    embedding,
+    domains,
+    labels,
+    domain_names,
+    point_size,
+    alpha,
+):
+    cmap = plt.get_cmap("tab10")
+    unique_domains = sorted(np.unique(domains))
+    unique_labels = sorted(np.unique(labels))
+
+    for domain in unique_domains:
+        domain_color = cmap(int(domain) % 10)
+        for label in unique_labels:
+            mask = (domains == domain) & (labels == label)
+            if not np.any(mask):
+                continue
+
+            marker = GRADE_MARKERS.get(int(label), "o")
+            scatter_kwargs = {
+                "s": point_size,
+                "alpha": alpha,
+                "color": domain_color,
+                "marker": marker,
+            }
+            if marker in UNFILLED_MARKERS:
+                scatter_kwargs["linewidths"] = 0.6
+            else:
+                scatter_kwargs["linewidths"] = 0
+                scatter_kwargs["edgecolors"] = "none"
+
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                **scatter_kwargs,
+            )
+
+
+def make_domain_legend_handles(domain_names):
+    cmap = plt.get_cmap("tab10")
+    handles = []
+    for index, name in enumerate(domain_names):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="None",
+                markerfacecolor=cmap(index % 10),
+                markeredgecolor=cmap(index % 10),
+                markersize=7,
+                label=str(name),
+            )
+        )
+    return handles
+
+
+def make_grade_legend_handles():
+    handles = []
+    for label, name in GRADE_NAMES.items():
+        marker = GRADE_MARKERS.get(label, "o")
+        markerfacecolor = "none" if marker in UNFILLED_MARKERS else "black"
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker=marker,
+                linestyle="None",
+                color="black",
+                markerfacecolor=markerfacecolor,
+                markeredgecolor="black",
+                markersize=7,
+                label=name,
+            )
+        )
+    return handles
+
+
 def style_axis(ax):
     ax.set_xticks([])
     ax.set_yticks([])
@@ -149,12 +249,20 @@ def main():
         raise ValueError("The number of feature files must match method names.")
 
     n_methods = len(args.feature_files)
-    fig, axes = plt.subplots(
-        2,
-        n_methods,
-        figsize=(4.0 * n_methods, 7.0),
-        squeeze=False,
-    )
+    if args.layout == "combined":
+        fig, axes = plt.subplots(
+            1,
+            n_methods,
+            figsize=(4.4 * n_methods, 4.2),
+            squeeze=False,
+        )
+    else:
+        fig, axes = plt.subplots(
+            2,
+            n_methods,
+            figsize=(4.0 * n_methods, 7.0),
+            squeeze=False,
+        )
 
     for column, (file_path, method_name) in enumerate(
         zip(args.feature_files, args.method_names)
@@ -175,37 +283,71 @@ def main():
             umap_min_dist=args.umap_min_dist,
         )
 
-        ax_domain = axes[0, column]
-        scatter_by_domain(
-            ax_domain,
-            embedding,
-            domains,
-            domain_names,
-            args.point_size,
-            args.alpha,
+        if args.layout == "combined":
+            ax = axes[0, column]
+            scatter_by_domain_and_grade(
+                ax,
+                embedding,
+                domains,
+                labels,
+                domain_names,
+                args.point_size,
+                args.alpha,
+            )
+            ax.set_title(method_name)
+            style_axis(ax)
+        else:
+            ax_domain = axes[0, column]
+            scatter_by_domain(
+                ax_domain,
+                embedding,
+                domains,
+                domain_names,
+                args.point_size,
+                args.alpha,
+            )
+            ax_domain.set_title(f"{method_name}\nColored by domain")
+            style_axis(ax_domain)
+
+            ax_grade = axes[1, column]
+            scatter_by_grade(ax_grade, embedding, labels, args.point_size, args.alpha)
+            ax_grade.set_title(f"{method_name}\nColored by DR grade")
+            style_axis(ax_grade)
+
+    if args.layout == "combined":
+        last_ax = axes[0, -1]
+        domain_legend = last_ax.legend(
+            handles=make_domain_legend_handles(domain_names),
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.65),
+            frameon=False,
+            fontsize=9,
+            title="Domain",
         )
-        ax_domain.set_title(f"{method_name}\nColored by domain")
-        style_axis(ax_domain)
-
-        ax_grade = axes[1, column]
-        scatter_by_grade(ax_grade, embedding, labels, args.point_size, args.alpha)
-        ax_grade.set_title(f"{method_name}\nColored by DR grade")
-        style_axis(ax_grade)
-
-    axes[0, -1].legend(
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        frameon=False,
-        fontsize=9,
-        title="Domain",
-    )
-    axes[1, -1].legend(
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        frameon=False,
-        fontsize=9,
-        title="Grade",
-    )
+        last_ax.add_artist(domain_legend)
+        last_ax.legend(
+            handles=make_grade_legend_handles(),
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.25),
+            frameon=False,
+            fontsize=9,
+            title="DR grade",
+        )
+    else:
+        axes[0, -1].legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            frameon=False,
+            fontsize=9,
+            title="Domain",
+        )
+        axes[1, -1].legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            frameon=False,
+            fontsize=9,
+            title="Grade",
+        )
 
     plt.tight_layout()
     output_path = Path(args.out)
